@@ -6,17 +6,17 @@ use drm::control::{
     AtomicCommitFlags, Mode, PlaneType, connector, crtc, dumbbuffer::DumbBuffer, framebuffer, plane, property,
 };
 
-#[cfg(debug_assertions)]
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(debug_assertions)]
 use std::fmt;
+use std::ops::RangeInclusive;
 use std::os::unix::io::AsRawFd;
 use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicBool, Ordering},
 };
 
+use crate::backend::drm::color::{self, Colorspace, ConnectorColorState};
 use crate::backend::drm::error::AccessError;
 use crate::utils::{Coordinate, Rectangle, Transform};
 use crate::{
@@ -37,6 +37,33 @@ use tracing::{debug, info, info_span, instrument, trace, warn};
 
 use super::{PlaneConfig, PlaneState, VrrSupport};
 
+/// Connector color state resolved against the actual properties of the surface's connectors,
+/// ready to be put into an atomic request.
+///
+/// The `Colorspace` property is an enum property, so the requested [`Colorspace`] is resolved
+/// to its raw value by name, per connector, when the state is staged. HDR metadata is carried
+/// as an already-created property blob.
+#[derive(Debug, Clone)]
+pub struct ResolvedColorState {
+    /// Raw value of the requested colorspace per connector. Connectors without a
+    /// `Colorspace` property (only permitted for [`Colorspace::Default`]) are absent.
+    colorspace_values: HashMap<connector::Handle, u64>,
+    /// The `HDR_OUTPUT_METADATA` blob; `Blob(0)` when no metadata is signalled.
+    hdr_blob: property::Value<'static>,
+    /// The raw `max bpc` value, if one should be set.
+    max_bpc: Option<u64>,
+}
+
+impl Default for ResolvedColorState {
+    fn default() -> Self {
+        ResolvedColorState {
+            colorspace_values: HashMap::new(),
+            hdr_blob: property::Value::Blob(0),
+            max_bpc: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct State {
     pub active: bool,
@@ -44,15 +71,20 @@ pub struct State {
     pub blob: property::Value<'static>,
     pub vrr: bool,
     pub connectors: HashSet<connector::Handle>,
+    pub color_state: ConnectorColorState,
+    pub resolved_color: ResolvedColorState,
 }
 
 impl PartialEq for State {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
+        // `resolved_color` is derived from `color_state` (and owns the metadata blob), so like
+        // the mode blob it is excluded from the comparison.
         self.active == other.active
             && self.mode == other.mode
             && self.vrr == other.vrr
             && self.connectors == other.connectors
+            && self.color_state == other.color_state
     }
 }
 
@@ -141,6 +173,63 @@ impl State {
             }
         }
 
+        // Read back the current color state of the connectors, so that e.g. HDR signalling
+        // left enabled by a previous KMS client is known and gets reset on our next commit.
+        //
+        // `max bpc` is deliberately not read back: `None` means "leave the property alone",
+        // so reading back the kernel's current value would only force spurious modesets.
+        let mut color_state = ConnectorColorState::default();
+        for conn in &current_connectors {
+            let Ok(props) = fd.get_properties(*conn) else {
+                continue;
+            };
+            for (prop, raw) in props {
+                let Ok(info) = fd.get_property(prop) else { continue };
+                match info.name().to_str() {
+                    Ok("Colorspace") => {
+                        if color_state.colorspace != Colorspace::Default {
+                            continue;
+                        }
+                        if let property::ValueType::Enum(values) = info.value_type() {
+                            let (_, enums) = values.values();
+                            // `Default` is a kernel uapi constant (DRM_MODE_COLORIMETRY_DEFAULT == 0),
+                            // anything else we can't match by name is some foreign colorimetry.
+                            color_state.colorspace = enums
+                                .iter()
+                                .find(|e| e.value() == raw)
+                                .and_then(|e| e.name().to_str().ok())
+                                .and_then(Colorspace::from_kernel_name)
+                                .unwrap_or(if raw == 0 {
+                                    Colorspace::Default
+                                } else {
+                                    Colorspace::Unknown
+                                });
+                        }
+                    }
+                    Ok("HDR_OUTPUT_METADATA") => {
+                        if raw == 0 || color_state.hdr_metadata.is_some() {
+                            continue;
+                        }
+                        match fd.get_property_blob(raw) {
+                            Ok(data) => {
+                                color_state.hdr_metadata = color::ffi::HdrOutputMetadata::parse(&data);
+                                if color_state.hdr_metadata.is_none() {
+                                    warn!(
+                                        ?conn,
+                                        "Failed to parse current HDR_OUTPUT_METADATA blob, assuming none"
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                warn!(?conn, "Failed to read current HDR_OUTPUT_METADATA blob: {}", err)
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         Ok(State {
             // If we don't know the active state we just assume off.
             // This is highly unlikely, but having a false negative should do no harm.
@@ -150,6 +239,10 @@ impl State {
             // If we don't know the VRR state, the driver doesn't support the property
             vrr: vrr.unwrap_or(false),
             connectors: current_connectors,
+            color_state,
+            // We don't own the current metadata blob (if any), so don't reference it here;
+            // requests are only ever built from the pending state anyway.
+            resolved_color: ResolvedColorState::default(),
         })
     }
 
@@ -159,7 +252,101 @@ impl State {
         self.connectors.clear();
         self.active = false;
         self.vrr = false;
+        self.color_state = ConnectorColorState::default();
+        self.resolved_color = ResolvedColorState::default();
     }
+}
+
+/// Resolves the given color state against the actual properties of `connectors`.
+///
+/// Fails with [`Error::UnknownProperty`] if the state requests something a connector has no
+/// property for (a non-default colorspace, HDR metadata or a `max bpc` value). Connectors
+/// missing a property that isn't actively used are simply skipped, so plain SDR state
+/// resolves successfully on any connector.
+fn resolve_color_state<A: DevPath + ControlDevice>(
+    fd: &A,
+    prop_mapping: &PropMapping,
+    color_state: &ConnectorColorState,
+    hdr_blob: property::Value<'static>,
+    connectors: impl IntoIterator<Item = connector::Handle>,
+) -> Result<ResolvedColorState, Error> {
+    let mut resolved = ResolvedColorState {
+        colorspace_values: HashMap::new(),
+        hdr_blob,
+        max_bpc: color_state.max_bpc.map(u64::from),
+    };
+
+    // `Colorspace::Unknown` is a readback-only value and cannot be requested.
+    let colorspace_name = color_state.colorspace.kernel_name();
+
+    for conn in connectors {
+        if colorspace_name.is_none() {
+            return Err(Error::UnknownProperty {
+                handle: conn.into(),
+                name: "Colorspace",
+            });
+        }
+
+        match prop_mapping.conn_prop_handle(conn, "Colorspace") {
+            Ok(prop) => {
+                let info = fd.get_property(prop).map_err(|source| {
+                    Error::Access(AccessError {
+                        errmsg: "Failed to query Colorspace property",
+                        dev: fd.dev_path(),
+                        source,
+                    })
+                })?;
+                let value = if let property::ValueType::Enum(values) = info.value_type() {
+                    let (_, enums) = values.values();
+                    enums
+                        .iter()
+                        .find(|e| e.name().to_str().ok() == colorspace_name)
+                        .map(|e| e.value())
+                } else {
+                    None
+                };
+                match value {
+                    Some(value) => {
+                        resolved.colorspace_values.insert(conn, value);
+                    }
+                    None if color_state.colorspace == Colorspace::Default => {}
+                    None => {
+                        return Err(Error::UnknownProperty {
+                            handle: conn.into(),
+                            name: "Colorspace",
+                        });
+                    }
+                }
+            }
+            Err(_) if color_state.colorspace == Colorspace::Default => {}
+            Err(_) => {
+                return Err(Error::UnknownProperty {
+                    handle: conn.into(),
+                    name: "Colorspace",
+                });
+            }
+        }
+
+        if color_state.hdr_metadata.is_some()
+            && prop_mapping
+                .conn_prop_handle(conn, "HDR_OUTPUT_METADATA")
+                .is_err()
+        {
+            return Err(Error::UnknownProperty {
+                handle: conn.into(),
+                name: "HDR_OUTPUT_METADATA",
+            });
+        }
+
+        if color_state.max_bpc.is_some() && prop_mapping.conn_prop_handle(conn, "max bpc").is_err() {
+            return Err(Error::UnknownProperty {
+                handle: conn.into(),
+                name: "max bpc",
+            });
+        }
+    }
+
+    Ok(resolved)
 }
 
 #[derive(Debug)]
@@ -201,12 +388,24 @@ impl AtomicDrmSurface {
                 source,
             })
         })?;
+        // Resolve the default (SDR) color state, so the first commit resets any color
+        // signalling a previous KMS client might have left on the connectors.
+        let color_state = ConnectorColorState::default();
+        let resolved_color = resolve_color_state(
+            &*fd,
+            &prop_mapping.read().unwrap(),
+            &color_state,
+            property::Value::Blob(0),
+            connectors.iter().copied(),
+        )?;
         let pending = State {
             active: true,
             mode,
             blob,
             vrr: false,
             connectors: connectors.iter().copied().collect(),
+            color_state,
+            resolved_color,
         };
 
         drop(_guard);
@@ -357,11 +556,26 @@ impl AtomicDrmSurface {
 
             let mut connectors = pending.connectors.clone();
             connectors.insert(conn);
+
+            // resolve the pending color state for the new connector as well
+            let mut resolved_color = pending.resolved_color.clone();
+            resolved_color.colorspace_values.extend(
+                resolve_color_state(
+                    &*self.fd,
+                    &prop_mapping,
+                    &pending.color_state,
+                    resolved_color.hdr_blob,
+                    [conn],
+                )?
+                .colorspace_values,
+            );
+
             let req = AtomicRequest::build_request(
                 &prop_mapping,
                 self.crtc,
                 Some(pending.blob),
                 pending.vrr,
+                Some(&resolved_color),
                 &connectors,
                 [],
                 [&plane_state],
@@ -375,6 +589,7 @@ impl AtomicDrmSurface {
 
             // seems to be, lets add the connector
             pending.connectors.insert(conn);
+            pending.resolved_color = resolved_color;
 
             Ok(())
         } else {
@@ -421,6 +636,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             pending.vrr,
+            Some(&pending.resolved_color),
             &connectors,
             [&conn],
             [&plane_state],
@@ -434,6 +650,7 @@ impl AtomicDrmSurface {
 
         // seems to be, lets remove the connector
         pending.connectors.remove(&conn);
+        pending.resolved_color.colorspace_values.remove(&conn);
 
         Ok(())
     }
@@ -473,11 +690,21 @@ impl AtomicDrmSurface {
                 fence: None,
             }),
         };
+        // re-resolve the pending color state for the new connector set
+        let resolved_color = resolve_color_state(
+            &*self.fd,
+            &prop_mapping,
+            &pending.color_state,
+            pending.resolved_color.hdr_blob,
+            conns.iter().copied(),
+        )?;
+
         let req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
             Some(pending.blob),
             pending.vrr,
+            Some(&resolved_color),
             &conns,
             removed,
             [&plane_state],
@@ -491,6 +718,7 @@ impl AtomicDrmSurface {
             .map_err(|_| Error::TestFailed(self.crtc))?;
 
         pending.connectors = conns;
+        pending.resolved_color = resolved_color;
 
         Ok(())
     }
@@ -532,6 +760,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(new_blob),
             pending.vrr,
+            Some(&pending.resolved_color),
             pending.connectors.iter(),
             [],
             [&plane_state],
@@ -655,6 +884,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             value,
+            Some(&pending.resolved_color),
             &pending.connectors,
             &[],
             [&plane_config],
@@ -682,6 +912,214 @@ impl AtomicDrmSurface {
             .map_err(|_| Error::TestFailed(self.crtc))?;
 
         pending.vrr = value;
+        Ok(())
+    }
+
+    /// Returns the colorspaces supported by the given connector's `Colorspace` property.
+    ///
+    /// Contains at least [`Colorspace::Default`], which is also the only entry if the
+    /// connector has no `Colorspace` property at all.
+    pub fn supported_colorspaces(&self, conn: connector::Handle) -> Result<Vec<Colorspace>, Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+
+        let prop = match self
+            .prop_mapping
+            .read()
+            .unwrap()
+            .conn_prop_handle(conn, "Colorspace")
+        {
+            Ok(prop) => prop,
+            Err(_) => return Ok(vec![Colorspace::Default]),
+        };
+
+        let info = self.fd.get_property(prop).map_err(|source| {
+            Error::Access(AccessError {
+                errmsg: "Failed to query Colorspace property",
+                dev: self.fd.dev_path(),
+                source,
+            })
+        })?;
+
+        let mut supported = vec![Colorspace::Default];
+        if let property::ValueType::Enum(values) = info.value_type() {
+            let (_, enums) = values.values();
+            supported.extend(
+                enums
+                    .iter()
+                    .filter_map(|e| e.name().to_str().ok())
+                    .filter_map(Colorspace::from_kernel_name)
+                    .filter(|cs| *cs != Colorspace::Default),
+            );
+        }
+        Ok(supported)
+    }
+
+    /// Returns whether the given connector supports the `HDR_OUTPUT_METADATA` property.
+    pub fn hdr_metadata_supported(&self, conn: connector::Handle) -> Result<bool, Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+
+        Ok(self
+            .prop_mapping
+            .read()
+            .unwrap()
+            .conn_prop_handle(conn, "HDR_OUTPUT_METADATA")
+            .is_ok())
+    }
+
+    /// Returns the valid range of the given connector's `max bpc` property, or `None` if the
+    /// connector has no such property.
+    pub fn max_bpc_range(&self, conn: connector::Handle) -> Result<Option<RangeInclusive<u32>>, Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+
+        let prop = match self
+            .prop_mapping
+            .read()
+            .unwrap()
+            .conn_prop_handle(conn, "max bpc")
+        {
+            Ok(prop) => prop,
+            Err(_) => return Ok(None),
+        };
+
+        let info = self.fd.get_property(prop).map_err(|source| {
+            Error::Access(AccessError {
+                errmsg: "Failed to query max bpc property",
+                dev: self.fd.dev_path(),
+                source,
+            })
+        })?;
+
+        Ok(match info.value_type() {
+            property::ValueType::UnsignedRange(min, max) => Some(min as u32..=max as u32),
+            _ => None,
+        })
+    }
+
+    /// Returns the currently pending [`ConnectorColorState`].
+    pub fn pending_color_state(&self) -> ConnectorColorState {
+        self.pending.read().unwrap().color_state
+    }
+
+    /// Returns the currently active [`ConnectorColorState`].
+    pub fn current_color_state(&self) -> ConnectorColorState {
+        self.state.read().unwrap().color_state
+    }
+
+    /// Stages a new [`ConnectorColorState`] to be applied on the next commit.
+    ///
+    /// The state is validated with a `TEST_ONLY` commit, but only applied by the next
+    /// [`commit`](Self::commit). Unlike VRR, color properties are never applied via
+    /// [`page_flip`](Self::page_flip): some drivers treat e.g. a `Colorspace` change as
+    /// requiring a full modeset and can misbehave badly (up to hanging the display pipe)
+    /// when connector color properties are committed without complete CRTC/plane state.
+    /// The kernel latches connector property values, so page flips after the commit keep
+    /// the signalled state without re-emitting it.
+    pub fn use_color_state(&self, color_state: ConnectorColorState) -> Result<(), Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+
+        let current = self.state.read().unwrap();
+        let mut pending = self.pending.write().unwrap();
+        if pending.color_state == color_state {
+            return Ok(());
+        }
+
+        let destroy_blob = |blob: property::Value<'static>| {
+            if let property::Value::Blob(id) = blob {
+                if id != 0 {
+                    if let Err(err) = self.fd.destroy_property_blob(id) {
+                        warn!("Failed to destroy HDR metadata property blob: {}", err);
+                    }
+                }
+            }
+        };
+
+        let hdr_blob = match color_state.hdr_metadata {
+            Some(meta) => self
+                .fd
+                .create_property_blob(&color::ffi::HdrOutputMetadata::from(meta))
+                .map_err(|source| {
+                    Error::Access(AccessError {
+                        errmsg: "Failed to create HDR metadata property blob",
+                        dev: self.fd.dev_path(),
+                        source,
+                    })
+                })?,
+            None => property::Value::Blob(0),
+        };
+
+        let prop_mapping = self.prop_mapping.read().unwrap();
+        let resolved = match resolve_color_state(
+            &*self.fd,
+            &prop_mapping,
+            &color_state,
+            hdr_blob,
+            pending.connectors.iter().copied(),
+        ) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                destroy_blob(hdr_blob);
+                return Err(err);
+            }
+        };
+
+        let res = (|| {
+            let test_buffer = self.create_test_buffer(pending.mode.size(), self.plane)?;
+            let plane_config = PlaneState {
+                handle: self.plane,
+                config: Some(PlaneConfig {
+                    src: Rectangle::from_size(pending.mode.size().into()).to_f64(),
+                    dst: Rectangle::from_size(
+                        (pending.mode.size().0 as i32, pending.mode.size().1 as i32).into(),
+                    ),
+                    transform: Transform::Normal,
+                    alpha: 1.0,
+                    damage_clips: None,
+                    fb: test_buffer.fb,
+                    fence: None,
+                }),
+            };
+
+            let req = AtomicRequest::build_request(
+                &prop_mapping,
+                self.crtc,
+                Some(pending.blob),
+                pending.vrr,
+                Some(&resolved),
+                &pending.connectors,
+                &[],
+                [&plane_config],
+            )?;
+
+            self.fd
+                .atomic_commit(
+                    AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
+                    req.build()?,
+                )
+                .map_err(|_| Error::TestFailed(self.crtc))
+        })();
+
+        if let Err(err) = res {
+            destroy_blob(hdr_blob);
+            return Err(err);
+        }
+
+        // Destroy a previously staged blob that was never committed. A committed blob
+        // (referenced by the current state) is destroyed by `commit` once it is replaced.
+        let old_blob = std::mem::replace(&mut pending.resolved_color.hdr_blob, property::Value::Blob(0));
+        if old_blob != current.resolved_color.hdr_blob {
+            destroy_blob(old_blob);
+        }
+
+        pending.color_state = color_state;
+        pending.resolved_color = resolved;
         Ok(())
     }
 
@@ -725,6 +1163,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             pending.vrr,
+            Some(&pending.resolved_color),
             &pending_conns,
             removed,
             &*planes,
@@ -797,6 +1236,7 @@ impl AtomicDrmSurface {
                 self.crtc,
                 Some(pending.blob),
                 pending.vrr,
+                Some(&pending.resolved_color),
                 &pending_conns,
                 removed,
                 &*planes,
@@ -813,6 +1253,17 @@ impl AtomicDrmSurface {
                 if current.mode != pending.mode {
                     if let Err(err) = self.fd.destroy_property_blob(current.blob.into()) {
                         warn!("Failed to destroy old mode property blob: {}", err);
+                    }
+                }
+                // Like the mode blob: once the property moves off the old metadata blob, the
+                // kernel keeps it alive as long as needed, so it's safe to release it now.
+                if current.resolved_color.hdr_blob != pending.resolved_color.hdr_blob {
+                    if let property::Value::Blob(id) = current.resolved_color.hdr_blob {
+                        if id != 0 {
+                            if let Err(err) = self.fd.destroy_property_blob(id) {
+                                warn!("Failed to destroy old HDR metadata property blob: {}", err);
+                            }
+                        }
                     }
                 }
 
@@ -879,11 +1330,15 @@ impl AtomicDrmSurface {
 
         // page flips work just like commits with fewer parameters..
         let prop_mapping = self.prop_mapping.read().unwrap();
+        // Connector color properties are deliberately omitted (`None`): the kernel latches
+        // them from the last commit, and re-emitting connector state on every flip makes the
+        // kernel re-run its modeset checks and can cause sinks to renegotiate infoframes.
         let req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
             None,
             self.state.read().unwrap().vrr,
+            None,
             [],
             [],
             &*planes,
@@ -1021,6 +1476,28 @@ impl AtomicDrmSurface {
 
         let old_blob = std::mem::replace(&mut pending.blob, blob);
         let _ = self.fd.destroy_property_blob(old_blob.into());
+
+        // Re-initialize the HDR metadata blob, which might have gotten lost after
+        // suspend/resume; the pending color state then re-asserts itself on the next commit,
+        // since the re-read current state reflects whatever survived.
+        if let Some(meta) = pending.color_state.hdr_metadata {
+            let hdr_blob = self
+                .fd
+                .create_property_blob(&color::ffi::HdrOutputMetadata::from(meta))
+                .map_err(|source| {
+                    Error::Access(AccessError {
+                        errmsg: "Failed to create HDR metadata property blob",
+                        dev: self.fd.dev_path(),
+                        source,
+                    })
+                })?;
+            let old_blob = std::mem::replace(&mut pending.resolved_color.hdr_blob, hdr_blob);
+            if let property::Value::Blob(id) = old_blob {
+                if id != 0 {
+                    let _ = self.fd.destroy_property_blob(id);
+                }
+            }
+        }
 
         Ok(())
     }
@@ -1171,15 +1648,42 @@ impl<'a> AtomicRequest<'a> {
         }
     }
 
-    fn set_connector(&mut self, conn: connector::Handle, crtc: crtc::Handle) -> Result<(), Error> {
+    fn set_connector(
+        &mut self,
+        conn: connector::Handle,
+        crtc: crtc::Handle,
+        color: Option<&ResolvedColorState>,
+    ) -> Result<(), Error> {
         let connector_props = self.connector_props.entry(conn).or_default();
         connector_props.insert("CRTC_ID", property::Value::CRTC(Some(crtc)));
+        if let Some(color) = color {
+            if let Some(value) = color.colorspace_values.get(&conn) {
+                connector_props.insert("Colorspace", property::Value::Unknown(*value));
+            }
+            if self.mapping.conn_prop_handle(conn, "HDR_OUTPUT_METADATA").is_ok() {
+                connector_props.insert("HDR_OUTPUT_METADATA", color.hdr_blob);
+            }
+            if let Some(max_bpc) = color.max_bpc {
+                if self.mapping.conn_prop_handle(conn, "max bpc").is_ok() {
+                    connector_props.insert("max bpc", property::Value::UnsignedRange(max_bpc));
+                }
+            }
+        }
         Ok(())
     }
 
     fn reset_connector(&mut self, conn: connector::Handle) -> Result<(), Error> {
         let connector_props = self.connector_props.entry(conn).or_default();
         connector_props.insert("CRTC_ID", property::Value::CRTC(None));
+        // Reset color signalling, so the next KMS client starts from a defined SDR state.
+        // `max bpc` is left alone; there is no meaningful default to restore.
+        if self.mapping.conn_prop_handle(conn, "Colorspace").is_ok() {
+            // Default == DRM_MODE_COLORIMETRY_DEFAULT, a kernel uapi constant
+            connector_props.insert("Colorspace", property::Value::Unknown(0));
+        }
+        if self.mapping.conn_prop_handle(conn, "HDR_OUTPUT_METADATA").is_ok() {
+            connector_props.insert("HDR_OUTPUT_METADATA", property::Value::Blob(0));
+        }
         Ok(())
     }
 
@@ -1367,12 +1871,35 @@ impl<'a> AtomicRequest<'a> {
         }
     }
 
-    fn set_connector(&mut self, conn: connector::Handle, crtc: crtc::Handle) -> Result<(), Error> {
+    fn set_connector(
+        &mut self,
+        conn: connector::Handle,
+        crtc: crtc::Handle,
+        color: Option<&ResolvedColorState>,
+    ) -> Result<(), Error> {
         self.request.add_property(
             conn,
             self.mapping.conn_prop_handle(conn, "CRTC_ID")?,
             property::Value::CRTC(Some(crtc)),
         );
+        if let Some(color) = color {
+            if let Some(value) = color.colorspace_values.get(&conn) {
+                self.request.add_property(
+                    conn,
+                    self.mapping.conn_prop_handle(conn, "Colorspace")?,
+                    property::Value::Unknown(*value),
+                );
+            }
+            if let Ok(prop) = self.mapping.conn_prop_handle(conn, "HDR_OUTPUT_METADATA") {
+                self.request.add_property(conn, prop, color.hdr_blob);
+            }
+            if let Some(max_bpc) = color.max_bpc {
+                if let Ok(prop) = self.mapping.conn_prop_handle(conn, "max bpc") {
+                    self.request
+                        .add_property(conn, prop, property::Value::UnsignedRange(max_bpc));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1382,6 +1909,15 @@ impl<'a> AtomicRequest<'a> {
             self.mapping.conn_prop_handle(conn, "CRTC_ID")?,
             property::Value::CRTC(None),
         );
+        // Reset color signalling, so the next KMS client starts from a defined SDR state.
+        // `max bpc` is left alone; there is no meaningful default to restore.
+        if let Ok(prop) = self.mapping.conn_prop_handle(conn, "Colorspace") {
+            // Default == DRM_MODE_COLORIMETRY_DEFAULT, a kernel uapi constant
+            self.request.add_property(conn, prop, property::Value::Unknown(0));
+        }
+        if let Ok(prop) = self.mapping.conn_prop_handle(conn, "HDR_OUTPUT_METADATA") {
+            self.request.add_property(conn, prop, property::Value::Blob(0));
+        }
         Ok(())
     }
 
@@ -1638,11 +2174,13 @@ impl<'a> AtomicRequest<'a> {
 }
 
 impl<'a> AtomicRequest<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn build_request(
         mapping: &'a PropMapping,
         crtc: crtc::Handle,
         blob: Option<property::Value<'static>>,
         vrr: bool,
+        color: Option<&ResolvedColorState>,
         connectors: impl IntoIterator<Item = &'a connector::Handle>,
         removed_connectors: impl IntoIterator<Item = &'a connector::Handle>,
         planes: impl IntoIterator<Item = &'a PlaneState<'a>>,
@@ -1653,8 +2191,9 @@ impl<'a> AtomicRequest<'a> {
         // for different drm objects (crtc, plane, connector, ...).
 
         // for every connector that is new, we need to set our crtc_id
+        // (and the color state, if this is a full commit rather than a page flip)
         for conn in connectors {
-            req.set_connector(*conn, crtc)?;
+            req.set_connector(*conn, crtc, color)?;
         }
 
         // for every connector that got removed, we need to set no crtc_id.

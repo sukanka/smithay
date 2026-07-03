@@ -1,4 +1,5 @@
 use std::io;
+use std::ops::RangeInclusive;
 use std::os::unix::io::{AsFd, BorrowedFd};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -13,7 +14,10 @@ pub(super) mod atomic;
 pub(super) mod gbm;
 pub(super) mod legacy;
 use super::{
-    DrmDeviceFd, PlaneClaim, PlaneInfo, PlaneType, Planes, device::PlaneClaimStorage, error::Error,
+    DrmDeviceFd, PlaneClaim, PlaneInfo, PlaneType, Planes,
+    color::{Colorspace, ConnectorColorState},
+    device::PlaneClaimStorage,
+    error::Error,
     plane_type,
 };
 use crate::utils::DevPath;
@@ -340,6 +344,87 @@ impl DrmSurface {
                 handle: self.crtc.into(),
                 name: "VRR_ENABLED",
             }),
+        }
+    }
+
+    /// Returns the colorspaces supported by the given connector's `Colorspace` property.
+    ///
+    /// Contains at least [`Colorspace::Default`], which is also the only entry if the
+    /// connector has no `Colorspace` property or the underlying implementation is using the
+    /// legacy DRM api.
+    pub fn supported_colorspaces(&self, conn: connector::Handle) -> Result<Vec<Colorspace>, Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.supported_colorspaces(conn),
+            DrmSurfaceInternal::Legacy(_) => Ok(vec![Colorspace::Default]),
+        }
+    }
+
+    /// Returns whether the given connector supports the `HDR_OUTPUT_METADATA` property.
+    ///
+    /// Note: This will always return `false` if the underlying implementation is using the
+    /// legacy DRM api.
+    pub fn hdr_metadata_supported(&self, conn: connector::Handle) -> Result<bool, Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.hdr_metadata_supported(conn),
+            DrmSurfaceInternal::Legacy(_) => Ok(false),
+        }
+    }
+
+    /// Returns the valid range of the given connector's `max bpc` property, or `None` if the
+    /// connector has no such property or the underlying implementation is using the legacy
+    /// DRM api.
+    pub fn max_bpc_range(&self, conn: connector::Handle) -> Result<Option<RangeInclusive<u32>>, Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.max_bpc_range(conn),
+            DrmSurfaceInternal::Legacy(_) => Ok(None),
+        }
+    }
+
+    /// Returns the [`ConnectorColorState`] to be used after the next commit.
+    pub fn pending_color_state(&self) -> ConnectorColorState {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.pending_color_state(),
+            DrmSurfaceInternal::Legacy(_) => ConnectorColorState::default(),
+        }
+    }
+
+    /// Returns the currently active [`ConnectorColorState`].
+    pub fn current_color_state(&self) -> ConnectorColorState {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.current_color_state(),
+            DrmSurfaceInternal::Legacy(_) => ConnectorColorState::default(),
+        }
+    }
+
+    /// Stages a new [`ConnectorColorState`] (colorspace, HDR metadata, max bpc) to be applied
+    /// on the next commit.
+    ///
+    /// A change to the color state causes [`DrmSurface::commit_pending`] to return `true`; the
+    /// state is applied together with the mode, CRTC and plane state in a *single* atomic
+    /// commit. It is never applied via page flips: some drivers treat connector color property
+    /// changes as requiring a full modeset and misbehave when they are committed with
+    /// incomplete pipeline state.
+    ///
+    /// Use [`supported_colorspaces`](DrmSurface::supported_colorspaces),
+    /// [`hdr_metadata_supported`](DrmSurface::hdr_metadata_supported) and
+    /// [`max_bpc_range`](DrmSurface::max_bpc_range) to probe for driver support, and the
+    /// sink's EDID (e.g. via `smithay-drm-extras`) for what the connected display can accept.
+    ///
+    /// Fails with [`Error::UnknownProperty`] if the state requests a property (or colorspace)
+    /// a connector doesn't expose, or on the legacy DRM api for any non-default state.
+    pub fn use_color_state(&self, state: ConnectorColorState) -> Result<(), Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.use_color_state(state),
+            DrmSurfaceInternal::Legacy(_) => {
+                if state == ConnectorColorState::default() {
+                    Ok(())
+                } else {
+                    Err(Error::UnknownProperty {
+                        handle: self.crtc.into(),
+                        name: "Colorspace",
+                    })
+                }
+            }
         }
     }
 

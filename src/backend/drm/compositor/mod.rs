@@ -128,6 +128,7 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     io::ErrorKind,
+    ops::RangeInclusive,
     os::unix::io::{AsFd, OwnedFd},
     str::FromStr,
     sync::Arc,
@@ -176,6 +177,7 @@ use crate::{
 
 use super::{
     DrmSurface, Framebuffer, PlaneClaim, PlaneInfo, Planes,
+    color::{Colorspace, ConnectorColorState},
     error::AccessError,
     exporter::{ExportBuffer, ExportFramebuffer, gbm::GbmFramebufferExporter, gbm::NodeFilter},
     surface::VrrSupport,
@@ -2743,6 +2745,53 @@ where
     /// used without a modeset on the attached connectors.
     pub fn use_vrr(&mut self, vrr: bool) -> FrameResult<(), A, F> {
         self.surface.use_vrr(vrr).map_err(FrameError::DrmError)
+    }
+
+    /// Returns the colorspaces supported by the given connector's `Colorspace` property.
+    ///
+    /// See [`DrmSurface::supported_colorspaces`] for more details.
+    pub fn supported_colorspaces(&self, conn: connector::Handle) -> FrameResult<Vec<Colorspace>, A, F> {
+        self.surface
+            .supported_colorspaces(conn)
+            .map_err(FrameError::DrmError)
+    }
+
+    /// Returns whether the given connector supports the `HDR_OUTPUT_METADATA` property.
+    ///
+    /// See [`DrmSurface::hdr_metadata_supported`] for more details.
+    pub fn hdr_metadata_supported(&self, conn: connector::Handle) -> FrameResult<bool, A, F> {
+        self.surface
+            .hdr_metadata_supported(conn)
+            .map_err(FrameError::DrmError)
+    }
+
+    /// Returns the valid range of the given connector's `max bpc` property, if any.
+    ///
+    /// See [`DrmSurface::max_bpc_range`] for more details.
+    pub fn max_bpc_range(&self, conn: connector::Handle) -> FrameResult<Option<RangeInclusive<u32>>, A, F> {
+        self.surface.max_bpc_range(conn).map_err(FrameError::DrmError)
+    }
+
+    /// Returns the [`ConnectorColorState`] to be used after the next commit.
+    pub fn pending_color_state(&self) -> ConnectorColorState {
+        self.surface.pending_color_state()
+    }
+
+    /// Returns the currently active [`ConnectorColorState`].
+    pub fn current_color_state(&self) -> ConnectorColorState {
+        self.surface.current_color_state()
+    }
+
+    /// Stages a new [`ConnectorColorState`] (colorspace, HDR metadata, max bpc) to be applied
+    /// with the next queued frame.
+    ///
+    /// A changed color state upgrades the next frame submission to a full atomic modeset
+    /// commit, so the connector color properties are applied in a *single* atomic commit
+    /// together with the mode, CRTC and plane state.
+    ///
+    /// See [`DrmSurface::use_color_state`] for more details.
+    pub fn use_color_state(&mut self, state: ConnectorColorState) -> FrameResult<(), A, F> {
+        self.surface.use_color_state(state).map_err(FrameError::DrmError)
     }
 
     /// Set the [`DebugFlags`] to use

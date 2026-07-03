@@ -70,6 +70,7 @@
 //! to allocate buffers for use in X11 or Wayland. If you need to do mode setting, you should use
 //! [`DrmDevice`] instead.
 
+pub mod color;
 #[cfg(all(feature = "wayland_frontend", feature = "backend_gbm"))]
 pub mod compositor;
 pub(crate) mod device;
@@ -87,6 +88,7 @@ mod surface;
 use std::sync::Once;
 
 use crate::utils::{DevPath, Physical, Size};
+pub use color::{Colorspace, ConnectorColorState, CtaCoordinate, Eotf, HdrOutputMetadata};
 pub use device::{
     DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmEvent, EventMetadata as DrmEventMetadata, PlaneClaim,
     Time as DrmEventTime, WeakDrmDeviceFd,

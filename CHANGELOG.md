@@ -128,6 +128,13 @@ is used for timestamps for synthesized events.
 - Add `WmWindowProperty::Other` to forward unrecognized X11 property changes to the compositor.
 
 - ExtBackgroundEffect protocol is now available in `smithay::wayland::background_effect` module.
+- `DrmSurface::use_color_state` (and the corresponding `DrmCompositor::use_color_state`) allows
+  staging connector color state — `Colorspace`, `HDR_OUTPUT_METADATA` and `max bpc` — which is
+  applied together with mode, CRTC and plane state in a *single* atomic commit on the next
+  commit/queued frame. Support can be probed with `supported_colorspaces`,
+  `hdr_metadata_supported` and `max_bpc_range`. This enables HDR/wide-gamut signalling without
+  standalone connector-property commits, which some drivers (notably nvidia) answer with a hung
+  display pipe. New value types live in `smithay::backend::drm::color`.
 
 `crate::input::dnd` was introduced to enable implementation of Drag&Drop operations on custom types.
 Internally the same types and traits are used to implement `wayland::data_device` dnd-operations and XDND
