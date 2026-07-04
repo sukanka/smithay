@@ -404,6 +404,10 @@ pub struct GlesRenderer {
     tex_program: GlesTexProgram,
     solid_program: GlesSolidProgram,
 
+    // frame defaults
+    default_tex_program_override: Option<(GlesTexProgram, Vec<Uniform<'static>>)>,
+    solid_color_transform: Option<Box<dyn Fn(Color32F) -> Color32F>>,
+
     // caches
     buffers: Vec<GlesBuffer>,
     dmabuf_cache: HashMap<WeakDmabuf, GlesTexture>,
@@ -742,6 +746,8 @@ impl GlesRenderer {
 
             tex_program,
             solid_program,
+            default_tex_program_override: None,
+            solid_color_transform: None,
             vbos,
             min_filter: TextureFilter::Linear,
             max_filter: TextureFilter::Linear,
@@ -2180,6 +2186,28 @@ impl GlesRenderer {
             )
         }
     }
+
+    /// Sets a default texture-program override that every subsequently created [`GlesFrame`]
+    /// starts with, as if [`GlesFrame::override_default_tex_program`] was called on it.
+    ///
+    /// This allows overriding the default texture shader for frames created internally, e.g.
+    /// by `DrmCompositor`. `None` (the default) restores the built-in texture shader.
+    pub fn set_default_tex_program_override(
+        &mut self,
+        program_override: Option<(GlesTexProgram, Vec<Uniform<'static>>)>,
+    ) {
+        self.default_tex_program_override = program_override;
+    }
+
+    /// Sets a transform applied to every solid color drawn by this renderer, including
+    /// [`Frame::clear`] and the colors of `SolidColorRenderElement`s.
+    ///
+    /// Solid colors are drawn by a fixed shader that custom texture programs cannot affect;
+    /// this hook lets compositors color-manage them (e.g. encode into an HDR blend space).
+    /// `None` (the default) draws colors unmodified.
+    pub fn set_solid_color_transform(&mut self, transform: Option<Box<dyn Fn(Color32F) -> Color32F>>) {
+        self.solid_color_transform = transform;
+    }
 }
 
 impl GlesFrame<'_, '_> {
@@ -2313,6 +2341,7 @@ impl Renderer for GlesRenderer {
         let current_projection = (flip180 * transform.matrix() * renderer).into();
         let span = span!(parent: &self.span, Level::DEBUG, "renderer_gles2_frame", current_projection = ?current_projection, size = ?output_size, transform = ?transform).entered();
 
+        let tex_program_override = self.default_tex_program_override.clone();
         Ok(GlesFrame {
             renderer: self,
             target,
@@ -2320,7 +2349,7 @@ impl Renderer for GlesRenderer {
             current_projection,
             transform,
             size: output_size,
-            tex_program_override: None,
+            tex_program_override,
             finished: AtomicBool::new(false),
 
             span,
@@ -2619,6 +2648,22 @@ impl GlesFrame<'_, '_> {
         self.tex_program_override = None;
     }
 
+    /// Takes the current texture-program override, leaving none in place.
+    ///
+    /// Use together with [`GlesFrame::set_tex_program_override`] to temporarily suspend a
+    /// frame-wide override around individual draws and restore it afterwards.
+    pub fn take_tex_program_override(&mut self) -> Option<(GlesTexProgram, Vec<Uniform<'static>>)> {
+        self.tex_program_override.take()
+    }
+
+    /// Sets (or clears) the texture-program override for the rest of this frame.
+    pub fn set_tex_program_override(
+        &mut self,
+        program_override: Option<(GlesTexProgram, Vec<Uniform<'static>>)>,
+    ) {
+        self.tex_program_override = program_override;
+    }
+
     /// Draw a solid color to the current target at the specified destination with the specified color.
     #[instrument(level = "trace", skip(self), parent = &self.span)]
     #[profiling::function]
@@ -2631,6 +2676,11 @@ impl GlesFrame<'_, '_> {
         if damage.is_empty() {
             return Ok(());
         }
+
+        let color = match &self.renderer.solid_color_transform {
+            Some(transform) => transform(color),
+            None => color,
+        };
 
         let mut mat = Mat3::IDENTITY;
         mat = self.current_projection * mat;

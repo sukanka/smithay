@@ -145,6 +145,10 @@ is used for timestamps for synthesized events.
   `smithay::wayland::color::representation` module (`ColorRepresentationHandler` /
   `ColorRepresentationState`, routed with `delegate_dispatch2!`), letting clients declare the
   coefficients, chroma location and alpha mode of their surface contents.
+- `GlesRenderer::set_default_tex_program_override` and `GlesRenderer::set_solid_color_transform`
+  (with the matching per-frame `GlesFrame::override_default_tex_program` /
+  `set_tex_program_override`) let compositors apply color/tone-mapping shaders and transform solid
+  colors during composition — e.g. to encode SDR content into an HDR blend space.
 
 `crate::input::dnd` was introduced to enable implementation of Drag&Drop operations on custom types.
 Internally the same types and traits are used to implement `wayland::data_device` dnd-operations and XDND
