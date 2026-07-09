@@ -12,9 +12,11 @@
 //!
 //! Only *parametric* image descriptions with *named* transfer functions are supported;
 //! ICC-file descriptions are rejected with `unsupported_feature`. The pre-defined
-//! Windows-scRGB description is available via [`Feature::WindowsScrgb`] and is flagged as
-//! [`windows_scrgb`](ImageDescription::windows_scrgb), exempting it from any tone mapping the
-//! compositor performs. The compositor chooses which transfer functions, primaries, features
+//! Windows-scRGB and Windows-BT.2100 descriptions are available via
+//! [`Feature::WindowsScrgb`] / [`Feature::WindowsBt2100`] and are flagged as
+//! [`windows_scrgb`](ImageDescription::windows_scrgb) /
+//! [`windows_bt2100`](ImageDescription::windows_bt2100), exempting them from any tone mapping
+//! the compositor performs. The compositor chooses which transfer functions, primaries, features
 //! and rendering intents to advertise when creating the
 //! [`ColorManagementState`]. Mastering display metadata
 //! (target color volume) is supported via [`Feature::SetMasteringDisplayPrimaries`], including
@@ -52,7 +54,38 @@ use crate::wayland::{Dispatch2, GlobalDispatch2};
 
 pub use wp_color_manager_v1::{Feature, Primaries, RenderIntent, TransferFunction};
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 3;
+
+/// Whether a transfer function may be advertised to a client that bound the given version:
+/// deprecated entries must not be sent to v2+ clients, entries added in v2 don't exist for v1
+/// clients.
+fn tf_visible(tf: TransferFunction, version: u32) -> bool {
+    match tf {
+        // Deprecated since version 2 (ambiguous sRGB curves).
+        TransferFunction::Srgb | TransferFunction::ExtSrgb => version < 2,
+        // Added in version 2.
+        TransferFunction::CompoundPower24 => version >= 2,
+        _ => true,
+    }
+}
+
+/// Whether a feature may be advertised to a client that bound the given version.
+fn feature_visible(feature: Feature, version: u32) -> bool {
+    match feature {
+        // create_windows_bt2100 was added in version 3.
+        Feature::WindowsBt2100 => version >= 3,
+        _ => true,
+    }
+}
+
+/// Whether a rendering intent may be advertised to a client that bound the given version.
+fn intent_visible(intent: RenderIntent, version: u32) -> bool {
+    match intent {
+        // Added in version 2.
+        RenderIntent::AbsoluteNoAdaptation => version >= 2,
+        _ => true,
+    }
+}
 
 /// CIE 1931 xy chromaticities of a set of primaries and their white point, in protocol wire
 /// units (coordinate multiplied by 1,000,000).
@@ -229,6 +262,13 @@ pub struct ImageDescription {
     /// at most), unlike parametric descriptions with the same extended-linear transfer and
     /// sRGB primaries, which describe content that may be tone mapped.
     pub windows_scrgb: bool,
+    /// Whether this is the pre-defined Windows-BT.2100 stimulus encoding (created via
+    /// `create_windows_bt2100`) rather than a client-authored parametric description.
+    ///
+    /// Like Windows-scRGB it is display-referred for a BT.2100/PQ-mode screen and exempt from
+    /// tone mapping; the content itself is regular PQ/BT.2020 and composites like other PQ
+    /// content.
+    pub windows_bt2100: bool,
 }
 
 impl ImageDescription {
@@ -246,6 +286,7 @@ impl ImageDescription {
         mastering_primaries: None,
         luminances: None,
         windows_scrgb: false,
+        windows_bt2100: false,
     };
 
     /// The pre-defined Windows-scRGB stimulus encoding: sRGB primaries and white point with an
@@ -268,6 +309,28 @@ impl ImageDescription {
         // scRGB's escape-the-gamut encoding.
         luminances: Some((0, 80, 203)),
         windows_scrgb: true,
+        windows_bt2100: false,
+    };
+
+    /// The pre-defined Windows-BT.2100 stimulus encoding: BT.2020 primaries and white point
+    /// with the ST 2084 (PQ) transfer characteristic, as produced by Windows 10 driving an HDR
+    /// screen in BT.2100/PQ signalling mode.
+    pub const WINDOWS_BT2100: Self = Self {
+        transfer: TransferFunction::St2084Pq,
+        primaries: PrimariesOption {
+            named: Some(Primaries::Bt2020),
+            values: None,
+        },
+        max_cll: None,
+        max_fall: None,
+        mastering_luminance: None,
+        // The target color volume is unknown ("anything up to BT.2100"); it defaults to the
+        // container primaries.
+        mastering_primaries: None,
+        // PQ luminances with the protocol-suggested 203 cd/m² (BT.2408) reference white.
+        luminances: Some((50, 10_000, 203)),
+        windows_scrgb: false,
+        windows_bt2100: true,
     };
 
     /// Whether this description denotes HDR/wide-gamut content: an HDR transfer function
@@ -596,7 +659,11 @@ impl ColorManagementState {
             let mut feedbacks = data.feedbacks.lock().unwrap();
             feedbacks.retain(|feedback| feedback.is_alive());
             for feedback in feedbacks.iter() {
-                feedback.preferred_changed(identity);
+                if feedback.version() >= 2 {
+                    feedback.preferred_changed2(0, identity);
+                } else {
+                    feedback.preferred_changed(identity);
+                }
             }
         });
     }
@@ -637,15 +704,24 @@ where
     ) {
         let manager = data_init.init(manager, ());
 
+        // Enum entries that are deprecated in — or newer than — the bound version must not be
+        // advertised.
+        let version = manager.version();
         let cm_state = state.color_management_state();
         for intent in &cm_state.supported_intents {
-            manager.supported_intent(*intent);
+            if intent_visible(*intent, version) {
+                manager.supported_intent(*intent);
+            }
         }
         for feature in &cm_state.supported_features {
-            manager.supported_feature(*feature);
+            if feature_visible(*feature, version) {
+                manager.supported_feature(*feature);
+            }
         }
         for tf in &cm_state.supported_tfs {
-            manager.supported_tf_named(*tf);
+            if tf_visible(*tf, version) {
+                manager.supported_tf_named(*tf);
+            }
         }
         for primaries in &cm_state.supported_primaries {
             manager.supported_primaries_named(*primaries);
@@ -737,6 +813,37 @@ where
                     state,
                     image_description,
                     ImageDescription::WINDOWS_SCRGB,
+                    data_init,
+                );
+            }
+            Request::CreateWindowsBt2100 { image_description } => {
+                if !state
+                    .color_management_state()
+                    .supported_features
+                    .contains(&Feature::WindowsBt2100)
+                {
+                    resource.post_error(
+                        wp_color_manager_v1::Error::UnsupportedFeature,
+                        "Windows BT.2100 image descriptions are not supported",
+                    );
+                    return;
+                }
+                make_ready_description(
+                    state,
+                    image_description,
+                    ImageDescription::WINDOWS_BT2100,
+                    data_init,
+                );
+            }
+            Request::GetImageDescription {
+                image_description, ..
+            } => {
+                // This implementation never creates wp_image_description_reference_v1
+                // objects, so any reference necessarily comes from a protocol it doesn't
+                // know about.
+                make_failed_description(
+                    image_description,
+                    "image description references are not supported",
                     data_init,
                 );
             }
@@ -980,6 +1087,9 @@ where
                     .into_result()
                     .ok()
                     .filter(|tf| state.color_management_state().supported_tfs.contains(tf))
+                    // Only names advertised to this client are allowed; deprecated/newer
+                    // entries were filtered out at bind time.
+                    .filter(|tf| tf_visible(*tf, resource.version()))
                 {
                     Some(tf) => params.transfer = Some(tf),
                     None => resource.post_error(Error::InvalidTf, "unsupported transfer function"),
@@ -1152,6 +1262,7 @@ where
                     mastering_primaries: params.mastering_primaries,
                     luminances: params.luminances,
                     windows_scrgb: false,
+                    windows_bt2100: false,
                 };
                 drop(params);
 
@@ -1217,8 +1328,8 @@ where
                     return;
                 };
                 // The protocol forbids get_information on descriptions from
-                // create_windows_scrgb.
-                if desc.windows_scrgb {
+                // create_windows_scrgb and create_windows_bt2100.
+                if desc.windows_scrgb || desc.windows_bt2100 {
                     resource.post_error(
                         wp_image_description_v1::Error::NoInformation,
                         "this image description does not allow get_information",
@@ -1265,7 +1376,12 @@ fn make_ready_description<D>(
 {
     let identity = state.color_management_state().identity_for(desc);
     let image = data_init.init(image_description, ImageDescriptionData { desc: Some(desc) });
-    image.ready(identity);
+    if image.version() >= 2 {
+        // Identities are never recycled (the table grows monotonically), as ready2 requires.
+        image.ready2(0, identity);
+    } else {
+        image.ready(identity);
+    }
 }
 
 /// Initializes a `wp_image_description_v1` that immediately fails gracefully with the
@@ -1309,6 +1425,7 @@ mod tests {
             mastering_primaries: None,
             luminances: None,
             windows_scrgb: false,
+            windows_bt2100: false,
         };
 
         let a = state.identity_for(srgb);
@@ -1373,6 +1490,58 @@ mod tests {
             }
             .is_hdr()
         );
+    }
+
+    #[test]
+    fn windows_bt2100_description() {
+        let bt2100 = ImageDescription::WINDOWS_BT2100;
+        assert!(bt2100.windows_bt2100);
+        assert!(!bt2100.windows_scrgb);
+        assert!(bt2100.is_hdr());
+        assert_eq!(bt2100.transfer, TransferFunction::St2084Pq);
+        assert_eq!(bt2100.primaries.named, Some(Primaries::Bt2020));
+        // PQ luminances with the assumed 203 cd/m² reference white.
+        assert_eq!(bt2100.luminances_or_default(), (50, 10_000, 203));
+
+        // Distinct from a parametric PQ/BT.2020 twin, so the tone-mapping exemption survives
+        // identity-based deduplication.
+        let mut state = ColorManagementState {
+            supported_tfs: Vec::new(),
+            supported_primaries: Vec::new(),
+            supported_features: Vec::new(),
+            supported_intents: Vec::new(),
+            identities: Vec::new(),
+            output_objects: Vec::new(),
+        };
+        let twin = ImageDescription {
+            windows_bt2100: false,
+            ..bt2100
+        };
+        assert_ne!(state.identity_for(bt2100), state.identity_for(twin));
+    }
+
+    #[test]
+    fn version_visibility() {
+        // Deprecated sRGB TFs are only advertised to v1 clients; compound_power_2_4 only
+        // from v2 on.
+        assert!(tf_visible(TransferFunction::Srgb, 1));
+        assert!(!tf_visible(TransferFunction::Srgb, 2));
+        assert!(!tf_visible(TransferFunction::ExtSrgb, 3));
+        assert!(!tf_visible(TransferFunction::CompoundPower24, 1));
+        assert!(tf_visible(TransferFunction::CompoundPower24, 2));
+        assert!(tf_visible(TransferFunction::St2084Pq, 1));
+        assert!(tf_visible(TransferFunction::St2084Pq, 3));
+
+        // windows_bt2100 requires the v3 create request.
+        assert!(!feature_visible(Feature::WindowsBt2100, 2));
+        assert!(feature_visible(Feature::WindowsBt2100, 3));
+        assert!(feature_visible(Feature::WindowsScrgb, 1));
+        assert!(feature_visible(Feature::ExtendedTargetVolume, 1));
+
+        // absolute_no_adaptation was added in v2.
+        assert!(!intent_visible(RenderIntent::AbsoluteNoAdaptation, 1));
+        assert!(intent_visible(RenderIntent::AbsoluteNoAdaptation, 2));
+        assert!(intent_visible(RenderIntent::Perceptual, 1));
     }
 
     #[test]
