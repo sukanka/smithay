@@ -13,7 +13,10 @@
 //! Only *parametric* image descriptions with *named* transfer functions and primaries are
 //! supported; ICC-file and Windows-scRGB descriptions are rejected with `unsupported_feature`.
 //! The compositor chooses which transfer functions, primaries, features and rendering intents
-//! to advertise when creating the [`ColorManagementState`].
+//! to advertise when creating the [`ColorManagementState`]. Mastering display metadata
+//! (target color volume) is supported via [`Feature::SetMasteringDisplayPrimaries`], including
+//! target volumes exceeding the primary color volume via [`Feature::ExtendedTargetVolume`];
+//! without the latter, such descriptions fail gracefully as the protocol recommends.
 //!
 //! ## Usage
 //!
@@ -46,6 +49,122 @@ pub use wp_color_manager_v1::{Feature, Primaries, RenderIntent, TransferFunction
 
 const VERSION: u32 = 1;
 
+/// CIE 1931 xy chromaticities of a set of primaries and their white point, in protocol wire
+/// units (coordinate multiplied by 1,000,000).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Chromaticities {
+    /// The red primary as (x, y).
+    pub red: (i32, i32),
+    /// The green primary as (x, y).
+    pub green: (i32, i32),
+    /// The blue primary as (x, y).
+    pub blue: (i32, i32),
+    /// The white point as (x, y).
+    pub white: (i32, i32),
+}
+
+impl Chromaticities {
+    /// The chromaticities of a named set of primaries, per ITU-T H.273 (and the respective
+    /// defining standards referenced by the protocol).
+    pub fn from_named(primaries: Primaries) -> Self {
+        const D65: (i32, i32) = (312_700, 329_000);
+        const C: (i32, i32) = (310_000, 316_000);
+        match primaries {
+            Primaries::Srgb => Self {
+                red: (640_000, 330_000),
+                green: (300_000, 600_000),
+                blue: (150_000, 60_000),
+                white: D65,
+            },
+            Primaries::PalM => Self {
+                red: (670_000, 330_000),
+                green: (210_000, 710_000),
+                blue: (140_000, 80_000),
+                white: C,
+            },
+            Primaries::Pal => Self {
+                red: (640_000, 330_000),
+                green: (290_000, 600_000),
+                blue: (150_000, 60_000),
+                white: D65,
+            },
+            Primaries::Ntsc => Self {
+                red: (630_000, 340_000),
+                green: (310_000, 595_000),
+                blue: (155_000, 70_000),
+                white: D65,
+            },
+            Primaries::GenericFilm => Self {
+                red: (681_000, 319_000),
+                green: (243_000, 692_000),
+                blue: (145_000, 49_000),
+                white: C,
+            },
+            Primaries::Bt2020 => Self {
+                red: (708_000, 292_000),
+                green: (170_000, 797_000),
+                blue: (131_000, 46_000),
+                white: D65,
+            },
+            Primaries::Cie1931Xyz => Self {
+                red: (1_000_000, 0),
+                green: (0, 1_000_000),
+                blue: (0, 0),
+                white: (333_333, 333_333),
+            },
+            Primaries::DciP3 => Self {
+                red: (680_000, 320_000),
+                green: (265_000, 690_000),
+                blue: (150_000, 60_000),
+                white: (314_000, 351_000),
+            },
+            Primaries::DisplayP3 => Self {
+                red: (680_000, 320_000),
+                green: (265_000, 690_000),
+                blue: (150_000, 60_000),
+                white: D65,
+            },
+            Primaries::AdobeRgb => Self {
+                red: (640_000, 330_000),
+                green: (210_000, 710_000),
+                blue: (150_000, 60_000),
+                white: D65,
+            },
+            // Named primaries added by future protocol versions; they cannot be advertised or
+            // accepted by this implementation, so this is unreachable for stored descriptions.
+            _ => Self::from_named(Primaries::Srgb),
+        }
+    }
+
+    /// Whether the chromaticity gamut of `other` (its primaries and white point) lies entirely
+    /// inside (or on the boundary of) the RGB triangle of `self`.
+    ///
+    /// This is the 2D gamut-containment check used to decide whether a target color volume
+    /// stays within the primary color volume.
+    pub fn gamut_contains(&self, other: &Chromaticities) -> bool {
+        [other.red, other.green, other.blue, other.white]
+            .into_iter()
+            .all(|p| point_in_triangle(p, self.red, self.green, self.blue))
+    }
+}
+
+/// Whether `p` lies inside (or on an edge of) the triangle `(a, b, c)`, in exact integer
+/// arithmetic and independent of winding order.
+fn point_in_triangle(p: (i32, i32), a: (i32, i32), b: (i32, i32), c: (i32, i32)) -> bool {
+    fn cross(o: (i32, i32), a: (i32, i32), b: (i32, i32)) -> i64 {
+        let (ox, oy) = (o.0 as i64, o.1 as i64);
+        let (ax, ay) = (a.0 as i64, a.1 as i64);
+        let (bx, by) = (b.0 as i64, b.1 as i64);
+        (ax - ox) * (by - oy) - (ay - oy) * (bx - ox)
+    }
+    let d1 = cross(a, b, p);
+    let d2 = cross(b, c, p);
+    let d3 = cross(c, a, p);
+    let has_neg = d1 < 0 || d2 < 0 || d3 < 0;
+    let has_pos = d1 > 0 || d2 > 0 || d3 > 0;
+    !(has_neg && has_pos)
+}
+
 /// A parsed, immutable parametric image description.
 ///
 /// Only named transfer functions and primaries are representable, since those are the only
@@ -62,6 +181,12 @@ pub struct ImageDescription {
     pub max_fall: Option<u32>,
     /// Mastering display luminance as (min in 0.0001 cd/m², max in cd/m²), if provided.
     pub mastering_luminance: Option<(u32, u32)>,
+    /// Mastering display primaries and white point (SMPTE ST 2086), if provided. Together with
+    /// [`mastering_luminance`](Self::mastering_luminance) these define the target color volume.
+    ///
+    /// Coordinates are 1e6-scaled CIE 1931 xy; for DRM HDR metadata they can be bridged with
+    /// `CtaCoordinate::from_xy(x as f64 / 1e6, y as f64 / 1e6)`.
+    pub mastering_primaries: Option<Chromaticities>,
     /// Content luminances as (min in 0.0001 cd/m², max in cd/m², reference white in cd/m²),
     /// if provided via `set_luminances`.
     pub luminances: Option<(u32, u32, u32)>,
@@ -76,6 +201,7 @@ impl ImageDescription {
         max_cll: None,
         max_fall: None,
         mastering_luminance: None,
+        mastering_primaries: None,
         luminances: None,
     };
 
@@ -140,12 +266,15 @@ struct ColorManagementSurfaceData {
 /// User data of a `wp_image_description_v1`: the parsed description it represents.
 #[derive(Debug)]
 pub struct ImageDescriptionData {
-    desc: ImageDescription,
+    /// `None` for objects that got the `failed` event instead of `ready`; those can only be
+    /// destroyed.
+    desc: Option<ImageDescription>,
 }
 
 impl ImageDescriptionData {
-    /// The description this object represents.
-    pub fn description(&self) -> ImageDescription {
+    /// The description this object represents, or `None` if creating it failed (the object
+    /// received the `failed` event and never became ready).
+    pub fn description(&self) -> Option<ImageDescription> {
         self.desc
     }
 }
@@ -159,6 +288,7 @@ pub struct ImageDescriptionBuilder {
     max_cll: Option<u32>,
     max_fall: Option<u32>,
     mastering_luminance: Option<(u32, u32)>,
+    mastering_primaries: Option<Chromaticities>,
     luminances: Option<(u32, u32, u32)>,
 }
 
@@ -217,8 +347,32 @@ pub fn send_image_description_info(info: &WpImageDescriptionInfoV1, desc: &Image
     if !info.is_alive() {
         return;
     }
+    let container = Chromaticities::from_named(desc.primaries);
+    info.primaries(
+        container.red.0,
+        container.red.1,
+        container.green.0,
+        container.green.1,
+        container.blue.0,
+        container.blue.1,
+        container.white.0,
+        container.white.1,
+    );
     info.primaries_named(desc.primaries);
     info.tf_named(desc.transfer);
+    // The target color volume defaults to the primary color volume when no mastering display
+    // primaries were given.
+    let target = desc.mastering_primaries.unwrap_or(container);
+    info.target_primaries(
+        target.red.0,
+        target.red.1,
+        target.green.0,
+        target.green.1,
+        target.blue.0,
+        target.blue.1,
+        target.white.0,
+        target.white.1,
+    );
     if let Some((min, max)) = desc.mastering_luminance {
         info.target_luminance(min, max);
     }
@@ -256,7 +410,13 @@ impl ColorManagementState {
     /// The supported transfer functions, primaries, features and rendering intents are
     /// advertised to clients and validated in requests. [`Feature::Parametric`] is always
     /// advertised (this implementation is parametric-only); [`RenderIntent::Perceptual`]
-    /// is always advertised as required by the protocol.
+    /// is always advertised as required by the protocol. If
+    /// [`Feature::ExtendedTargetVolume`] is requested, [`Feature::SetMasteringDisplayPrimaries`]
+    /// is advertised as well, since the protocol only allows the former alongside the latter.
+    ///
+    /// Without [`Feature::ExtendedTargetVolume`], image descriptions whose target color volume
+    /// extends outside the primary color volume are failed gracefully (`failed` with cause
+    /// `unsupported`), as recommended by the protocol.
     ///
     /// The global is only visible to clients for which `filter` returns `true`.
     pub fn new<D, F>(
@@ -282,6 +442,11 @@ impl ColorManagementState {
         let mut supported_features: Vec<Feature> = supported_features.into_iter().collect();
         if !supported_features.contains(&Feature::Parametric) {
             supported_features.push(Feature::Parametric);
+        }
+        if supported_features.contains(&Feature::ExtendedTargetVolume)
+            && !supported_features.contains(&Feature::SetMasteringDisplayPrimaries)
+        {
+            supported_features.push(Feature::SetMasteringDisplayPrimaries);
         }
         let mut supported_intents: Vec<RenderIntent> = supported_intents.into_iter().collect();
         if !supported_intents.contains(&RenderIntent::Perceptual) {
@@ -540,7 +705,10 @@ where
                     }
                 };
 
-                let Some(desc) = image_description.data::<ImageDescriptionData>().map(|d| d.desc) else {
+                let Some(desc) = image_description
+                    .data::<ImageDescriptionData>()
+                    .and_then(|d| d.desc)
+                else {
                     resource.post_error(
                         wp_color_management_surface_v1::Error::ImageDescription,
                         "image description is not ready",
@@ -722,6 +890,22 @@ where
                 }
             }
             Request::SetMasteringLuminance { min_lum, max_lum } => {
+                if !state
+                    .color_management_state()
+                    .supported_features
+                    .contains(&Feature::SetMasteringDisplayPrimaries)
+                {
+                    resource.post_error(
+                        Error::UnsupportedFeature,
+                        "set_mastering_luminance is not supported",
+                    );
+                    return;
+                }
+                // min_lum is in 0.0001 cd/m² units, max_lum in cd/m².
+                if u64::from(max_lum) * 10000 <= u64::from(min_lum) {
+                    resource.post_error(Error::InvalidLuminance, "max L must be greater than min L");
+                    return;
+                }
                 self.lock().unwrap().mastering_luminance = Some((min_lum, max_lum));
             }
             Request::SetMaxCll { max_cll } => {
@@ -743,11 +927,33 @@ where
                     resource.post_error(Error::UnsupportedFeature, "set_luminances is not supported");
                     return;
                 }
-                self.lock().unwrap().luminances = Some((min_lum, max_lum, reference_lum));
+                let mut params = self.lock().unwrap();
+                if params.luminances.is_some() {
+                    resource.post_error(Error::AlreadySet, "luminances already set");
+                    return;
+                }
+                // min_lum is in 0.0001 cd/m² units, max_lum and reference_lum in cd/m².
+                if u64::from(max_lum) * 10000 <= u64::from(min_lum)
+                    || u64::from(reference_lum) * 10000 <= u64::from(min_lum)
+                {
+                    resource.post_error(
+                        Error::InvalidLuminance,
+                        "max_lum and reference_lum must be greater than min_lum",
+                    );
+                    return;
+                }
+                params.luminances = Some((min_lum, max_lum, reference_lum));
             }
-            Request::SetMasteringDisplayPrimaries { .. } => {
-                // Accepted (if advertised) so HDR clients can convey mastering metadata
-                // without erroring; the values are not used yet.
+            Request::SetMasteringDisplayPrimaries {
+                r_x,
+                r_y,
+                g_x,
+                g_y,
+                b_x,
+                b_y,
+                w_x,
+                w_y,
+            } => {
                 if !state
                     .color_management_state()
                     .supported_features
@@ -757,7 +963,19 @@ where
                         Error::UnsupportedFeature,
                         "set_mastering_display_primaries is not supported",
                     );
+                    return;
                 }
+                let mut params = self.lock().unwrap();
+                if params.mastering_primaries.is_some() {
+                    resource.post_error(Error::AlreadySet, "mastering display primaries already set");
+                    return;
+                }
+                params.mastering_primaries = Some(Chromaticities {
+                    red: (r_x, r_y),
+                    green: (g_x, g_y),
+                    blue: (b_x, b_y),
+                    white: (w_x, w_y),
+                });
             }
             Request::SetTfPower { .. } => {
                 resource.post_error(Error::UnsupportedFeature, "set_tf_power is not supported");
@@ -774,15 +992,53 @@ where
                     );
                     return;
                 };
+                if let (Some(max_cll), Some(max_fall)) = (params.max_cll, params.max_fall) {
+                    if max_fall > max_cll {
+                        resource.post_error(
+                            Error::InvalidLuminance,
+                            "max_fall must be less or equal to max_cll",
+                        );
+                        return;
+                    }
+                }
                 let desc = ImageDescription {
                     transfer,
                     primaries,
                     max_cll: params.max_cll,
                     max_fall: params.max_fall,
                     mastering_luminance: params.mastering_luminance,
+                    mastering_primaries: params.mastering_primaries,
                     luminances: params.luminances,
                 };
                 drop(params);
+
+                // Without extended_target_volume, the target color volume must stay inside the
+                // primary color volume; the protocol recommends detecting violations and
+                // failing the image description gracefully.
+                if !state
+                    .color_management_state()
+                    .supported_features
+                    .contains(&Feature::ExtendedTargetVolume)
+                {
+                    let exceeds_gamut = desc.mastering_primaries.is_some_and(|mastering| {
+                        !Chromaticities::from_named(desc.primaries).gamut_contains(&mastering)
+                    });
+                    // A reference white above the maximum luminance encodes signal levels only
+                    // reachable with an extended target volume (see set_luminances).
+                    let exceeds_luminance = desc
+                        .luminances
+                        .is_some_and(|(_, max_lum, reference_lum)| reference_lum > max_lum);
+                    if exceeds_gamut || exceeds_luminance {
+                        make_failed_description(
+                            image_description,
+                            "target color volume exceeds the primary color volume \
+                             (extended_target_volume is not supported)",
+                            data_init,
+                        );
+                        return;
+                    }
+                }
+
                 make_ready_description(state, image_description, desc, data_init);
             }
             _ => {}
@@ -800,7 +1056,7 @@ where
         &self,
         state: &mut D,
         _client: &Client,
-        _resource: &WpImageDescriptionV1,
+        resource: &WpImageDescriptionV1,
         request: <WpImageDescriptionV1 as Resource>::Request,
         _dhandle: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
@@ -808,10 +1064,17 @@ where
         use wp_image_description_v1::Request;
         match request {
             Request::GetInformation { information } => {
+                let Some(desc) = self.desc else {
+                    resource.post_error(
+                        wp_image_description_v1::Error::NotReady,
+                        "the image description failed and never became ready",
+                    );
+                    return;
+                };
                 // The actual events (ending in the destructor `done`) are sent deferred —
                 // see the handler doc.
                 let info = data_init.init(information, ());
-                state.schedule_image_description_info(info, self.desc);
+                state.schedule_image_description_info(info, desc);
             }
             Request::Destroy => {}
             _ => {}
@@ -847,8 +1110,21 @@ fn make_ready_description<D>(
     D: Dispatch<WpImageDescriptionV1, ImageDescriptionData> + ColorManagementHandler + 'static,
 {
     let identity = state.color_management_state().identity_for(desc);
-    let image = data_init.init(image_description, ImageDescriptionData { desc });
+    let image = data_init.init(image_description, ImageDescriptionData { desc: Some(desc) });
     image.ready(identity);
+}
+
+/// Initializes a `wp_image_description_v1` that immediately fails gracefully with the
+/// `unsupported` cause; the object never becomes ready and can only be destroyed.
+fn make_failed_description<D>(
+    image_description: New<WpImageDescriptionV1>,
+    msg: &str,
+    data_init: &mut DataInit<'_, D>,
+) where
+    D: Dispatch<WpImageDescriptionV1, ImageDescriptionData> + 'static,
+{
+    let image = data_init.init(image_description, ImageDescriptionData { desc: None });
+    image.failed(wp_image_description_v1::Cause::Unsupported, msg.into());
 }
 
 #[cfg(test)]
@@ -873,6 +1149,7 @@ mod tests {
             max_cll: Some(800),
             max_fall: Some(400),
             mastering_luminance: None,
+            mastering_primaries: None,
             luminances: None,
         };
 
@@ -892,5 +1169,91 @@ mod tests {
         let c = state.identity_for(pq_brighter);
         assert_ne!(c, b);
         assert_eq!(state.identity_for(pq), b);
+        // Mastering primaries are part of a description's identity.
+        let pq_mastered = ImageDescription {
+            mastering_primaries: Some(Chromaticities::from_named(Primaries::DciP3)),
+            ..pq
+        };
+        let d = state.identity_for(pq_mastered);
+        assert_ne!(d, b);
+        assert_eq!(state.identity_for(pq_mastered), d);
+    }
+
+    #[test]
+    fn gamut_containment() {
+        let srgb = Chromaticities::from_named(Primaries::Srgb);
+        let bt2020 = Chromaticities::from_named(Primaries::Bt2020);
+        let dci_p3 = Chromaticities::from_named(Primaries::DciP3);
+        let xyz = Chromaticities::from_named(Primaries::Cie1931Xyz);
+
+        // A gamut contains itself (all points on the triangle boundary).
+        assert!(srgb.gamut_contains(&srgb));
+        assert!(bt2020.gamut_contains(&bt2020));
+
+        // Smaller gamuts are contained in wider ones, but not vice versa.
+        assert!(bt2020.gamut_contains(&srgb));
+        assert!(!srgb.gamut_contains(&bt2020));
+        assert!(bt2020.gamut_contains(&Chromaticities::from_named(Primaries::AdobeRgb)));
+        // The DCI-P3 red primary lies marginally outside the BT.2020 triangle, so P3 is not
+        // a strict subset of BT.2020 (nor the other way around).
+        assert!(!bt2020.gamut_contains(&dci_p3));
+        assert!(!dci_p3.gamut_contains(&bt2020));
+
+        // CIE 1931 XYZ spans the entire chromaticity diagram.
+        for other in [srgb, bt2020, dci_p3, xyz] {
+            assert!(xyz.gamut_contains(&other));
+        }
+        assert!(!srgb.gamut_contains(&xyz));
+    }
+
+    #[test]
+    fn points_on_edges_are_contained() {
+        let srgb = Chromaticities::from_named(Primaries::Srgb);
+        // The midpoint of the red-green edge lies exactly on the triangle boundary.
+        let midpoint = ((srgb.red.0 + srgb.green.0) / 2, (srgb.red.1 + srgb.green.1) / 2);
+        assert!(point_in_triangle(midpoint, srgb.red, srgb.green, srgb.blue));
+        // Nudged outwards (up, past the red-green edge) it is not contained.
+        assert!(!point_in_triangle(
+            (midpoint.0, midpoint.1 + 100_000),
+            srgb.red,
+            srgb.green,
+            srgb.blue
+        ));
+        // Winding order does not matter.
+        assert!(point_in_triangle(midpoint, srgb.blue, srgb.green, srgb.red));
+    }
+
+    #[test]
+    fn named_chromaticities_sanity() {
+        // Every named gamut contains its own white point.
+        for primaries in [
+            Primaries::Srgb,
+            Primaries::PalM,
+            Primaries::Pal,
+            Primaries::Ntsc,
+            Primaries::GenericFilm,
+            Primaries::Bt2020,
+            Primaries::Cie1931Xyz,
+            Primaries::DciP3,
+            Primaries::DisplayP3,
+            Primaries::AdobeRgb,
+        ] {
+            let c = Chromaticities::from_named(primaries);
+            assert!(
+                point_in_triangle(c.white, c.red, c.green, c.blue),
+                "white point of {primaries:?} outside its own gamut"
+            );
+        }
+
+        // Display P3 shares the DCI-P3 primaries but uses the D65 white point.
+        let dci_p3 = Chromaticities::from_named(Primaries::DciP3);
+        let display_p3 = Chromaticities::from_named(Primaries::DisplayP3);
+        assert_eq!(dci_p3.red, display_p3.red);
+        assert_eq!(dci_p3.green, display_p3.green);
+        assert_eq!(dci_p3.blue, display_p3.blue);
+        assert_eq!(
+            display_p3.white,
+            Chromaticities::from_named(Primaries::Srgb).white
+        );
     }
 }
