@@ -11,9 +11,12 @@
 //! DRM connector.
 //!
 //! Only *parametric* image descriptions with *named* transfer functions and primaries are
-//! supported; ICC-file and Windows-scRGB descriptions are rejected with `unsupported_feature`.
-//! The compositor chooses which transfer functions, primaries, features and rendering intents
-//! to advertise when creating the [`ColorManagementState`]. Mastering display metadata
+//! supported; ICC-file descriptions are rejected with `unsupported_feature`. The pre-defined
+//! Windows-scRGB description is available via [`Feature::WindowsScrgb`] and is flagged as
+//! [`windows_scrgb`](ImageDescription::windows_scrgb), exempting it from any tone mapping the
+//! compositor performs. The compositor chooses which transfer functions, primaries, features
+//! and rendering intents to advertise when creating the
+//! [`ColorManagementState`]. Mastering display metadata
 //! (target color volume) is supported via [`Feature::SetMasteringDisplayPrimaries`], including
 //! target volumes exceeding the primary color volume via [`Feature::ExtendedTargetVolume`];
 //! without the latter, such descriptions fail gracefully as the protocol recommends.
@@ -66,7 +69,7 @@ pub struct Chromaticities {
 impl Chromaticities {
     /// The chromaticities of a named set of primaries, per ITU-T H.273 (and the respective
     /// defining standards referenced by the protocol).
-    pub fn from_named(primaries: Primaries) -> Self {
+    pub const fn from_named(primaries: Primaries) -> Self {
         const D65: (i32, i32) = (312_700, 329_000);
         const C: (i32, i32) = (310_000, 316_000);
         match primaries {
@@ -132,7 +135,12 @@ impl Chromaticities {
             },
             // Named primaries added by future protocol versions; they cannot be advertised or
             // accepted by this implementation, so this is unreachable for stored descriptions.
-            _ => Self::from_named(Primaries::Srgb),
+            _ => Self {
+                red: (640_000, 330_000),
+                green: (300_000, 600_000),
+                blue: (150_000, 60_000),
+                white: D65,
+            },
         }
     }
 
@@ -190,6 +198,14 @@ pub struct ImageDescription {
     /// Content luminances as (min in 0.0001 cd/m², max in cd/m², reference white in cd/m²),
     /// if provided via `set_luminances`.
     pub luminances: Option<(u32, u32, u32)>,
+    /// Whether this is the pre-defined Windows-scRGB stimulus encoding (created via
+    /// `create_windows_scrgb`) rather than a client-authored parametric description.
+    ///
+    /// Windows-scRGB content is display-referred for a BT.2100/PQ-mode screen: compositors
+    /// implementing tone mapping must pass it through unmapped (clamping to the output volume
+    /// at most), unlike parametric descriptions with the same extended-linear transfer and
+    /// sRGB primaries, which describe content that may be tone mapped.
+    pub windows_scrgb: bool,
 }
 
 impl ImageDescription {
@@ -203,13 +219,34 @@ impl ImageDescription {
         mastering_luminance: None,
         mastering_primaries: None,
         luminances: None,
+        windows_scrgb: false,
+    };
+
+    /// The pre-defined Windows-scRGB stimulus encoding: sRGB primaries and white point with an
+    /// extended-linear transfer where R=G=B=1.0 corresponds to 80 cd/m² (up to 125.0 for
+    /// 10,000 cd/m²).
+    pub const WINDOWS_SCRGB: Self = Self {
+        transfer: TransferFunction::ExtLinear,
+        primaries: Primaries::Srgb,
+        max_cll: None,
+        max_fall: None,
+        mastering_luminance: None,
+        // The protocol leaves the target color volume unknown ("anything between sRGB and
+        // BT.2100"); assume BT.2020 like KWin so consumers don't clip wide-gamut content.
+        mastering_primaries: Some(Chromaticities::from_named(Primaries::Bt2020)),
+        // 1.0 = 80 cd/m²; the protocol suggests assuming a 203 cd/m² (BT.2408) reference
+        // white. Reference above maximum is the extended-target-volume shape inherent to
+        // scRGB's escape-the-gamut encoding.
+        luminances: Some((0, 80, 203)),
+        windows_scrgb: true,
     };
 
     /// Whether this description denotes HDR/wide-gamut content: an HDR transfer function
-    /// (PQ or HLG) or BT.2020 primaries.
+    /// (PQ or HLG), BT.2020 primaries, or the Windows-scRGB encoding.
     pub fn is_hdr(&self) -> bool {
         matches!(self.transfer, TransferFunction::St2084Pq | TransferFunction::Hlg)
             || matches!(self.primaries, Primaries::Bt2020)
+            || self.windows_scrgb
     }
 }
 
@@ -567,6 +604,7 @@ where
     D: Dispatch<WpColorManagementSurfaceV1, Weak<WlSurface>>,
     D: Dispatch<WpColorManagementSurfaceFeedbackV1, Weak<WlSurface>>,
     D: Dispatch<WpImageDescriptionCreatorParamsV1, Mutex<ImageDescriptionBuilder>>,
+    D: Dispatch<WpImageDescriptionV1, ImageDescriptionData>,
     D: ColorManagementHandler,
     D: 'static,
 {
@@ -623,10 +661,23 @@ where
                     "ICC image descriptions are not supported",
                 );
             }
-            Request::CreateWindowsScrgb { .. } => {
-                resource.post_error(
-                    wp_color_manager_v1::Error::UnsupportedFeature,
-                    "Windows scRGB image descriptions are not supported",
+            Request::CreateWindowsScrgb { image_description } => {
+                if !state
+                    .color_management_state()
+                    .supported_features
+                    .contains(&Feature::WindowsScrgb)
+                {
+                    resource.post_error(
+                        wp_color_manager_v1::Error::UnsupportedFeature,
+                        "Windows scRGB image descriptions are not supported",
+                    );
+                    return;
+                }
+                make_ready_description(
+                    state,
+                    image_description,
+                    ImageDescription::WINDOWS_SCRGB,
+                    data_init,
                 );
             }
             Request::Destroy => {}
@@ -1009,6 +1060,7 @@ where
                     mastering_luminance: params.mastering_luminance,
                     mastering_primaries: params.mastering_primaries,
                     luminances: params.luminances,
+                    windows_scrgb: false,
                 };
                 drop(params);
 
@@ -1071,6 +1123,15 @@ where
                     );
                     return;
                 };
+                // The protocol forbids get_information on descriptions from
+                // create_windows_scrgb.
+                if desc.windows_scrgb {
+                    resource.post_error(
+                        wp_image_description_v1::Error::NoInformation,
+                        "this image description does not allow get_information",
+                    );
+                    return;
+                }
                 // The actual events (ending in the destructor `done`) are sent deferred —
                 // see the handler doc.
                 let info = data_init.init(information, ());
@@ -1151,6 +1212,7 @@ mod tests {
             mastering_luminance: None,
             mastering_primaries: None,
             luminances: None,
+            windows_scrgb: false,
         };
 
         let a = state.identity_for(srgb);
@@ -1177,6 +1239,44 @@ mod tests {
         let d = state.identity_for(pq_mastered);
         assert_ne!(d, b);
         assert_eq!(state.identity_for(pq_mastered), d);
+
+        // Windows scRGB is distinct from a parametric description with identical values, so
+        // its tone-mapping exemption survives identity-based deduplication.
+        let scrgb = ImageDescription::WINDOWS_SCRGB;
+        let parametric_twin = ImageDescription {
+            windows_scrgb: false,
+            ..scrgb
+        };
+        let e = state.identity_for(scrgb);
+        let f = state.identity_for(parametric_twin);
+        assert_ne!(e, f);
+        assert_eq!(state.identity_for(scrgb), e);
+    }
+
+    #[test]
+    fn windows_scrgb_description() {
+        let scrgb = ImageDescription::WINDOWS_SCRGB;
+        assert!(scrgb.windows_scrgb);
+        assert!(scrgb.is_hdr());
+        assert_eq!(scrgb.transfer, TransferFunction::ExtLinear);
+        assert_eq!(scrgb.primaries, Primaries::Srgb);
+        // Assumed BT.2020 target volume, exceeding the sRGB primary volume.
+        assert_eq!(
+            scrgb.mastering_primaries,
+            Some(Chromaticities::from_named(Primaries::Bt2020))
+        );
+        // 1.0 = 80 cd/m² with an assumed 203 cd/m² reference white.
+        assert_eq!(scrgb.luminances, Some((0, 80, 203)));
+        // A parametric twin without the flag is not HDR by itself...
+        assert!(
+            !ImageDescription {
+                windows_scrgb: false,
+                mastering_primaries: None,
+                luminances: None,
+                ..scrgb
+            }
+            .is_hdr()
+        );
     }
 
     #[test]
