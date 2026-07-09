@@ -333,14 +333,17 @@ impl ImageDescription {
         windows_bt2100: true,
     };
 
-    /// Whether this description denotes HDR/wide-gamut content: an HDR transfer function
-    /// (PQ or HLG), BT.2020 primaries, or the Windows-scRGB encoding.
+    /// Whether this description denotes HDR/wide-gamut content: an HDR or extended-range
+    /// transfer function (PQ, HLG or extended linear), BT.2020 primaries, or the
+    /// Windows-scRGB encoding.
     pub fn is_hdr(&self) -> bool {
-        matches!(self.transfer, TransferFunction::St2084Pq | TransferFunction::Hlg)
-            || self
-                .primaries
-                .named
-                .is_some_and(|named| named == Primaries::Bt2020)
+        matches!(
+            self.transfer,
+            TransferFunction::St2084Pq | TransferFunction::Hlg | TransferFunction::ExtLinear
+        ) || self
+            .primaries
+            .named
+            .is_some_and(|named| named == Primaries::Bt2020)
             || self.windows_scrgb
     }
 
@@ -1480,9 +1483,10 @@ mod tests {
         );
         // 1.0 = 80 cd/m² with an assumed 203 cd/m² reference white.
         assert_eq!(scrgb.luminances, Some((0, 80, 203)));
-        // A parametric twin without the flag is not HDR by itself...
+        // A parametric extended-linear twin is extended-range content too (what Mesa's WSI
+        // creates for EXTENDED_SRGB_LINEAR swapchains), while a plain sRGB one is not.
         assert!(
-            !ImageDescription {
+            ImageDescription {
                 windows_scrgb: false,
                 mastering_primaries: None,
                 luminances: None,
@@ -1490,6 +1494,7 @@ mod tests {
             }
             .is_hdr()
         );
+        assert!(!ImageDescription::SRGB.is_hdr());
     }
 
     #[test]
