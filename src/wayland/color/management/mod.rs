@@ -10,8 +10,8 @@
 //! [`ConnectorColorState`](crate::backend::drm::ConnectorColorState) for signalling HDR on a
 //! DRM connector.
 //!
-//! Only *parametric* image descriptions with *named* transfer functions and primaries are
-//! supported; ICC-file descriptions are rejected with `unsupported_feature`. The pre-defined
+//! Only *parametric* image descriptions with *named* transfer functions are supported;
+//! ICC-file descriptions are rejected with `unsupported_feature`. The pre-defined
 //! Windows-scRGB description is available via [`Feature::WindowsScrgb`] and is flagged as
 //! [`windows_scrgb`](ImageDescription::windows_scrgb), exempting it from any tone mapping the
 //! compositor performs. The compositor chooses which transfer functions, primaries, features
@@ -20,6 +20,8 @@
 //! (target color volume) is supported via [`Feature::SetMasteringDisplayPrimaries`], including
 //! target volumes exceeding the primary color volume via [`Feature::ExtendedTargetVolume`];
 //! without the latter, such descriptions fail gracefully as the protocol recommends.
+//! Source image description primaries may also be set to arbitrary values via
+//! [`Feature::SetPrimaries`].
 //!
 //! ## Usage
 //!
@@ -64,6 +66,17 @@ pub struct Chromaticities {
     pub blue: (i32, i32),
     /// The white point as (x, y).
     pub white: (i32, i32),
+}
+
+/// The primary color volume of an image description: either a named set of primaries
+/// (`set_primaries_named`) or raw chromaticity coordinates (`set_primaries`). Exactly one is
+/// set on a created description; both `None` only occurs mid-build.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PrimariesOption {
+    /// The named primaries last set.
+    pub named: Option<Primaries>,
+    /// The actual raw primaries.
+    pub values: Option<Chromaticities>,
 }
 
 impl Chromaticities {
@@ -154,6 +167,16 @@ impl Chromaticities {
             .into_iter()
             .all(|p| point_in_triangle(p, self.red, self.green, self.blue))
     }
+
+    /// Cast dynamically from PrimariesOption
+    pub const fn from_option(primaries: PrimariesOption) -> Option<Chromaticities> {
+        match (primaries.values, primaries.named) {
+            (Some(val), None) => Some(val),
+            (None, Some(val)) => Some(Chromaticities::from_named(val)),
+            (None, None) => None,
+            (Some(_val), Some(_otherval)) => None, // Should not happen
+        }
+    }
 }
 
 /// Whether `p` lies inside (or on an edge of) the triangle `(a, b, c)`, in exact integer
@@ -182,7 +205,7 @@ pub struct ImageDescription {
     /// The transfer characteristics of the content.
     pub transfer: TransferFunction,
     /// The color primaries of the content.
-    pub primaries: Primaries,
+    pub primaries: PrimariesOption,
     /// Maximum content light level in cd/m², if the client provided it.
     pub max_cll: Option<u32>,
     /// Maximum frame-average light level in cd/m², if provided.
@@ -213,7 +236,10 @@ impl ImageDescription {
     /// description.
     pub const SRGB: Self = Self {
         transfer: TransferFunction::Srgb,
-        primaries: Primaries::Srgb,
+        primaries: PrimariesOption {
+            named: Some(Primaries::Srgb),
+            values: None,
+        },
         max_cll: None,
         max_fall: None,
         mastering_luminance: None,
@@ -227,7 +253,10 @@ impl ImageDescription {
     /// 10,000 cd/m²).
     pub const WINDOWS_SCRGB: Self = Self {
         transfer: TransferFunction::ExtLinear,
-        primaries: Primaries::Srgb,
+        primaries: PrimariesOption {
+            named: Some(Primaries::Srgb),
+            values: None,
+        },
         max_cll: None,
         max_fall: None,
         mastering_luminance: None,
@@ -245,7 +274,10 @@ impl ImageDescription {
     /// (PQ or HLG), BT.2020 primaries, or the Windows-scRGB encoding.
     pub fn is_hdr(&self) -> bool {
         matches!(self.transfer, TransferFunction::St2084Pq | TransferFunction::Hlg)
-            || matches!(self.primaries, Primaries::Bt2020)
+            || self
+                .primaries
+                .named
+                .is_some_and(|named| named == Primaries::Bt2020)
             || self.windows_scrgb
     }
 }
@@ -321,7 +353,7 @@ impl ImageDescriptionData {
 #[derive(Debug, Default)]
 pub struct ImageDescriptionBuilder {
     transfer: Option<TransferFunction>,
-    primaries: Option<Primaries>,
+    primaries: PrimariesOption,
     max_cll: Option<u32>,
     max_fall: Option<u32>,
     mastering_luminance: Option<(u32, u32)>,
@@ -384,22 +416,28 @@ pub fn send_image_description_info(info: &WpImageDescriptionInfoV1, desc: &Image
     if !info.is_alive() {
         return;
     }
-    let container = Chromaticities::from_named(desc.primaries);
-    info.primaries(
-        container.red.0,
-        container.red.1,
-        container.green.0,
-        container.green.1,
-        container.blue.0,
-        container.blue.1,
-        container.white.0,
-        container.white.1,
-    );
-    info.primaries_named(desc.primaries);
+    let container = Chromaticities::from_option(desc.primaries);
+    if let Some(primaries) = container {
+        info.primaries(
+            primaries.red.0,
+            primaries.red.1,
+            primaries.green.0,
+            primaries.green.1,
+            primaries.blue.0,
+            primaries.blue.1,
+            primaries.white.0,
+            primaries.white.1,
+        );
+    }
+    if let Some(named) = desc.primaries.named {
+        info.primaries_named(named);
+    }
     info.tf_named(desc.transfer);
     // The target color volume defaults to the primary color volume when no mastering display
-    // primaries were given.
-    let target = desc.mastering_primaries.unwrap_or(container);
+    // primaries were given, or fall back to sRGB.
+    let target = desc
+        .mastering_primaries
+        .unwrap_or(container.unwrap_or(Chromaticities::from_named(Primaries::Srgb)));
     info.target_primaries(
         target.red.0,
         target.red.1,
@@ -927,7 +965,7 @@ where
             }
             Request::SetPrimariesNamed { primaries } => {
                 let mut params = self.lock().unwrap();
-                if params.primaries.is_some() {
+                if params.primaries.named.is_some() || params.primaries.values.is_some() {
                     resource.post_error(Error::AlreadySet, "primaries already set");
                     return;
                 }
@@ -936,7 +974,7 @@ where
                     .ok()
                     .filter(|p| state.color_management_state().supported_primaries.contains(p))
                 {
-                    Some(p) => params.primaries = Some(p),
+                    Some(p) => params.primaries.named = Some(p),
                     None => resource.post_error(Error::InvalidPrimariesNamed, "unsupported primaries"),
                 }
             }
@@ -1031,18 +1069,49 @@ where
             Request::SetTfPower { .. } => {
                 resource.post_error(Error::UnsupportedFeature, "set_tf_power is not supported");
             }
-            Request::SetPrimaries { .. } => {
-                resource.post_error(Error::UnsupportedFeature, "set_primaries is not supported");
+            Request::SetPrimaries {
+                r_x,
+                r_y,
+                g_x,
+                g_y,
+                b_x,
+                b_y,
+                w_x,
+                w_y,
+            } => {
+                if !state
+                    .color_management_state()
+                    .supported_features
+                    .contains(&Feature::SetPrimaries)
+                {
+                    resource.post_error(Error::UnsupportedFeature, "set_primaries is not supported");
+                    return;
+                }
+                let mut params = self.lock().unwrap();
+                if params.primaries.values.is_some() || params.primaries.named.is_some() {
+                    resource.post_error(Error::AlreadySet, "primaries already set");
+                    return;
+                }
+                params.primaries.values = Some(Chromaticities {
+                    red: (r_x, r_y),
+                    green: (g_x, g_y),
+                    blue: (b_x, b_y),
+                    white: (w_x, w_y),
+                });
             }
             Request::Create { image_description } => {
                 let params = self.lock().unwrap();
-                let (Some(transfer), Some(primaries)) = (params.transfer, params.primaries) else {
-                    resource.post_error(
-                        Error::IncompleteSet,
-                        "transfer function and primaries are both required",
-                    );
+                let Some(transfer) = params.transfer else {
+                    resource.post_error(Error::IncompleteSet, "transfer function is required");
                     return;
                 };
+                let primaries = params.primaries;
+                // Exactly one of named/raw primaries must be set (the setters enforce mutual
+                // exclusion, so "both" cannot happen).
+                if primaries.named.is_some() == primaries.values.is_some() {
+                    resource.post_error(Error::IncompleteSet, "primaries are required");
+                    return;
+                }
                 if let (Some(max_cll), Some(max_fall)) = (params.max_cll, params.max_fall) {
                     if max_fall > max_cll {
                         resource.post_error(
@@ -1073,7 +1142,9 @@ where
                     .contains(&Feature::ExtendedTargetVolume)
                 {
                     let exceeds_gamut = desc.mastering_primaries.is_some_and(|mastering| {
-                        !Chromaticities::from_named(desc.primaries).gamut_contains(&mastering)
+                        !Chromaticities::from_option(desc.primaries)
+                            .unwrap()
+                            .gamut_contains(&mastering)
                     });
                     // A reference white above the maximum luminance encodes signal levels only
                     // reachable with an extended target volume (see set_luminances).
@@ -1206,7 +1277,10 @@ mod tests {
         let srgb = ImageDescription::SRGB;
         let pq = ImageDescription {
             transfer: TransferFunction::St2084Pq,
-            primaries: Primaries::Bt2020,
+            primaries: PrimariesOption {
+                named: Some(Primaries::Bt2020),
+                values: None,
+            },
             max_cll: Some(800),
             max_fall: Some(400),
             mastering_luminance: None,
@@ -1259,7 +1333,7 @@ mod tests {
         assert!(scrgb.windows_scrgb);
         assert!(scrgb.is_hdr());
         assert_eq!(scrgb.transfer, TransferFunction::ExtLinear);
-        assert_eq!(scrgb.primaries, Primaries::Srgb);
+        assert_eq!(scrgb.primaries.named, Some(Primaries::Srgb));
         // Assumed BT.2020 target volume, exceeding the sRGB primary volume.
         assert_eq!(
             scrgb.mastering_primaries,
@@ -1277,6 +1351,82 @@ mod tests {
             }
             .is_hdr()
         );
+    }
+
+    #[test]
+    fn custom_primaries() {
+        let named_srgb = PrimariesOption {
+            named: Some(Primaries::Srgb),
+            values: None,
+        };
+        let raw_srgb = PrimariesOption {
+            named: None,
+            values: Some(Chromaticities::from_named(Primaries::Srgb)),
+        };
+
+        // from_option resolves named primaries through the table and raw values as-is;
+        // an unset (mid-build) option resolves to nothing.
+        assert_eq!(
+            Chromaticities::from_option(named_srgb),
+            Some(Chromaticities::from_named(Primaries::Srgb))
+        );
+        assert_eq!(
+            Chromaticities::from_option(raw_srgb),
+            Some(Chromaticities::from_named(Primaries::Srgb))
+        );
+        assert_eq!(Chromaticities::from_option(PrimariesOption::default()), None);
+
+        // A description built from set_primaries with sRGB's coordinates is a different
+        // record than one built from set_primaries_named(srgb), even though the resolved
+        // chromaticities match: primaries_named must only be sent for the latter.
+        let mut state = ColorManagementState {
+            supported_tfs: Vec::new(),
+            supported_primaries: Vec::new(),
+            supported_features: Vec::new(),
+            supported_intents: Vec::new(),
+            identities: Vec::new(),
+            output_objects: Vec::new(),
+        };
+        let named_desc = ImageDescription::SRGB;
+        let raw_desc = ImageDescription {
+            primaries: raw_srgb,
+            ..named_desc
+        };
+        let a = state.identity_for(named_desc);
+        let b = state.identity_for(raw_desc);
+        assert_ne!(a, b);
+        // The same raw coordinates dedupe to the same identity.
+        assert_eq!(state.identity_for(raw_desc), b);
+
+        // Wide-gamut detection keys off *named* BT.2020 only; raw coordinates that happen
+        // to equal BT.2020 don't flag HDR.
+        let raw_bt2020 = ImageDescription {
+            primaries: PrimariesOption {
+                named: None,
+                values: Some(Chromaticities::from_named(Primaries::Bt2020)),
+            },
+            ..ImageDescription::SRGB
+        };
+        assert!(!raw_bt2020.is_hdr());
+        let named_bt2020 = ImageDescription {
+            primaries: PrimariesOption {
+                named: Some(Primaries::Bt2020),
+                values: None,
+            },
+            ..ImageDescription::SRGB
+        };
+        assert!(named_bt2020.is_hdr());
+
+        // The extended-target-volume containment check resolves custom containers too:
+        // a raw P3 container holds sRGB mastering primaries but not BT.2020 ones (this is
+        // the expression the create handler evaluates).
+        let raw_p3 = PrimariesOption {
+            named: None,
+            values: Some(Chromaticities::from_named(Primaries::DisplayP3)),
+        };
+        let container = Chromaticities::from_option(raw_p3).unwrap();
+        assert!(container.gamut_contains(&Chromaticities::from_named(Primaries::Srgb)));
+        assert!(!container.gamut_contains(&Chromaticities::from_named(Primaries::Bt2020)));
     }
 
     #[test]
