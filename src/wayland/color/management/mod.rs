@@ -280,6 +280,23 @@ impl ImageDescription {
                 .is_some_and(|named| named == Primaries::Bt2020)
             || self.windows_scrgb
     }
+
+    /// The primary color volume luminances as (min in 0.0001 cd/m², max in cd/m², reference
+    /// white in cd/m²): the explicit `set_luminances` values if the client provided them,
+    /// otherwise the defaults implied by the transfer function per the protocol
+    /// (PQ: 0.005/10,000/203; HLG: 0.005/1,000/203; BT.1886: 0.01/100/100; anything else the
+    /// sRGB defaults 0.2/80/80).
+    pub const fn luminances_or_default(&self) -> (u32, u32, u32) {
+        match self.luminances {
+            Some(lum) => lum,
+            None => match self.transfer {
+                TransferFunction::St2084Pq => (50, 10_000, 203),
+                TransferFunction::Hlg => (50, 1_000, 203),
+                TransferFunction::Bt1886 => (100, 100, 100),
+                _ => (2_000, 80, 80),
+            },
+        }
+    }
 }
 
 /// Double-buffered per-surface color management state.
@@ -433,6 +450,10 @@ pub fn send_image_description_info(info: &WpImageDescriptionInfoV1, desc: &Image
         info.primaries_named(named);
     }
     info.tf_named(desc.transfer);
+    // The primary color volume luminances must always be sent; clients (e.g. winewayland's
+    // HDR display detection) read the reference white from here.
+    let (min_lum, max_lum, reference_lum) = desc.luminances_or_default();
+    info.luminances(min_lum, max_lum, reference_lum);
     // The target color volume defaults to the primary color volume when no mastering display
     // primaries were given, or fall back to sRGB.
     let target = desc
@@ -448,9 +469,10 @@ pub fn send_image_description_info(info: &WpImageDescriptionInfoV1, desc: &Image
         target.white.0,
         target.white.1,
     );
-    if let Some((min, max)) = desc.mastering_luminance {
-        info.target_luminance(min, max);
-    }
+    // Likewise always sent: without mastering luminances the target volume has the primary
+    // color volume's luminance range.
+    let (target_min, target_max) = desc.mastering_luminance.unwrap_or((min_lum, max_lum));
+    info.target_luminance(target_min, target_max);
     if let Some(max_cll) = desc.max_cll {
         info.target_max_cll(max_cll);
     }
@@ -1351,6 +1373,33 @@ mod tests {
             }
             .is_hdr()
         );
+    }
+
+    #[test]
+    fn luminance_defaults() {
+        // Explicit set_luminances values win.
+        let scrgb = ImageDescription::WINDOWS_SCRGB;
+        assert_eq!(scrgb.luminances_or_default(), (0, 80, 203));
+
+        // Otherwise the transfer function implies the defaults from the protocol spec.
+        let pq = ImageDescription {
+            transfer: TransferFunction::St2084Pq,
+            luminances: None,
+            ..ImageDescription::SRGB
+        };
+        assert_eq!(pq.luminances_or_default(), (50, 10_000, 203));
+        let hlg = ImageDescription {
+            transfer: TransferFunction::Hlg,
+            ..pq
+        };
+        assert_eq!(hlg.luminances_or_default(), (50, 1_000, 203));
+        let bt1886 = ImageDescription {
+            transfer: TransferFunction::Bt1886,
+            ..pq
+        };
+        assert_eq!(bt1886.luminances_or_default(), (100, 100, 100));
+        // sRGB defaults for everything else (min is in 0.0001 cd/m² units).
+        assert_eq!(ImageDescription::SRGB.luminances_or_default(), (2_000, 80, 80));
     }
 
     #[test]
