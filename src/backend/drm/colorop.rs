@@ -7,9 +7,11 @@
 //! through their `NEXT` property and each describes one fixed-function color operation
 //! (a named 1D curve, a 1D/3D LUT, a 3x4 matrix or a multiplier).
 //!
-//! This module only performs *discovery*: it walks the advertised pipelines of a plane and
-//! returns a description of the operations they can perform. Selecting and programming a
-//! pipeline happens as part of the atomic plane state.
+//! This module performs *discovery* — it walks the advertised pipelines of a plane and
+//! returns a description of the operations they can perform — and *resolution*: matching a
+//! parametric [`ScanoutColorTransform`] against a discovered [`ColorPipeline`], producing the
+//! concrete colorop property values to program. The programming itself happens as part of the
+//! atomic plane state, see [`PlaneConfig::color_pipeline`](super::PlaneConfig::color_pipeline).
 //!
 //! Whether the capability could be enabled on a device is reported by
 //! [`DrmDevice::plane_color_pipelines_supported`](super::DrmDevice::plane_color_pipelines_supported);
@@ -18,9 +20,11 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::num::NonZeroU32;
 
-use drm::control::{Device as ControlDevice, from_u32, plane, property};
+use drm::control::{Device as ControlDevice, RawResourceHandle, from_u32, plane, property};
 
+use super::DrmDeviceFd;
 use super::error::{AccessError, Error};
 use crate::utils::DevPath;
 
@@ -162,7 +166,6 @@ pub struct ColorOp {
     pub bypassable: bool,
     /// The atomic property handles of this colorop by name, for programming it as part of a
     /// plane update.
-    #[allow(dead_code)] // Not consumed yet; pipeline programming builds on this.
     pub(super) props: HashMap<String, property::Handle>,
 }
 
@@ -382,4 +385,280 @@ where
         },
         next,
     })
+}
+
+/// A parametric color transform to apply to a plane's pixels during scanout.
+///
+/// Semantically the transform is `encode(ctm × (multiplier × decode(pixel)))`: the pixel is
+/// decoded to linear light, scaled, multiplied by a 3x4 matrix and re-encoded. Each stage is
+/// optional; the default value is the identity transform (equivalent to selecting no pipeline
+/// at all).
+///
+/// Linear-light values use the scale of the kernel's `PQ 125` curves: 1.0 corresponds to
+/// 80 cd/m² and 125.0 to 10,000 cd/m² for the PQ curves, while the SDR curves map \[0, 1\]
+/// electrical to \[0, 1\] linear.
+///
+/// A transform is turned into concrete colorop property values with [`Self::resolve`], or
+/// applied automatically by
+/// [`DrmCompositor::use_color_transforms`](super::compositor::DrmCompositor::use_color_transforms).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScanoutColorTransform {
+    /// The curve decoding the pixel values to linear light, or `None` if the content is
+    /// already linear.
+    pub decode: Option<Curve1DType>,
+    /// A gain applied to the linear pixel values; 1.0 is the identity.
+    pub multiplier: f64,
+    /// A 3x4 matrix applied to the linear pixel values, in row-major order with the fourth
+    /// column an offset (matching `struct drm_color_ctm_3x4`), or `None` for the identity.
+    pub ctm: Option<[f64; 12]>,
+    /// The curve re-encoding the linear pixel values, or `None` to keep them linear.
+    pub encode: Option<Curve1DType>,
+}
+
+impl Default for ScanoutColorTransform {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl ScanoutColorTransform {
+    /// The identity transform: pixels pass through unmodified (the plane's `COLOR_PIPELINE`
+    /// is set to `Bypass`).
+    pub const IDENTITY: Self = Self {
+        decode: None,
+        multiplier: 1.0,
+        ctm: None,
+        encode: None,
+    };
+
+    /// Whether this is the identity transform.
+    pub fn is_identity(&self) -> bool {
+        *self == Self::IDENTITY
+    }
+
+    /// Resolves this transform against a color pipeline, producing the property values to
+    /// program.
+    ///
+    /// Walks the pipeline's operations in order, assigning each stage of the transform to the
+    /// first operation that can express it and bypassing all others. Operations without a
+    /// `BYPASS` property are programmed to an identity where possible (matrix, multiplier);
+    /// pipelines with other non-bypassable unused operations are rejected, as are pipelines
+    /// that cannot express every stage.
+    ///
+    /// The `device` is used to create property blobs (e.g. the CTM matrix); their lifetime is
+    /// tied to the returned value.
+    ///
+    /// Returns `None` if the pipeline cannot express the transform.
+    pub fn resolve(&self, device: &DrmDeviceFd, pipeline: &ColorPipeline) -> Option<ResolvedColorPipeline> {
+        let mut resolved = ResolvedColorPipeline {
+            pipeline_id: pipeline.id,
+            props: Vec::new(),
+            blobs: Vec::new(),
+        };
+
+        // The remaining transform stages, in application order.
+        let mut decode = self.decode;
+        let mut multiplier = (self.multiplier != 1.0).then_some(self.multiplier);
+        let mut ctm = self.ctm;
+        let mut encode = self.encode;
+
+        for op in &pipeline.ops {
+            let mut used = false;
+
+            match &op.kind {
+                ColorOpKind::Curve1D { supported } => {
+                    // A curve op can take the decode stage, or the encode stage once
+                    // everything before it is placed.
+                    let stage = if decode.is_some() {
+                        &mut decode
+                    } else if multiplier.is_none() && ctm.is_none() {
+                        &mut encode
+                    } else {
+                        &mut None
+                    };
+                    if let Some(curve) = *stage {
+                        if let Some(&(_, value)) = supported.iter().find(|(c, _)| *c == curve) {
+                            resolved.set(op, "CURVE_1D_TYPE", value)?;
+                            *stage = None;
+                            used = true;
+                        }
+                    }
+                }
+                ColorOpKind::Multiplier => {
+                    if decode.is_none() {
+                        if let Some(gain) = multiplier {
+                            resolved.set(op, "MULTIPLIER", to_s31_32(gain))?;
+                            multiplier = None;
+                            used = true;
+                        }
+                    }
+                }
+                ColorOpKind::Ctm3x4 => {
+                    if decode.is_none() && (multiplier.is_some() || ctm.is_some()) {
+                        // Fold a pending gain into the matrix: out = M × (g × in) scales the
+                        // three input columns, leaving the offset column untouched.
+                        let gain = multiplier.take().unwrap_or(1.0);
+                        let mut matrix = ctm.take().unwrap_or(CTM_3X4_IDENTITY);
+                        for row in 0..3 {
+                            for col in 0..3 {
+                                matrix[row * 4 + col] *= gain;
+                            }
+                        }
+                        resolved.set_ctm(device, op, &matrix)?;
+                        used = true;
+                    }
+                }
+                ColorOpKind::Lut1D { .. } | ColorOpKind::Lut3D { .. } | ColorOpKind::Unknown { .. } => {}
+            }
+
+            if !used {
+                resolved.bypass(device, op)?;
+            }
+        }
+
+        // Every stage must have found an operation.
+        if decode.is_some() || multiplier.is_some() || ctm.is_some() || encode.is_some() {
+            return None;
+        }
+
+        Some(resolved)
+    }
+}
+
+const CTM_3X4_IDENTITY: [f64; 12] = [
+    1.0, 0.0, 0.0, 0.0, //
+    0.0, 1.0, 0.0, 0.0, //
+    0.0, 0.0, 1.0, 0.0,
+];
+
+/// Converts a floating point value to the kernel's S31.32 sign-magnitude fixed-point format.
+fn to_s31_32(value: f64) -> u64 {
+    let magnitude = (value.abs() * 4294967296.0).round() as u64;
+    let magnitude = magnitude.min(i64::MAX as u64);
+    ((value.is_sign_negative() as u64) << 63) | magnitude
+}
+
+/// `struct drm_color_ctm_3x4`: the contents of a 3x4 matrix colorop's `DATA` blob.
+#[repr(C)]
+struct CtmBlob {
+    matrix: [u64; 12],
+}
+
+/// A property blob owned by a [`ResolvedColorPipeline`], destroyed when dropped.
+#[derive(Debug)]
+struct OwnedBlob {
+    device: DrmDeviceFd,
+    id: u64,
+}
+
+impl Drop for OwnedBlob {
+    fn drop(&mut self) {
+        // Nothing to be done if this fails.
+        let _ = self.device.destroy_property_blob(self.id);
+    }
+}
+
+/// A [`ScanoutColorTransform`] resolved against a specific [`ColorPipeline`]: the plane's
+/// `COLOR_PIPELINE` value plus the property values of every colorop in the chain, ready to be
+/// added to an atomic commit via [`PlaneConfig::color_pipeline`](super::PlaneConfig::color_pipeline).
+///
+/// Owns the property blobs (e.g. the CTM matrix) referenced by the values; they are destroyed
+/// when the resolved pipeline is dropped, so it must be kept alive as long as a commit uses it.
+#[derive(Debug)]
+pub struct ResolvedColorPipeline {
+    pipeline_id: u64,
+    props: Vec<(RawResourceHandle, property::Handle, u64)>,
+    #[allow(dead_code)] // Held to keep the kernel blobs alive.
+    blobs: Vec<OwnedBlob>,
+}
+
+impl ResolvedColorPipeline {
+    /// The value to set the plane's `COLOR_PIPELINE` property to.
+    pub(super) fn pipeline_id(&self) -> u64 {
+        self.pipeline_id
+    }
+
+    /// The colorop property values to add to the atomic commit.
+    pub(super) fn props(&self) -> &[(RawResourceHandle, property::Handle, u64)] {
+        &self.props
+    }
+
+    fn op_handle(op: &ColorOp) -> Option<RawResourceHandle> {
+        NonZeroU32::new(op.id)
+    }
+
+    /// Programs a property of a used colorop, un-bypassing it.
+    fn set(&mut self, op: &ColorOp, prop: &str, value: u64) -> Option<()> {
+        let handle = Self::op_handle(op)?;
+        self.props.push((handle, *op.props.get(prop)?, value));
+        if op.bypassable {
+            self.props.push((handle, *op.props.get("BYPASS")?, 0));
+        }
+        Some(())
+    }
+
+    /// Programs the `DATA` blob of a 3x4 matrix colorop.
+    fn set_ctm(&mut self, device: &DrmDeviceFd, op: &ColorOp, matrix: &[f64; 12]) -> Option<()> {
+        let blob = CtmBlob {
+            matrix: matrix.map(to_s31_32),
+        };
+        let property::Value::Blob(id) = device.create_property_blob(&blob).ok()? else {
+            return None;
+        };
+        self.blobs.push(OwnedBlob {
+            device: device.clone(),
+            id,
+        });
+        self.set(op, "DATA", id)
+    }
+
+    /// Bypasses an unused colorop, or programs it to an identity if it cannot be bypassed.
+    fn bypass(&mut self, device: &DrmDeviceFd, op: &ColorOp) -> Option<()> {
+        if op.bypassable {
+            let handle = Self::op_handle(op)?;
+            self.props.push((handle, *op.props.get("BYPASS")?, 1));
+            return Some(());
+        }
+        match &op.kind {
+            ColorOpKind::Multiplier => self.set(op, "MULTIPLIER", to_s31_32(1.0)),
+            ColorOpKind::Ctm3x4 => self.set_ctm(device, op, &CTM_3X4_IDENTITY),
+            // Curves and LUTs have no identity we can program without uploading data;
+            // reject the pipeline.
+            _ => None,
+        }
+    }
+}
+
+impl PartialEq for ResolvedColorPipeline {
+    fn eq(&self, other: &Self) -> bool {
+        self.pipeline_id == other.pipeline_id && self.props == other.props
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn s31_32_encoding() {
+        assert_eq!(to_s31_32(0.0), 0);
+        assert_eq!(to_s31_32(1.0), 1 << 32);
+        assert_eq!(to_s31_32(2.5375), (2.5375f64 * 4294967296.0).round() as u64);
+        // Sign-magnitude: -1.0 is the magnitude of 1.0 with the sign bit set.
+        assert_eq!(to_s31_32(-1.0), (1 << 63) | (1 << 32));
+        assert_eq!(to_s31_32(-0.5), (1 << 63) | (1 << 31));
+    }
+
+    #[test]
+    fn identity_transform() {
+        assert!(ScanoutColorTransform::IDENTITY.is_identity());
+        assert!(ScanoutColorTransform::default().is_identity());
+        assert!(
+            !ScanoutColorTransform {
+                multiplier: 2.0,
+                ..Default::default()
+            }
+            .is_identity()
+        );
+    }
 }

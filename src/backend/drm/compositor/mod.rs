@@ -126,6 +126,7 @@
 //! }
 //! ```
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fmt::Debug,
     io::ErrorKind,
@@ -180,7 +181,7 @@ use crate::{
 use super::{
     DrmSurface, Framebuffer, PlaneClaim, PlaneInfo, Planes,
     color::{Colorspace, ConnectorColorState},
-    colorop::ColorPipeline,
+    colorop::{ColorPipeline, ResolvedColorPipeline, ScanoutColorTransform},
     error::AccessError,
     exporter::{ExportBuffer, ExportFramebuffer, gbm::GbmFramebufferExporter, gbm::NodeFilter},
     surface::VrrSupport,
@@ -500,12 +501,18 @@ struct PlaneConfig<B: Buffer, F: Framebuffer> {
     pub damage_clips: Option<PlaneDamageClips>,
     pub plane_claim: PlaneClaim,
     pub sync: Option<(SyncPoint, Option<Arc<OwnedFd>>)>,
+    pub color_pipeline: Option<Arc<ResolvedColorPipeline>>,
 }
 
 impl<B: Buffer, F: Framebuffer> PlaneConfig<B, F> {
     #[inline]
     pub fn is_compatible(&self, other: &PlaneConfig<B, F>) -> bool {
-        self.properties.is_compatible(&other.properties)
+        let color_pipeline_compatible = match (&self.color_pipeline, &other.color_pipeline) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
+            _ => false,
+        };
+        self.properties.is_compatible(&other.properties) && color_pipeline_compatible
     }
 }
 
@@ -518,6 +525,7 @@ impl<B: Buffer, F: Framebuffer> Clone for PlaneConfig<B, F> {
             damage_clips: self.damage_clips.clone(),
             plane_claim: self.plane_claim.clone(),
             sync: self.sync.clone(),
+            color_pipeline: self.color_pipeline.clone(),
         }
     }
 }
@@ -846,6 +854,7 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
                         .sync
                         .as_ref()
                         .and_then(|(_, fence)| fence.as_ref().map(|fence| fence.as_fd())),
+                    color_pipeline: config.color_pipeline.as_deref(),
                 }),
             })
     }
@@ -1120,6 +1129,17 @@ where
     opaque_regions: Vec<Rectangle<i32, Physical>>,
     element_opaque_regions_workhouse: Vec<Rectangle<i32, Physical>>,
 
+    plane_color_pipelines: HashMap<plane::Handle, Vec<ColorPipeline>>,
+    element_color_transforms: HashMap<Id, ScanoutColorTransform>,
+    deny_untransformed_scanout: bool,
+    resolved_color_pipelines: RefCell<
+        Vec<(
+            plane::Handle,
+            ScanoutColorTransform,
+            Option<Arc<ResolvedColorPipeline>>,
+        )>,
+    >,
+
     debug_flags: DebugFlags,
     span: tracing::Span,
 }
@@ -1281,6 +1301,7 @@ where
 
                     let overlay_plane_element_ids = OverlayPlaneElementIds::from_planes(&planes);
                     let current_frame = FrameState::from_planes(surface.plane(), &planes);
+                    let plane_color_pipelines = discover_plane_color_pipelines(&surface, &planes);
 
                     let drm_renderer = DrmCompositor {
                         primary_plane_element_id: Id::new(),
@@ -1305,6 +1326,10 @@ where
                         previous_element_states: IndexMap::new(),
                         opaque_regions: Vec::new(),
                         element_opaque_regions_workhouse: Vec::new(),
+                        plane_color_pipelines,
+                        element_color_transforms: HashMap::new(),
+                        deny_untransformed_scanout: false,
+                        resolved_color_pipelines: RefCell::new(Vec::new()),
                         supports_fencing,
                         debug_flags: DebugFlags::empty(),
                         span,
@@ -1463,6 +1488,7 @@ where
 
         let overlay_plane_element_ids = OverlayPlaneElementIds::from_planes(&planes);
         let current_frame = FrameState::from_planes(surface.plane(), &planes);
+        let plane_color_pipelines = discover_plane_color_pipelines(&surface, &planes);
 
         let drm_renderer = DrmCompositor {
             primary_plane_element_id: Id::new(),
@@ -1487,6 +1513,10 @@ where
             previous_element_states: IndexMap::new(),
             opaque_regions: Vec::new(),
             element_opaque_regions_workhouse: Vec::new(),
+            plane_color_pipelines,
+            element_color_transforms: HashMap::new(),
+            deny_untransformed_scanout: false,
+            resolved_color_pipelines: RefCell::new(Vec::new()),
             supports_fencing,
             debug_flags: DebugFlags::empty(),
             span,
@@ -1608,6 +1638,7 @@ where
                 damage_clips: None,
                 plane_claim,
                 sync: None,
+                color_pipeline: None,
             }),
         };
 
@@ -1882,6 +1913,7 @@ where
                 damage_clips: None,
                 plane_claim,
                 sync: None,
+                color_pipeline: None,
             }),
         };
 
@@ -2953,6 +2985,86 @@ where
             .map_err(FrameError::DrmError)
     }
 
+    /// Sets the per-element color transforms used for direct scan-out on subsequent frames.
+    ///
+    /// An element listed here is only assigned to a plane whose color pipeline can express its
+    /// transform; the pipeline is programmed as part of the same atomic commit that scans the
+    /// element out. Elements whose transform no plane can express are rendered instead, where
+    /// the renderer is responsible for the equivalent color conversion. Listing an element
+    /// with [`ScanoutColorTransform::IDENTITY`] marks it as matching the output's signal
+    /// (scan-out with the pipeline bypassed).
+    ///
+    /// `deny_unlisted` controls elements *not* in the map: `false` scans them out unconverted,
+    /// `true` excludes them from direct scan-out entirely. Set it on outputs whose signal
+    /// differs from the natural encoding of elements (e.g. an HDR output compositing SDR
+    /// content), so that elements without a known transform can never reach a plane raw.
+    ///
+    /// The state persists across frames; call with an empty map and `false` to restore the
+    /// default behavior.
+    #[allow(clippy::mutable_key_type)] // Id's Eq/Hash are stable.
+    pub fn use_color_transforms(
+        &mut self,
+        transforms: HashMap<Id, ScanoutColorTransform>,
+        deny_unlisted: bool,
+    ) {
+        if self.element_color_transforms == transforms && self.deny_untransformed_scanout == deny_unlisted {
+            return;
+        }
+        self.element_color_transforms = transforms;
+        self.deny_untransformed_scanout = deny_unlisted;
+
+        // Previously recorded scan-out failures may have been transform-related; forget them
+        // so planes are re-tested against the new transforms.
+        for state in self
+            .element_states
+            .values_mut()
+            .chain(self.previous_element_states.values_mut())
+        {
+            for instance in &mut state.instances {
+                instance.failed_planes = Default::default();
+            }
+        }
+    }
+
+    /// The pipeline configuration required to scan out the given element on the given plane:
+    /// `Ok(None)` scans out with the pipeline bypassed, `Ok(Some(_))` programs the resolved
+    /// pipeline, `Err(())` means the element must not be scanned out on this plane.
+    fn scanout_color_pipeline(
+        &self,
+        element_id: &Id,
+        plane: plane::Handle,
+    ) -> Result<Option<Arc<ResolvedColorPipeline>>, ()> {
+        let transform = match self.element_color_transforms.get(element_id) {
+            Some(transform) => *transform,
+            None if self.deny_untransformed_scanout => return Err(()),
+            None => return Ok(None),
+        };
+        if transform.is_identity() {
+            return Ok(None);
+        }
+
+        let mut cache = self.resolved_color_pipelines.borrow_mut();
+        if let Some((_, _, resolved)) = cache
+            .iter()
+            .find(|(handle, cached, _)| *handle == plane && *cached == transform)
+        {
+            return resolved.clone().map(Some).ok_or(());
+        }
+
+        let resolved = self
+            .plane_color_pipelines
+            .get(&plane)
+            .into_iter()
+            .flatten()
+            .find_map(|pipeline| transform.resolve(self.surface.device_fd(), pipeline))
+            .map(Arc::new);
+        if cache.len() >= RESOLVED_COLOR_PIPELINE_CACHE_SIZE {
+            cache.remove(0);
+        }
+        cache.push((plane, transform, resolved.clone()));
+        resolved.map(Some).ok_or(())
+    }
+
     /// Returns the valid range of the given connector's `max bpc` property, if any.
     ///
     /// See [`DrmSurface::max_bpc_range`] for more details.
@@ -3647,6 +3759,7 @@ where
             damage_clips: None,
             plane_claim,
             sync: None,
+            color_pipeline: None,
         };
         let is_compatible = previous_state
             .plane_state(plane_info.handle)
@@ -4217,6 +4330,20 @@ where
             }
         };
 
+        // Elements with a color transform may only reach a plane whose pipeline can express
+        // it; without color transform state, elements the current policy denies must be
+        // rendered instead.
+        let color_pipeline = match self.scanout_color_pipeline(element_id, plane.handle) {
+            Ok(pipeline) => pipeline,
+            Err(()) => {
+                trace!(
+                    "skipping direct scan-out on {:?} with zpos {:?} for element {:?}, color transform not expressible",
+                    plane.handle, plane.zpos, element_id,
+                );
+                return Err(Some(RenderingReason::ColorTransformUnsupported));
+            }
+        };
+
         // Try to assign the element to a plane
         trace!(
             "testing direct scan-out for element {:?} on {:?} with zpos {:?}: fb: {:?}, element_geometry: {:?}",
@@ -4299,6 +4426,7 @@ where
                 .buffer
                 .buffer
                 .acquire_point(self.signaled_fence.as_ref()),
+            color_pipeline,
         };
 
         let is_compatible = previous_state
@@ -4425,6 +4553,34 @@ where
 
         Ok(())
     }
+}
+
+/// Upper bound for the resolved-color-pipeline cache; entries are keyed by (plane, transform)
+/// and a frame only ever uses a handful of distinct transforms.
+const RESOLVED_COLOR_PIPELINE_CACHE_SIZE: usize = 32;
+
+/// Discovers the color pipelines of all planes the compositor may use.
+fn discover_plane_color_pipelines(
+    surface: &DrmSurface,
+    planes: &Planes,
+) -> HashMap<plane::Handle, Vec<ColorPipeline>> {
+    let mut map = HashMap::new();
+    let handles = std::iter::once(surface.plane())
+        .chain(planes.overlay.iter().map(|info| info.handle))
+        .chain(planes.cursor.iter().map(|info| info.handle));
+    for handle in handles {
+        match surface.plane_color_pipelines(handle) {
+            Ok(pipelines) => {
+                if !pipelines.is_empty() {
+                    map.insert(handle, pipelines);
+                }
+            }
+            Err(err) => {
+                debug!("failed to query color pipelines of {handle:?}: {err:?}");
+            }
+        }
+    }
+    map
 }
 
 #[inline]

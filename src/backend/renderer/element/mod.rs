@@ -270,6 +270,8 @@ pub enum RenderingReason {
     ScanoutFailed,
     /// Element was selected for async direct scan-out but failed
     AsyncScanoutFailed,
+    /// The element's color transform cannot be expressed by the plane's color pipeline
+    ColorTransformUnsupported,
 }
 
 /// Defines the presentation state of an element after rendering

@@ -16,7 +16,7 @@ pub(super) mod legacy;
 use super::{
     DrmDeviceFd, PlaneClaim, PlaneInfo, PlaneType, Planes,
     color::{Colorspace, ConnectorColorState},
-    colorop::ColorPipeline,
+    colorop::{ColorPipeline, ResolvedColorPipeline},
     device::PlaneClaimStorage,
     error::Error,
     plane_type,
@@ -162,6 +162,12 @@ pub struct PlaneConfig<'a> {
     pub fb: framebuffer::Handle,
     /// Optional fence
     pub fence: Option<BorrowedFd<'a>>,
+    /// Color pipeline to process the plane's pixels with during scanout.
+    ///
+    /// `None` sets the plane's `COLOR_PIPELINE` property to `Bypass` (when the plane has
+    /// one); `Some` selects the resolved pipeline and programs its colorops in the same
+    /// commit. See [`ScanoutColorTransform::resolve`](super::colorop::ScanoutColorTransform::resolve).
+    pub color_pipeline: Option<&'a ResolvedColorPipeline>,
 }
 
 /// VRR support state
