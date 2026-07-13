@@ -878,6 +878,20 @@ pub(crate) type RenderFrameErrorType<A, F, R> = RenderFrameError<
     <R as RendererSuper>::Error,
 >;
 
+/// Post-processing applied to cursor plane contents after they are filled.
+///
+/// Arguments: premultiplied ARGB8888 pixel data, the row stride in bytes, and the buffer's
+/// width and height in pixels.
+pub type CursorBufferTransformFn = Box<dyn Fn(&mut [u8], u32, (u32, u32)) + Send>;
+
+struct CursorBufferTransform(CursorBufferTransformFn);
+
+impl Debug for CursorBufferTransform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CursorBufferTransform")
+    }
+}
+
 #[derive(Debug)]
 struct CursorState<G: AsFd + 'static> {
     allocator: GbmAllocator<G>,
@@ -1132,6 +1146,8 @@ where
     plane_color_pipelines: HashMap<plane::Handle, Vec<ColorPipeline>>,
     element_color_transforms: HashMap<Id, ScanoutColorTransform>,
     deny_untransformed_scanout: bool,
+    cursor_buffer_transform: Option<CursorBufferTransform>,
+    cursor_buffer_transform_dirty: bool,
     resolved_color_pipelines: RefCell<
         Vec<(
             plane::Handle,
@@ -1329,6 +1345,8 @@ where
                         plane_color_pipelines,
                         element_color_transforms: HashMap::new(),
                         deny_untransformed_scanout: false,
+                        cursor_buffer_transform: None,
+                        cursor_buffer_transform_dirty: false,
                         resolved_color_pipelines: RefCell::new(Vec::new()),
                         supports_fencing,
                         debug_flags: DebugFlags::empty(),
@@ -1516,6 +1534,8 @@ where
             plane_color_pipelines,
             element_color_transforms: HashMap::new(),
             deny_untransformed_scanout: false,
+            cursor_buffer_transform: None,
+            cursor_buffer_transform_dirty: false,
             resolved_color_pipelines: RefCell::new(Vec::new()),
             supports_fencing,
             debug_flags: DebugFlags::empty(),
@@ -3026,6 +3046,21 @@ where
         }
     }
 
+    /// Sets a post-processing transform for cursor plane contents.
+    ///
+    /// Cursor plane contents bypass the renderer entirely (they are copied or
+    /// software-rendered into the cursor buffer), so on outputs whose signal differs from
+    /// plain sRGB the cursor pixels must be converted on the CPU; the transform runs over the
+    /// premultiplied ARGB8888 buffer every time the cursor is (re-)drawn. `None` restores the
+    /// pass-through behavior.
+    ///
+    /// Setting a transform always re-renders the cursor plane on the next frame, so only call
+    /// this when the transform actually changes.
+    pub fn set_cursor_buffer_transform(&mut self, transform: Option<CursorBufferTransformFn>) {
+        self.cursor_buffer_transform = transform.map(CursorBufferTransform);
+        self.cursor_buffer_transform_dirty = true;
+    }
+
     /// The pipeline configuration required to scan out the given element on the given plane:
     /// `Ok(None)` scans out with the pipeline bypassed, `Ok(Some(_))` programs the resolved
     /// pipeline, `Err(())` means the element must not be scanned out on this plane.
@@ -3520,10 +3555,11 @@ where
 
         // if the output transform or scale change we have to (re-)render the cursor plane,
         // also if the element changed or reports damage we have to render it
-        let render = cursor_state
-            .previous_output_transform
-            .map(|t| t != output_transform)
-            .unwrap_or(true)
+        let render = self.cursor_buffer_transform_dirty
+            || cursor_state
+                .previous_output_transform
+                .map(|t| t != output_transform)
+                .unwrap_or(true)
             || cursor_state
                 .previous_output_scale
                 .map(|s| s != scale)
@@ -3740,6 +3776,25 @@ where
                 return None;
             }
         };
+
+        if let Some(transform) = self.cursor_buffer_transform.as_ref() {
+            let res = cursor_buffer.map_mut(
+                0,
+                0,
+                cursor_plane_size.w as u32,
+                cursor_plane_size.h as u32,
+                |mbo| {
+                    let stride = mbo.stride();
+                    let size = (mbo.width(), mbo.height());
+                    (transform.0)(mbo.buffer_mut(), stride, size);
+                },
+            );
+            if let Err(err) = res {
+                debug!("failed to apply cursor buffer transform: {err}");
+                return None;
+            }
+        }
+        self.cursor_buffer_transform_dirty = false;
 
         let src = Rectangle::from_size(cursor_buffer_size).to_f64();
         let dst = Rectangle::new(cursor_plane_location, cursor_plane_size);
