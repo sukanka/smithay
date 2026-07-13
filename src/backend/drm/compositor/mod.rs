@@ -180,6 +180,7 @@ use crate::{
 use super::{
     DrmSurface, Framebuffer, PlaneClaim, PlaneInfo, Planes,
     color::{Colorspace, ConnectorColorState},
+    colorop::ColorPipeline,
     error::AccessError,
     exporter::{ExportBuffer, ExportFramebuffer, gbm::GbmFramebufferExporter, gbm::NodeFilter},
     surface::VrrSupport,
@@ -2940,6 +2941,15 @@ where
     pub fn hdr_metadata_supported(&self, conn: connector::Handle) -> FrameResult<bool, A, F> {
         self.surface
             .hdr_metadata_supported(conn)
+            .map_err(FrameError::DrmError)
+    }
+
+    /// Returns the color pipelines advertised on the given plane.
+    ///
+    /// See [`DrmSurface::plane_color_pipelines`] for more details.
+    pub fn plane_color_pipelines(&self, plane: plane::Handle) -> FrameResult<Vec<ColorPipeline>, A, F> {
+        self.surface
+            .plane_color_pipelines(plane)
             .map_err(FrameError::DrmError)
     }
 

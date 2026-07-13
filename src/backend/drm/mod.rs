@@ -71,6 +71,7 @@
 //! [`DrmDevice`] instead.
 
 pub mod color;
+pub mod colorop;
 #[cfg(all(feature = "wayland_frontend", feature = "backend_gbm"))]
 pub mod compositor;
 pub(crate) mod device;
@@ -89,6 +90,7 @@ use std::sync::Once;
 
 use crate::utils::{DevPath, Physical, Size};
 pub use color::{Colorspace, ConnectorColorState, CtaCoordinate, Eotf, HdrOutputMetadata};
+pub use colorop::{ColorOp, ColorOpKind, ColorPipeline, Curve1DType, Lut1DInterpolation, Lut3DInterpolation};
 pub use device::{
     DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmEvent, EventMetadata as DrmEventMetadata, PlaneClaim,
     Time as DrmEventTime, WeakDrmDeviceFd,

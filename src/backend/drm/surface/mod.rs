@@ -16,6 +16,7 @@ pub(super) mod legacy;
 use super::{
     DrmDeviceFd, PlaneClaim, PlaneInfo, PlaneType, Planes,
     color::{Colorspace, ConnectorColorState},
+    colorop::ColorPipeline,
     device::PlaneClaimStorage,
     error::Error,
     plane_type,
@@ -219,6 +220,17 @@ impl DrmSurface {
     /// Returns the [`PlaneInfo`] of the underlying primary [`plane`](drm::control::plane) of this surface
     pub fn plane_info(&self) -> &PlaneInfo {
         &self.primary_plane.0
+    }
+
+    /// Returns the color pipelines advertised on the given plane.
+    ///
+    /// See [`DrmDevice::plane_color_pipelines`](super::DrmDevice::plane_color_pipelines) for
+    /// more details; an empty list means the plane offers no (usable) pipelines.
+    pub fn plane_color_pipelines(&self, plane: plane::Handle) -> Result<Vec<ColorPipeline>, Error> {
+        if self.is_legacy() {
+            return Ok(Vec::new());
+        }
+        super::colorop::plane_color_pipelines(self, plane)
     }
 
     /// Currently used [`connector`](drm::control::connector)s of this surface

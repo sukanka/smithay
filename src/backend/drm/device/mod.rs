@@ -16,6 +16,7 @@ pub use self::fd::{DrmDeviceFd, WeakDrmDeviceFd};
 pub(super) mod legacy;
 use crate::utils::{Buffer, DevPath, Size};
 
+use super::colorop::ColorPipeline;
 use super::error::AccessError;
 use super::surface::{DrmSurface, DrmSurfaceInternal, atomic::AtomicDrmSurface, legacy::LegacyDrmSurface};
 use super::{Planes, error::Error, planes};
@@ -285,6 +286,30 @@ impl DrmDevice {
     /// Returns a set of available planes for a given crtc
     pub fn planes(&self, crtc: &crtc::Handle) -> Result<Planes, Error> {
         planes(self, crtc, self.has_universal_planes)
+    }
+
+    /// Returns whether the color pipeline uAPI (`DRM_CLIENT_CAP_PLANE_COLOR_PIPELINE`) is
+    /// enabled on this device.
+    ///
+    /// This requires an atomic device, a kernel with the color pipeline API (Linux 6.19+) and
+    /// `SMITHAY_NO_PLANE_COLOR_PIPELINE` not being set. Individual planes may still expose no
+    /// pipelines even when this returns `true`.
+    pub fn plane_color_pipelines_supported(&self) -> bool {
+        match &*self.internal {
+            DrmDeviceInternal::Atomic(dev) => dev.has_plane_color_pipeline,
+            DrmDeviceInternal::Legacy(_) => false,
+        }
+    }
+
+    /// Returns the color pipelines advertised on the given plane.
+    ///
+    /// Returns an empty list if the device or kernel does not support color pipelines, or if
+    /// the driver exposes none on this plane (e.g. cursor planes on amdgpu).
+    pub fn plane_color_pipelines(&self, plane: plane::Handle) -> Result<Vec<ColorPipeline>, Error> {
+        if !self.plane_color_pipelines_supported() {
+            return Ok(Vec::new());
+        }
+        super::colorop::plane_color_pipelines(self, plane)
     }
 
     /// Claim a plane so that it won't be used by a different crtc
