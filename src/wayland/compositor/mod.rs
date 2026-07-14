@@ -551,7 +551,7 @@ pub fn remove_destruction_hook(surface: &WlSurface, hook_id: &HookId) {
 /// The module will only evaluate blocker states on commit. If a blocker
 /// becomes ready later, a call to [`CompositorClientState::blocker_cleared`] is necessary
 /// to trigger a re-evaluation.
-pub fn add_blocker(surface: &WlSurface, blocker: impl Blocker + Send + 'static) {
+pub fn add_blocker(surface: &WlSurface, blocker: impl Blocker + Send + Sync + 'static) {
     PrivateSurfaceData::add_blocker(surface, blocker)
 }
 

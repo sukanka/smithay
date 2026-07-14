@@ -241,7 +241,7 @@ impl Blocker for SurfaceBarrierBlocker {
 #[derive(Default)]
 struct TransactionState {
     surfaces: Vec<(Weak<WlSurface>, Serial)>,
-    blockers: Vec<Box<dyn Blocker + Send>>,
+    blockers: Vec<Arc<dyn Blocker + Send + Sync>>,
 }
 
 impl TransactionState {
@@ -291,8 +291,8 @@ impl PendingTransaction {
         self.with_inner_state(|state| state.insert(surface, id))
     }
 
-    pub(crate) fn add_blocker<B: Blocker + Send + 'static>(&self, blocker: B) {
-        self.with_inner_state(|state| state.blockers.push(Box::new(blocker) as Box<_>))
+    pub(crate) fn add_blocker<B: Blocker + Send + Sync + 'static>(&self, blocker: B) {
+        self.with_inner_state(|state| state.blockers.push(Arc::new(blocker) as Arc<_>))
     }
 
     pub(crate) fn is_same_as(&self, other: &PendingTransaction) -> bool {
@@ -354,10 +354,10 @@ impl PendingTransaction {
 #[derive(Debug)]
 pub(crate) struct Transaction {
     surfaces: Vec<(Weak<WlSurface>, Serial)>,
-    blockers: Vec<Box<dyn Blocker + Send>>,
+    blockers: Vec<Arc<dyn Blocker + Send + Sync>>,
 }
 
-impl fmt::Debug for Box<dyn Blocker + Send> {
+impl fmt::Debug for dyn Blocker + Send + Sync {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Blocker").field("state", &self.state()).finish()
     }

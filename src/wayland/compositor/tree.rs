@@ -185,7 +185,7 @@ impl PrivateSurfaceData {
         f(&guard.public_data)
     }
 
-    pub fn add_blocker(surface: &WlSurface, blocker: impl Blocker + Send + 'static) {
+    pub fn add_blocker(surface: &WlSurface, blocker: impl Blocker + Send + Sync + 'static) {
         Self::lock_user_data(surface)
             .pending_transaction
             .add_blocker(blocker)
