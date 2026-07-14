@@ -44,7 +44,6 @@ use std::{
     sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
-use calloop::ping::Ping;
 use wayland_server::{DisplayHandle, Resource, Weak, protocol::wl_surface::WlSurface};
 
 use crate::utils::Serial;
@@ -178,36 +177,237 @@ impl Blocker for Barrier {
     }
 }
 
-/// A barrier waiting for multiple surfaces to be notified
+type BarrierNotifier = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Debug, Default)]
+struct BarrierSurfaceEntry {
+    // all immediate blockers of a transaction containing this surface have been cleared
+    notified: bool,
+    // that transaction also contains foreign pending delayed blockers we cannot fuse with
+    foreign_pending: bool,
+}
+
+struct BarrierGroupState {
+    #[allow(clippy::mutable_key_type)]
+    surfaces: HashMap<Weak<WlSurface>, BarrierSurfaceEntry>,
+    // released flag of every barrier fused into this group
+    members: Vec<Arc<AtomicBool>>,
+    // ready notifier of every barrier fused into this group
+    notifiers: Vec<BarrierNotifier>,
+    // the ready notification has been sent
+    signaled: bool,
+}
+
+impl fmt::Debug for BarrierGroupState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BarrierGroupState")
+            .field("surfaces", &self.surfaces)
+            .field("members", &self.members)
+            .field("signaled", &self.signaled)
+            .finish_non_exhaustive()
+    }
+}
+
+// Barrier groups form a union-find structure: fusing two groups redirects one
+// of them to the other, mirroring how `PendingTransaction`s are fused when
+// transactions are merged.
+#[derive(Debug)]
+enum BarrierGroupInner {
+    State(BarrierGroupState),
+    Fused(BarrierGroup),
+}
+
+#[derive(Debug, Clone)]
+struct BarrierGroup(Arc<Mutex<BarrierGroupInner>>);
+
+impl BarrierGroup {
+    fn new(state: BarrierGroupState) -> Self {
+        BarrierGroup(Arc::new(Mutex::new(BarrierGroupInner::State(state))))
+    }
+
+    /// Find the current root of this group
+    fn root(&self) -> BarrierGroup {
+        let mut next = self.clone();
+        loop {
+            let tmp = match &*next.0.lock().unwrap() {
+                BarrierGroupInner::State(_) => None,
+                BarrierGroupInner::Fused(into) => Some(into.clone()),
+            };
+            match tmp {
+                Some(into) => next = into,
+                None => return next,
+            }
+        }
+    }
+
+    fn with_state<T>(&self, f: impl FnOnce(&mut BarrierGroupState) -> T) -> T {
+        let mut next = self.clone();
+        loop {
+            let tmp = {
+                let mut guard = next.0.lock().unwrap();
+                match &mut *guard {
+                    BarrierGroupInner::State(state) => return f(state),
+                    BarrierGroupInner::Fused(into) => into.clone(),
+                }
+            };
+            next = tmp;
+        }
+    }
+
+    /// Fuse two groups into one.
+    ///
+    /// Afterwards both groups share their surfaces, members and notifiers: the ready
+    /// notification fires once the union of the tracked surfaces is ready and the
+    /// blockers of all fused barriers resolve together once every member barrier
+    /// has been released.
+    fn fuse(&self, other: &BarrierGroup) {
+        loop {
+            let a = self.root();
+            let b = other.root();
+            if Arc::ptr_eq(&a.0, &b.0) {
+                return;
+            }
+            // lock the two roots in address order to avoid lock cycles
+            let (first, second) = if Arc::as_ptr(&a.0) < Arc::as_ptr(&b.0) {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            let mut g1 = first.0.lock().unwrap();
+            let mut g2 = second.0.lock().unwrap();
+            // if another fuse redirected one of the roots in the meantime, retry
+            if !matches!(&*g1, BarrierGroupInner::State(_)) || !matches!(&*g2, BarrierGroupInner::State(_)) {
+                continue;
+            }
+            let BarrierGroupInner::State(merged) =
+                std::mem::replace(&mut *g2, BarrierGroupInner::Fused(first.clone()))
+            else {
+                unreachable!()
+            };
+            let BarrierGroupInner::State(state) = &mut *g1 else {
+                unreachable!()
+            };
+            state.surfaces.extend(merged.surfaces);
+            state.members.extend(merged.members);
+            state.notifiers.extend(merged.notifiers);
+            // the readiness condition changed, evaluate it anew
+            state.signaled = false;
+            return;
+        }
+    }
+
+    /// Checks whether the group became ready and if so sends the (one-shot) ready
+    /// notification to all fused barriers.
+    fn maybe_signal(&self) {
+        let notifiers = self.with_state(|state| {
+            if state.signaled {
+                return None;
+            }
+            let mut any_alive = false;
+            let ready = state.surfaces.iter().all(|(surface, entry)| {
+                if !surface.is_alive() {
+                    // dead surfaces are excused, their state will never be applied
+                    return true;
+                }
+                any_alive = true;
+                entry.notified && !entry.foreign_pending
+            });
+            if ready && any_alive {
+                state.signaled = true;
+                Some(state.notifiers.clone())
+            } else {
+                None
+            }
+        });
+        // invoke the notifiers without holding the group lock, so they may
+        // call `SurfaceBarrier::release` synchronously
+        if let Some(notifiers) = notifiers {
+            for notifier in notifiers {
+                notifier();
+            }
+        }
+    }
+}
+
+/// A barrier synchronizing state application across multiple, possibly unrelated, surfaces.
+///
+/// A `SurfaceBarrier` places a [`BlockerKind::Delayed`] blocker on every registered
+/// surface. Once every registered surface reached the point where all
+/// [`BlockerKind::Immediate`] blockers of its transaction have been cleared — i.e. the
+/// only thing holding back the state application is this barrier — the provided
+/// notifier is invoked. Calling [`SurfaceBarrier::release`] then applies the pending
+/// state of all registered surfaces.
+///
+/// One example use case are animation transactions spanning multiple otherwise
+/// unrelated surfaces.
+///
+/// # Grouping and atomicity
+///
+/// Transactions can merge (e.g. through synchronized subsurfaces), so blockers of two
+/// different `SurfaceBarrier`s can end up in the same transaction. In that case the
+/// two barriers are *fused*: they behave like a single barrier spanning the union of
+/// their surfaces. The ready notifiers of both barriers fire together (once the union
+/// is ready) and no state is applied before *both* barriers have been released. This
+/// keeps the application of the whole group atomic instead of letting one barrier
+/// release a part of a transaction group while another part keeps waiting.
+///
+/// If a transaction contains a foreign pending [`BlockerKind::Delayed`] blocker (one
+/// not belonging to a `SurfaceBarrier`), the ready notification is deferred until that
+/// blocker resolves, so that when the notifier fires, releasing the barrier is
+/// guaranteed to immediately apply the pending state of all registered surfaces.
+///
+/// # One-shot
+///
+/// A `SurfaceBarrier` is one-shot: the notifier fires at most once (unless a later
+/// fuse re-arms the evaluation) and after [`SurfaceBarrier::release`] the barrier is
+/// spent. Create a new `SurfaceBarrier` for the next synchronization point instead of
+/// re-using a released one.
+///
+/// The notifier only fires while at least one tracked surface is alive. If every
+/// tracked surface is destroyed (or their transactions cancelled) before the barrier
+/// becomes ready, the notifier never fires — compositors should observe surface
+/// destruction themselves and release or drop the barrier accordingly.
 #[derive(Debug, Clone)]
 pub struct SurfaceBarrier {
-    barrier: Barrier,
-    ping: Ping,
-    ready: Arc<AtomicBool>,
-    surfaces: Arc<Mutex<HashMap<Weak<WlSurface>, bool>>>,
+    group: BarrierGroup,
+    released: Arc<AtomicBool>,
 }
 
 impl SurfaceBarrier {
-    /// Initialize an empty surface barrier
+    /// Initialize an empty surface barrier.
     ///
-    /// [`Ping`] will be used to notify once all [`BlockerKind::Immediate`] blockers are cleared for tracked surfaces.
-    /// On receiving the ping [`SurfaceBarrier::release`] has to be called to clear the surface barrier blockers and
-    /// let the tracked surfaces make progress.
-    pub fn new(ping: Ping) -> Self {
-        Self::with_surfaces(ping, [])
+    /// `notifier` will be invoked once all [`BlockerKind::Immediate`] blockers are
+    /// cleared for all tracked surfaces (see the type level documentation for the
+    /// exact semantics). It is invoked outside of any compositor lock, directly from
+    /// within the surface commit or
+    /// [`blocker_cleared`](super::CompositorClientState::blocker_cleared) call that
+    /// completed the condition, so [`SurfaceBarrier::release`] may be called from
+    /// within it to apply the pending states within the same event loop iteration.
+    /// Alternatively it can simply wake the event loop, e.g. via
+    /// [`calloop::ping::Ping`]: `SurfaceBarrier::new(move || ping.ping())`.
+    ///
+    /// Note that the notifier can fire from within a surface commit dispatch; if it
+    /// mutates compositor state it must do so through appropriately shared state.
+    pub fn new(notifier: impl Fn() + Send + Sync + 'static) -> Self {
+        Self::with_surfaces(notifier, [])
     }
 
     /// Initializes a new [`SurfaceBarrier`] from a list of [`WlSurface`]
     ///
     /// See [`SurfaceBarrier::new`] for more information.
-    pub fn with_surfaces<'a>(ping: Ping, surfaces: impl IntoIterator<Item = &'a WlSurface>) -> Self {
-        let barrier = Barrier::new(false);
-        let ready = Arc::new(AtomicBool::new(false));
+    pub fn with_surfaces<'a>(
+        notifier: impl Fn() + Send + Sync + 'static,
+        surfaces: impl IntoIterator<Item = &'a WlSurface>,
+    ) -> Self {
+        let released = Arc::new(AtomicBool::new(false));
         let barrier = Self {
-            barrier,
-            ping,
-            ready,
-            surfaces: Arc::new(Mutex::new(HashMap::new())),
+            group: BarrierGroup::new(BarrierGroupState {
+                surfaces: HashMap::new(),
+                members: vec![released.clone()],
+                notifiers: vec![Arc::new(notifier)],
+                signaled: false,
+            }),
+            released,
         };
         barrier.register_surfaces(surfaces);
         barrier
@@ -216,78 +416,144 @@ impl SurfaceBarrier {
     /// Register surfaces to be tracked by this barrier.
     ///
     /// This will automatically insert a blocker that will resolve on [`SurfaceBarrier::release`].
+    ///
+    /// The blocker attaches to the pending transaction of each surface, so this is
+    /// meant to be called before the surface commit that should be held back, e.g.
+    /// from within a pre-commit hook or before sending the configure the client is
+    /// expected to ack. Registering additional surfaces re-arms the ready
+    /// notification.
     pub fn register_surfaces<'a>(&self, surfaces: impl IntoIterator<Item = &'a WlSurface>) {
-        let mut lock = self.surfaces.lock().unwrap();
-        for surface in surfaces {
-            if let std::collections::hash_map::Entry::Vacant(vacant_entry) = lock.entry(surface.downgrade()) {
-                vacant_entry.insert(false);
-                add_blocker(
-                    surface,
-                    SurfaceBarrierBlocker {
-                        barrier: self.barrier.clone(),
-                        ping: self.ping.clone(),
-                        ready: self.ready.clone(),
-                        surfaces: self.surfaces.clone(),
-                    },
-                );
+        let root = self.group.root();
+        let mut new_surfaces = Vec::new();
+        root.with_state(|state| {
+            for surface in surfaces {
+                if let std::collections::hash_map::Entry::Vacant(vacant_entry) =
+                    state.surfaces.entry(surface.downgrade())
+                {
+                    vacant_entry.insert(BarrierSurfaceEntry::default());
+                    state.signaled = false;
+                    new_surfaces.push(surface.clone());
+                }
             }
+        });
+        for surface in new_surfaces {
+            add_blocker(&surface, SurfaceBarrierBlocker { group: root.clone() });
         }
-        self.ready.store(false, std::sync::atomic::Ordering::Release);
     }
 
-    /// Release this barrier and clear the blocker on all tracked surfaces
+    /// Query if the ready notification has fired.
+    ///
+    /// This allows polling the barrier state instead of (or in addition to) using the
+    /// notifier passed to [`SurfaceBarrier::new`].
+    pub fn is_ready(&self) -> bool {
+        self.group.with_state(|state| state.signaled)
+    }
+
+    /// Release this barrier and clear the blocker on all tracked surfaces.
+    ///
+    /// If this barrier has been fused with other barriers (see the type level
+    /// documentation), the blockers only resolve once every fused barrier has been
+    /// released; the last release applies the pending states of the whole group.
     pub fn release<D: CompositorHandler + 'static>(&self, dh: &DisplayHandle, state: &mut D) {
-        self.barrier.signal();
-        #[allow(clippy::mutable_key_type)]
-        let surfaces = { std::mem::take(&mut *self.surfaces.lock().unwrap()) };
-        for (surface, _) in surfaces {
+        self.released.store(true, std::sync::atomic::Ordering::Release);
+        let surfaces: Vec<Weak<WlSurface>> = self.group.with_state(|group| {
+            if !group
+                .members
+                .iter()
+                .all(|released| released.load(std::sync::atomic::Ordering::Acquire))
+            {
+                // other barriers of the group are not released yet, the last
+                // one will wake the surfaces
+                return Vec::new();
+            }
+            group.surfaces.drain().map(|(surface, _)| surface).collect()
+        });
+        let mut seen_clients = HashSet::new();
+        for surface in surfaces {
             let Ok(surface) = surface.upgrade() else {
                 continue;
             };
             let Some(client) = surface.client() else {
                 continue;
             };
-            state.client_compositor_state(&client).blocker_cleared(state, dh);
+            if seen_clients.insert(client.id()) {
+                state.client_compositor_state(&client).blocker_cleared(state, dh);
+            }
         }
     }
 }
 
 #[derive(Debug, Clone)]
 struct SurfaceBarrierBlocker {
-    barrier: Barrier,
-    ping: Ping,
-    ready: Arc<AtomicBool>,
-    surfaces: Arc<Mutex<HashMap<Weak<WlSurface>, bool>>>,
+    group: BarrierGroup,
 }
 
 impl Blocker for SurfaceBarrierBlocker {
     fn state(&self) -> BlockerState {
-        self.barrier.state()
+        let released = self.group.with_state(|state| {
+            state
+                .members
+                .iter()
+                .all(|released| released.load(std::sync::atomic::Ordering::Acquire))
+        });
+        if released {
+            BlockerState::Released
+        } else {
+            BlockerState::Pending
+        }
     }
 
     fn kind(&self) -> BlockerKind {
         BlockerKind::Delayed
     }
 
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn notify(&self, context: &NotifyContext<'_>) {
-        if context.kind != NotifyKind::Ready {
-            return;
-        }
-        let mut surfaces = self.surfaces.lock().unwrap();
-        for surface in context.surfaces {
-            surfaces
-                .entry(surface.downgrade())
-                .and_modify(|state| *state = true);
-        }
-        if surfaces
-            .iter()
-            .all(|(surface, state)| *state || !surface.is_alive())
-        {
-            let signaled = self.ready.swap(true, std::sync::atomic::Ordering::AcqRel);
-            if !signaled {
-                self.ping.ping();
+        match context.kind {
+            NotifyKind::Ready => {
+                // fuse with all surface barriers that ended up in the same transaction,
+                // so the whole group stays atomic (this includes ourselves, which is a no-op)
+                for peer in context.delayed {
+                    if let Some(peer) = peer
+                        .as_any()
+                        .and_then(|any| any.downcast_ref::<SurfaceBarrierBlocker>())
+                    {
+                        self.group.fuse(&peer.group);
+                    }
+                }
+                // check for foreign delayed blockers we cannot coordinate with; defer
+                // the ready notification until they resolved
+                let foreign_pending = context.delayed.iter().any(|blocker| {
+                    blocker
+                        .as_any()
+                        .map(|any| any.downcast_ref::<SurfaceBarrierBlocker>().is_none())
+                        .unwrap_or(true)
+                        && blocker.state() == BlockerState::Pending
+                });
+                self.group.with_state(|state| {
+                    for surface in context.surfaces {
+                        if let Some(entry) = state.surfaces.get_mut(&surface.downgrade()) {
+                            entry.notified = true;
+                            entry.foreign_pending = foreign_pending;
+                        }
+                    }
+                });
+            }
+            NotifyKind::Cancelled => {
+                // the transaction was cancelled: the pending state of its surfaces
+                // will never be applied, waiting for them would stall the whole
+                // group forever
+                self.group.with_state(|state| {
+                    for surface in context.surfaces {
+                        state.surfaces.remove(&surface.downgrade());
+                    }
+                });
             }
         }
+        self.group.maybe_signal();
     }
 }
 
