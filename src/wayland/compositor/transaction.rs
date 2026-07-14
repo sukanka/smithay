@@ -449,6 +449,14 @@ impl SurfaceBarrier {
         self.group.with_state(|state| state.signaled)
     }
 
+    /// Query if [`SurfaceBarrier::release`] has been called on this barrier.
+    ///
+    /// Note that this only reflects this barrier's own release, not that of
+    /// other barriers fused with it.
+    pub fn is_released(&self) -> bool {
+        self.released.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Release this barrier and clear the blocker on all tracked surfaces.
     ///
     /// If this barrier has been fused with other barriers (see the type level
