@@ -61,6 +61,34 @@ pub enum BlockerKind {
     Delayed,
 }
 
+/// The transaction event a [`Blocker::notify`] call describes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyKind {
+    /// All [`BlockerKind::Immediate`] blockers of the transaction have been cleared.
+    ///
+    /// The transaction is now only waiting for its [`BlockerKind::Delayed`] blockers.
+    Ready,
+    /// The transaction has been cancelled and its state will be discarded.
+    ///
+    /// The blocker will never be evaluated for this transaction again.
+    Cancelled,
+}
+
+/// Context describing the transaction a [`Blocker::notify`] call originates from
+#[derive(Debug)]
+pub struct NotifyContext<'a> {
+    /// The event that triggered this notification
+    pub kind: NotifyKind,
+    /// The surfaces taking part in the transaction.
+    ///
+    /// Note that due to transaction merging (e.g. synchronized subsurfaces)
+    /// this can contain surfaces the blocker was never registered on.
+    pub surfaces: &'a [WlSurface],
+    /// All [`BlockerKind::Delayed`] blockers of the transaction, including the
+    /// blocker being notified.
+    pub delayed: &'a [Arc<dyn Blocker + Send + Sync>],
+}
+
 /// Types potentially blocking state changes
 pub trait Blocker {
     /// Retrieve the current state of the blocker
@@ -71,10 +99,30 @@ pub trait Blocker {
         BlockerKind::Immediate
     }
 
-    /// Notifies the blocker that all immediate blockers have been cleared
-    /// for a particular surface
-    fn notify(&self, surface: &WlSurface) {
-        let _ = surface;
+    /// Notifies a [`BlockerKind::Delayed`] blocker about a state change of a
+    /// transaction it takes part in.
+    ///
+    /// This is called once per transaction when all [`BlockerKind::Immediate`]
+    /// blockers have been cleared ([`NotifyKind::Ready`]), again whenever the set of
+    /// pending [`BlockerKind::Delayed`] blockers of that transaction shrinks while the
+    /// transaction is still pending, and once if the transaction is cancelled
+    /// ([`NotifyKind::Cancelled`]).
+    ///
+    /// Notifications are delivered outside of any compositor transaction lock, so
+    /// implementations are allowed to call
+    /// [`CompositorClientState::blocker_cleared`](super::CompositorClientState::blocker_cleared)
+    /// (directly or indirectly) from within `notify`.
+    fn notify(&self, context: &NotifyContext<'_>) {
+        let _ = context;
+    }
+
+    /// Returns `self` as [`std::any::Any`] for downcasting.
+    ///
+    /// [`BlockerKind::Delayed`] blockers that want to cooperate with other instances
+    /// of themselves inside the same transaction (see [`NotifyContext::delayed`])
+    /// should return `Some(self)` here.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
     }
 }
 
@@ -221,16 +269,21 @@ impl Blocker for SurfaceBarrierBlocker {
         BlockerKind::Delayed
     }
 
-    fn notify(&self, surface: &WlSurface) {
+    fn notify(&self, context: &NotifyContext<'_>) {
+        if context.kind != NotifyKind::Ready {
+            return;
+        }
         let mut surfaces = self.surfaces.lock().unwrap();
-        surfaces
-            .entry(surface.downgrade())
-            .and_modify(|state| *state = true);
+        for surface in context.surfaces {
+            surfaces
+                .entry(surface.downgrade())
+                .and_modify(|state| *state = true);
+        }
         if surfaces
             .iter()
             .all(|(surface, state)| *state || !surface.is_alive())
         {
-            let signaled = self.ready.swap(true, std::sync::atomic::Ordering::Acquire);
+            let signaled = self.ready.swap(true, std::sync::atomic::Ordering::AcqRel);
             if !signaled {
                 self.ping.ping();
             }
@@ -344,7 +397,13 @@ impl PendingTransaction {
             match inner {
                 TransactionInner::Data(TransactionState {
                     surfaces, blockers, ..
-                }) => return Transaction { surfaces, blockers },
+                }) => {
+                    return Transaction {
+                        surfaces,
+                        blockers,
+                        last_pending_delayed: None,
+                    };
+                }
                 TransactionInner::Fused(into) => self.inner = into,
             }
         }
@@ -355,6 +414,33 @@ impl PendingTransaction {
 pub(crate) struct Transaction {
     surfaces: Vec<(Weak<WlSurface>, Serial)>,
     blockers: Vec<Arc<dyn Blocker + Send + Sync>>,
+    // number of pending delayed blockers at the time of the last
+    // delivered notification, `None` if never notified
+    last_pending_delayed: Option<usize>,
+}
+
+/// A pending notification for the delayed blockers of a single transaction.
+///
+/// Built while holding the transaction queue lock, delivered after it
+/// has been released, so that `notify` implementations may re-enter the
+/// compositor (e.g. call `blocker_cleared`).
+pub(crate) struct DelayedNotification {
+    kind: NotifyKind,
+    surfaces: Vec<WlSurface>,
+    delayed: Vec<Arc<dyn Blocker + Send + Sync>>,
+}
+
+impl DelayedNotification {
+    pub(crate) fn deliver(&self) {
+        let context = NotifyContext {
+            kind: self.kind,
+            surfaces: &self.surfaces,
+            delayed: &self.delayed,
+        };
+        for blocker in &self.delayed {
+            blocker.notify(&context);
+        }
+    }
 }
 
 impl fmt::Debug for dyn Blocker + Send + Sync {
@@ -389,16 +475,29 @@ impl Transaction {
             })
     }
 
-    pub(crate) fn notify_blockers(&self) {
-        for (s, _) in &self.surfaces {
-            let Ok(surface) = s.upgrade() else {
-                continue;
-            };
+    fn delayed_blockers(&self) -> impl Iterator<Item = &Arc<dyn Blocker + Send + Sync>> {
+        self.blockers
+            .iter()
+            .filter(|blocker| blocker.kind() == BlockerKind::Delayed)
+    }
 
-            for blocker in self.blockers.iter() {
-                blocker.notify(&surface);
-            }
+    /// Builds a notification for the delayed blockers of this transaction,
+    /// or `None` if it has no delayed blockers.
+    fn notification(&self, kind: NotifyKind) -> Option<DelayedNotification> {
+        let delayed: Vec<_> = self.delayed_blockers().cloned().collect();
+        if delayed.is_empty() {
+            return None;
         }
+        let surfaces = self
+            .surfaces
+            .iter()
+            .filter_map(|(surface, _)| surface.upgrade().ok())
+            .collect();
+        Some(DelayedNotification {
+            kind,
+            surfaces,
+            delayed,
+        })
     }
 
     pub(crate) fn apply<C: CompositorHandler + 'static>(self, dh: &DisplayHandle, state: &mut C) {
@@ -433,9 +532,16 @@ impl TransactionQueue {
         self.transactions.push(t);
     }
 
-    pub(crate) fn take_ready(&mut self) -> Vec<Transaction> {
+    /// Removes and returns all transactions that are ready to be applied.
+    ///
+    /// Additionally returns the notifications for delayed blockers that became
+    /// due during this pass. They *must* be delivered (see
+    /// [`DelayedNotification::deliver`]) by the caller after all locks
+    /// protecting this queue have been released.
+    pub(crate) fn take_ready(&mut self) -> (Vec<Transaction>, Vec<DelayedNotification>) {
         // FIXME: Get rid of this allocation here
         let mut ready_transactions = Vec::new();
+        let mut notifications = Vec::new();
         // this is a very non-optimized implementation
         // we just iterate over the queue of transactions, keeping track of which
         // surface we have seen as they encode transaction dependencies
@@ -449,8 +555,10 @@ impl TransactionQueue {
             // does the transaction have any active blocker?
             match self.transactions[i].state(Some(BlockerKind::Immediate)) {
                 BlockerState::Cancelled => {
-                    // this transaction is cancelled, remove it without further processing
-                    self.transactions.remove(i);
+                    // this transaction is cancelled, remove it without further processing,
+                    // but let its delayed blockers know they will never be evaluated again
+                    let transaction = self.transactions.remove(i);
+                    notifications.extend(transaction.notification(NotifyKind::Cancelled));
                     continue;
                 }
                 BlockerState::Pending => {
@@ -484,13 +592,22 @@ impl TransactionQueue {
                 }
                 i += 1;
             } else {
-                // this transaction is to be applied, yay!
+                // all immediate blockers are cleared, check the delayed ones
                 let transaction = &mut self.transactions[i];
-
-                transaction.notify_blockers();
 
                 match transaction.state(None) {
                     BlockerState::Pending => {
+                        // still waiting for delayed blockers; notify them, but only
+                        // when their observable state changed since the last pass to
+                        // avoid notifying over and over
+                        let pending_delayed = transaction
+                            .delayed_blockers()
+                            .filter(|blocker| blocker.state() == BlockerState::Pending)
+                            .count();
+                        if transaction.last_pending_delayed != Some(pending_delayed) {
+                            transaction.last_pending_delayed = Some(pending_delayed);
+                            notifications.extend(transaction.notification(NotifyKind::Ready));
+                        }
                         // this transaction is not yet ready and should be skipped, add its surfaces to our
                         // seen list
                         for (s, _) in &transaction.surfaces {
@@ -503,15 +620,16 @@ impl TransactionQueue {
                         i += 1;
                     }
                     BlockerState::Released => ready_transactions.push(self.transactions.remove(i)),
-                    BlockerState::Cancelled =>
-                    // this transaction is cancelled, remove it without further processing
-                    {
-                        self.transactions.remove(i);
+                    BlockerState::Cancelled => {
+                        // this transaction is cancelled, remove it without further processing,
+                        // but let its delayed blockers know they will never be evaluated again
+                        let transaction = self.transactions.remove(i);
+                        notifications.extend(transaction.notification(NotifyKind::Cancelled));
                     }
                 }
             }
         }
 
-        ready_transactions
+        (ready_transactions, notifications)
     }
 }

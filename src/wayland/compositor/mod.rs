@@ -118,7 +118,9 @@ use std::{any::Any, sync::Mutex};
 pub use self::cache::{Cacheable, CachedState, MultiCache};
 pub use self::handlers::{RegionUserData, SubsurfaceCachedState, SubsurfaceUserData, SurfaceUserData};
 use self::transaction::TransactionQueue;
-pub use self::transaction::{Barrier, Blocker, BlockerKind, BlockerState, SurfaceBarrier};
+pub use self::transaction::{
+    Barrier, Blocker, BlockerKind, BlockerState, NotifyContext, NotifyKind, SurfaceBarrier,
+};
 pub use self::tree::{AlreadyHasRole, TraversalAction};
 use self::tree::{PrivateSurfaceData, SuggestedSurfaceState};
 use crate::input::touch::FrameMarker;
@@ -639,14 +641,19 @@ impl CompositorClientState {
     /// got `Released` or `Cancelled` from being `Pending` previously for any
     /// surface belonging to this client.
     pub fn blocker_cleared<D: CompositorHandler + 'static>(&self, state: &mut D, dh: &DisplayHandle) {
-        let transactions = if let Some(queue) = self.queue.lock().unwrap().as_mut() {
+        let (transactions, notifications) = if let Some(queue) = self.queue.lock().unwrap().as_mut() {
             queue.take_ready()
         } else {
-            Vec::new()
+            Default::default()
         };
 
         for transaction in transactions {
             transaction.apply(dh, state)
+        }
+
+        // notify delayed blockers, they might re-enter this function
+        for notification in notifications {
+            notification.deliver();
         }
     }
 
