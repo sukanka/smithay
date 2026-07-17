@@ -1144,7 +1144,7 @@ where
     element_opaque_regions_workhouse: Vec<Rectangle<i32, Physical>>,
 
     plane_color_pipelines: HashMap<plane::Handle, Vec<ColorPipeline>>,
-    element_color_transforms: HashMap<Id, ScanoutColorTransform>,
+    element_color_transforms: HashMap<Id, Option<ScanoutColorTransform>>,
     deny_untransformed_scanout: bool,
     cursor_buffer_transform: Option<CursorBufferTransform>,
     cursor_buffer_transform_dirty: bool,
@@ -3011,8 +3011,10 @@ where
     /// transform; the pipeline is programmed as part of the same atomic commit that scans the
     /// element out. Elements whose transform no plane can express are rendered instead, where
     /// the renderer is responsible for the equivalent color conversion. Listing an element
-    /// with [`ScanoutColorTransform::IDENTITY`] marks it as matching the output's signal
-    /// (scan-out with the pipeline bypassed).
+    /// with `Some(ScanoutColorTransform::IDENTITY)` marks it as matching the output's signal
+    /// (scan-out with the pipeline bypassed). Listing an element with `None` excludes it from
+    /// direct scan-out entirely: its conversion cannot be expressed by a plane color pipeline
+    /// at all (e.g. it requires tone mapping), so it must always go through the renderer.
     ///
     /// `deny_unlisted` controls elements *not* in the map: `false` scans them out unconverted,
     /// `true` excludes them from direct scan-out entirely. Set it on outputs whose signal
@@ -3024,7 +3026,7 @@ where
     #[allow(clippy::mutable_key_type)] // Id's Eq/Hash are stable.
     pub fn use_color_transforms(
         &mut self,
-        transforms: HashMap<Id, ScanoutColorTransform>,
+        transforms: HashMap<Id, Option<ScanoutColorTransform>>,
         deny_unlisted: bool,
     ) {
         if self.element_color_transforms == transforms && self.deny_untransformed_scanout == deny_unlisted {
@@ -3070,7 +3072,9 @@ where
         plane: plane::Handle,
     ) -> Result<Option<Arc<ResolvedColorPipeline>>, ()> {
         let transform = match self.element_color_transforms.get(element_id) {
-            Some(transform) => *transform,
+            // Listed with no expressible transform: the element must always be composited.
+            Some(None) => return Err(()),
+            Some(Some(transform)) => *transform,
             None if self.deny_untransformed_scanout => return Err(()),
             None => return Ok(None),
         };
