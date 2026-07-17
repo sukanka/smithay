@@ -363,6 +363,24 @@ impl ImageDescription {
             },
         }
     }
+
+    /// The peak luminance of the content in cd/m², for luminance mapping decisions such as
+    /// tone mapping to a less capable output.
+    ///
+    /// This is the tightest bound the description provides: the maximum content light level
+    /// if the client sent one, otherwise the mastering display's maximum luminance, otherwise
+    /// the primary color volume maximum (which for descriptions without explicit
+    /// `set_luminances` is the transfer function default, e.g. 10,000 cd/m² for PQ — see
+    /// [`Self::luminances_or_default`]).
+    pub const fn max_luminance(&self) -> u32 {
+        if let Some(max_cll) = self.max_cll {
+            return max_cll;
+        }
+        if let Some((_, max)) = self.mastering_luminance {
+            return max;
+        }
+        self.luminances_or_default().1
+    }
 }
 
 /// Double-buffered per-surface color management state.
