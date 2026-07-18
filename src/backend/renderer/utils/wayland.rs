@@ -63,6 +63,8 @@ struct InnerBuffer {
     acquire_point: Option<DrmSyncPoint>,
     #[cfg(feature = "backend_drm")]
     release_point: Option<DrmSyncPoint>,
+    #[cfg(feature = "backend_drm")]
+    release_fence: Mutex<Option<std::os::unix::io::OwnedFd>>,
 }
 
 impl Drop for InnerBuffer {
@@ -71,8 +73,22 @@ impl Drop for InnerBuffer {
         self.buffer.release();
         #[cfg(feature = "backend_drm")]
         if let Some(release_point) = &self.release_point {
-            if let Err(err) = release_point.signal() {
-                tracing::error!("Failed to signal syncobj release point: {}", err);
+            // Materialize the release point from the fence of the last frame that read the
+            // buffer, so it signals on GPU completion; fall back to signalling directly (the
+            // buffer never reached a renderer, or the fence could not be imported).
+            let fence = self.release_fence.get_mut().unwrap().take();
+            let imported = fence.is_some_and(|fence| {
+                release_point
+                    .import_sync_file(std::os::unix::io::AsFd::as_fd(&fence))
+                    .map_err(|err| {
+                        tracing::warn!("Failed to import syncobj release fence: {}", err);
+                    })
+                    .is_ok()
+            });
+            if !imported {
+                if let Err(err) = release_point.signal() {
+                    tracing::error!("Failed to signal syncobj release point: {}", err);
+                }
             }
         }
     }
@@ -94,6 +110,8 @@ impl Buffer {
                 acquire_point: None,
                 #[cfg(feature = "backend_drm")]
                 release_point: None,
+                #[cfg(feature = "backend_drm")]
+                release_fence: Mutex::new(None),
             }),
         }
     }
@@ -106,6 +124,7 @@ impl Buffer {
                 buffer,
                 acquire_point: Some(acquire_point),
                 release_point: Some(release_point),
+                release_fence: Mutex::new(None),
             }),
         }
     }
@@ -114,6 +133,24 @@ impl Buffer {
     #[allow(dead_code)]
     pub(crate) fn acquire_point(&self) -> Option<&DrmSyncPoint> {
         self.inner.acquire_point.as_ref()
+    }
+
+    /// Set the fence the explicit release sync point will be materialized from.
+    ///
+    /// Call after submitting rendering that reads the buffer, with a sync file fence for that
+    /// rendering. When the last reference to the buffer is dropped, the release point signals
+    /// through the most recently set fence — i.e. on actual GPU completion — instead of
+    /// immediately. Replacing an earlier fence is sound as long as both frames were submitted
+    /// to the same context (later submissions complete no earlier).
+    ///
+    /// No-op for buffers without an explicit release point.
+    #[cfg(feature = "backend_drm")]
+    pub fn set_release_fence(&self, fence: std::os::unix::io::BorrowedFd<'_>) {
+        if self.inner.release_point.is_some() {
+            if let Ok(fence) = fence.try_clone_to_owned() {
+                *self.inner.release_fence.lock().unwrap() = Some(fence);
+            }
+        }
     }
 }
 
@@ -173,6 +210,8 @@ impl RendererSurfaceState {
                             acquire_point: syncobj_state.acquire_point.take(),
                             #[cfg(feature = "backend_drm")]
                             release_point: syncobj_state.release_point.take(),
+                            #[cfg(feature = "backend_drm")]
+                            release_fence: Mutex::new(None),
                         }),
                     });
                 }
