@@ -2189,18 +2189,15 @@ where
         // If not do a single atomic commit test and when that fails render everything that failed
         // the test on the primary plane. This will also automatically correct any mistake we made
         // during plane assignment and start the full test cycle on the next frame.
-        if next_frame_state
-            .test_state_complete(
-                previous_state,
-                &self.surface,
-                self.supports_fencing,
-                false,
-                allow_partial_update,
-                presentation_mode,
-            )
-            .is_err()
-        {
-            trace!("atomic test failed for frame, resetting frame");
+        if let Err(err) = next_frame_state.test_state_complete(
+            previous_state,
+            &self.surface,
+            self.supports_fencing,
+            false,
+            allow_partial_update,
+            presentation_mode,
+        ) {
+            debug!(?err, "atomic test failed for frame, resetting frame");
 
             let mut removed_overlay_elements: Vec<(usize, &E)> = Vec::with_capacity(
                 next_frame_state
@@ -3097,6 +3094,15 @@ where
             .flatten()
             .find_map(|pipeline| transform.resolve(self.surface.device_fd(), pipeline))
             .map(Arc::new);
+        if resolved.is_none() {
+            let pipelines = self.plane_color_pipelines.get(&plane).map_or(0, Vec::len);
+            debug!(
+                ?plane,
+                pipelines,
+                ?transform,
+                "no color pipeline can express the scanout transform, denying scan-out"
+            );
+        }
         if cache.len() >= RESOLVED_COLOR_PIPELINE_CACHE_SIZE {
             cache.remove(0);
         }
@@ -3963,7 +3969,7 @@ where
                 .framebuffer_exporter
                 .add_framebuffer(self.surface.device_fd(), export_buffer, allow_opaque_fallback)
                 .map_err(|err| {
-                    trace!("failed to add framebuffer: {:?}", err);
+                    debug!("failed to add framebuffer: {:?}", err);
                     ExportBufferError::ExportFailed
                 })
                 .and_then(|fb| {
@@ -3972,7 +3978,7 @@ where
                 });
 
             if fb.is_err() {
-                trace!(
+                debug!(
                     "could not import framebuffer for element {:?} underlying storage {:?}",
                     element_id, &underlying_storage
                 );
