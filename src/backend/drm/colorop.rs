@@ -639,6 +639,238 @@ impl PartialEq for ResolvedColorPipeline {
 mod tests {
     use super::*;
 
+    /// A dummy device for resolve() calls that never create property blobs (no CTM stage and
+    /// no non-bypassable matrix): the fd is only dereferenced when a blob is created.
+    fn dummy_device() -> DrmDeviceFd {
+        let null = std::fs::File::open("/dev/null").unwrap();
+        DrmDeviceFd::new(crate::utils::DeviceFd::from(std::os::fd::OwnedFd::from(null)))
+    }
+
+    fn op(id: u32, kind: ColorOpKind, bypassable: bool) -> ColorOp {
+        // resolve() looks up properties by name; hand every op the full set with arbitrary
+        // (nonzero) handles.
+        let props = ["BYPASS", "CURVE_1D_TYPE", "MULTIPLIER", "DATA"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                (
+                    name.to_string(),
+                    from_u32::<property::Handle>(1000 + id + i as u32).unwrap(),
+                )
+            })
+            .collect();
+        ColorOp {
+            id,
+            kind,
+            bypassable,
+            props,
+        }
+    }
+
+    fn curve(id: u32, supported: &[Curve1DType], bypassable: bool) -> ColorOp {
+        op(
+            id,
+            ColorOpKind::Curve1D {
+                supported: supported.iter().map(|&c| (c, c as u64)).collect(),
+            },
+            bypassable,
+        )
+    }
+
+    /// The pipelines advertised by nvidia-drm 610.43.03 on a GeForce RTX 5070 Ti
+    /// (`COLOR_PIPELINE` enum on the primary plane), as discovered via drm_info:
+    ///
+    /// "NVIDIA Full": 3x4 Matrix, 1D Curve {PQ 125 EOTF}, 1D LUT, Multiplier, 3x4 Matrix,
+    /// 1D Curve {PQ 125 Inverse EOTF} (non-bypassable), 3x4 Matrix, 1D LUT, 3x4 Matrix,
+    /// 1D Curve {PQ 125 EOTF} (non-bypassable), 3x4 Matrix.
+    fn nvidia_full() -> ColorPipeline {
+        ColorPipeline {
+            id: 58,
+            ops: vec![
+                op(58, ColorOpKind::Ctm3x4, true),
+                curve(63, &[Curve1DType::Pq125Eotf], true),
+                op(
+                    68,
+                    ColorOpKind::Lut1D {
+                        size: 1024,
+                        interpolation: Lut1DInterpolation::Linear,
+                    },
+                    true,
+                ),
+                op(75, ColorOpKind::Multiplier, true),
+                op(80, ColorOpKind::Ctm3x4, true),
+                curve(85, &[Curve1DType::Pq125InvEotf], false),
+                op(89, ColorOpKind::Ctm3x4, true),
+                op(
+                    94,
+                    ColorOpKind::Lut1D {
+                        size: 1024,
+                        interpolation: Lut1DInterpolation::Linear,
+                    },
+                    true,
+                ),
+                op(101, ColorOpKind::Ctm3x4, true),
+                curve(106, &[Curve1DType::Pq125Eotf], false),
+                op(110, ColorOpKind::Ctm3x4, true),
+            ],
+        }
+    }
+
+    /// "NVIDIA Lite": 3x4 Matrix, 1D Curve {PQ 125 EOTF}, 1D LUT, Multiplier, 3x4 Matrix.
+    fn nvidia_lite() -> ColorPipeline {
+        ColorPipeline {
+            id: 115,
+            ops: vec![
+                op(115, ColorOpKind::Ctm3x4, true),
+                curve(120, &[Curve1DType::Pq125Eotf], true),
+                op(
+                    125,
+                    ColorOpKind::Lut1D {
+                        size: 1024,
+                        interpolation: Lut1DInterpolation::Linear,
+                    },
+                    true,
+                ),
+                op(132, ColorOpKind::Multiplier, true),
+                op(137, ColorOpKind::Ctm3x4, true),
+            ],
+        }
+    }
+
+    /// "NVIDIA FP Full": 3x4 Matrix, 3x4 Matrix, 1D Curve {PQ 125 Inverse EOTF}
+    /// (non-bypassable), 3x4 Matrix, 1D LUT, 3x4 Matrix, 1D Curve {PQ 125 EOTF}
+    /// (non-bypassable), 3x4 Matrix.
+    fn nvidia_fp_full() -> ColorPipeline {
+        ColorPipeline {
+            id: 142,
+            ops: vec![
+                op(142, ColorOpKind::Ctm3x4, true),
+                op(147, ColorOpKind::Ctm3x4, true),
+                curve(152, &[Curve1DType::Pq125InvEotf], false),
+                op(156, ColorOpKind::Ctm3x4, true),
+                op(
+                    161,
+                    ColorOpKind::Lut1D {
+                        size: 1024,
+                        interpolation: Lut1DInterpolation::Linear,
+                    },
+                    true,
+                ),
+                op(168, ColorOpKind::Ctm3x4, true),
+                curve(173, &[Curve1DType::Pq125Eotf], false),
+                op(177, ColorOpKind::Ctm3x4, true),
+            ],
+        }
+    }
+
+    /// "NVIDIA FP Lite": 3x4 Matrix, 3x4 Matrix.
+    fn nvidia_fp_lite() -> ColorPipeline {
+        ColorPipeline {
+            id: 182,
+            ops: vec![
+                op(182, ColorOpKind::Ctm3x4, true),
+                op(187, ColorOpKind::Ctm3x4, true),
+            ],
+        }
+    }
+
+    fn nvidia_pipelines() -> Vec<ColorPipeline> {
+        vec![nvidia_full(), nvidia_lite(), nvidia_fp_full(), nvidia_fp_lite()]
+    }
+
+    fn resolve_any(transform: &ScanoutColorTransform, pipelines: &[ColorPipeline]) -> bool {
+        let device = dummy_device();
+        pipelines.iter().any(|p| transform.resolve(&device, p).is_some())
+    }
+
+    /// The transform shapes niri uses on HDR (PQ blend space) outputs are inexpressible on
+    /// the nvidia-drm pipelines: the curve ops only offer the PQ 125 pair (no Gamma 2.2 /
+    /// sRGB curves), and the trailing non-bypassable `PQ 125 Inverse EOTF` / `PQ 125 EOTF`
+    /// pair means every pipeline ends in linear light, so a transform whose final stage is a
+    /// PQ encode can never resolve. The result is that direct scan-out is denied for
+    /// essentially all non-identity content on these pipelines.
+    #[test]
+    fn nvidia_pipelines_reject_pq_blend_transforms() {
+        let pipelines = nvidia_pipelines();
+
+        // SDR content on an HDR output: gamma 2.2 decode, reference-white gain, PQ encode.
+        // (The real transform also carries a BT.709->BT.2020 CTM; resolution fails before
+        // the CTM is placed, so the blob-free variant exercises the same path.)
+        let sdr_on_hdr = ScanoutColorTransform {
+            decode: Some(Curve1DType::Gamma22),
+            multiplier: 203. / 80.,
+            ctm: None,
+            encode: Some(Curve1DType::Pq125InvEotf),
+        };
+        assert!(!resolve_any(&sdr_on_hdr, &pipelines));
+
+        // PQ content needing a PQ round-trip (e.g. non-BT.2020 container): rejected because
+        // the trailing non-bypassable PQ 125 EOTF cannot be bypassed or used.
+        let pq_reencode = ScanoutColorTransform {
+            decode: Some(Curve1DType::Pq125Eotf),
+            multiplier: 1.0,
+            ctm: None,
+            encode: Some(Curve1DType::Pq125InvEotf),
+        };
+        assert!(!resolve_any(&pq_reencode, &pipelines));
+
+        // HDR content on an SDR output: PQ decode, gain, gamma 2.2 encode.
+        let hdr_on_sdr = ScanoutColorTransform {
+            decode: Some(Curve1DType::Pq125Eotf),
+            multiplier: 80. / 203.,
+            ctm: None,
+            encode: Some(Curve1DType::Gamma22Inv),
+        };
+        assert!(!resolve_any(&hdr_on_sdr, &pipelines));
+    }
+
+    /// Transforms that end in linear light (no encode stage) fit the "NVIDIA Lite" pipeline,
+    /// confirming the hardware model: nvidia planes decode and gain before a linear-light
+    /// blend, and the wire encode happens after blending (CRTC regamma).
+    #[test]
+    fn nvidia_lite_accepts_linear_output_transforms() {
+        let decode_and_gain = ScanoutColorTransform {
+            decode: Some(Curve1DType::Pq125Eotf),
+            multiplier: 2.0,
+            ctm: None,
+            encode: None,
+        };
+        assert!(resolve_any(&decode_and_gain, &[nvidia_lite()]));
+        // The Full pipeline still rejects it: its trailing non-bypassable PQ pair is not
+        // recognized as an identity.
+        assert!(!resolve_any(&decode_and_gain, &[nvidia_full()]));
+    }
+
+    /// Control: an AMD-style pipeline (every op bypassable, SDR + PQ curves available)
+    /// resolves the same transforms the nvidia pipelines reject.
+    #[test]
+    fn bypassable_pipeline_accepts_pq_blend_transforms() {
+        let all_curves = [
+            Curve1DType::SrgbEotf,
+            Curve1DType::SrgbInvEotf,
+            Curve1DType::Pq125Eotf,
+            Curve1DType::Pq125InvEotf,
+            Curve1DType::Gamma22,
+            Curve1DType::Gamma22Inv,
+        ];
+        let pipeline = ColorPipeline {
+            id: 300,
+            ops: vec![
+                curve(300, &all_curves, true),
+                op(310, ColorOpKind::Multiplier, true),
+                curve(320, &all_curves, true),
+            ],
+        };
+
+        let sdr_on_hdr = ScanoutColorTransform {
+            decode: Some(Curve1DType::Gamma22),
+            multiplier: 203. / 80.,
+            ctm: None,
+            encode: Some(Curve1DType::Pq125InvEotf),
+        };
+        assert!(resolve_any(&sdr_on_hdr, &[pipeline]));
+    }
+
     #[test]
     fn s31_32_encoding() {
         assert_eq!(to_s31_32(0.0), 0);
