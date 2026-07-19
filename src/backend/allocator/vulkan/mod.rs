@@ -739,13 +739,32 @@ impl VulkanAllocator {
             .drm_format_modifier_plane_count;
 
         // Allocate image memory
-        let memory_reqs = unsafe { self.device.get_image_memory_requirements(guard.image) };
+        //
+        // Some drivers (e.g. RADV for linear exportable images) require a dedicated allocation
+        // (VUID-vkBindImageMemory-image-01445), so query the requirements with
+        // VkMemoryDedicatedRequirements chained in.
+        let mut dedicated_reqs = vk::MemoryDedicatedRequirements::default();
+        let memory_reqs = {
+            let info = vk::ImageMemoryRequirementsInfo2::default().image(guard.image);
+            let mut memory_reqs = vk::MemoryRequirements2::default().push_next(&mut dedicated_reqs);
+            unsafe {
+                self.device
+                    .get_image_memory_requirements2(&info, &mut memory_reqs)
+            };
+            memory_reqs.memory_requirements
+        };
         // TODO: Memory type index
         let mut export_memory_allocate_info = vk::ExportMemoryAllocateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-        let alloc_create_info = vk::MemoryAllocateInfo::default()
+        let mut dedicated_allocate_info = vk::MemoryDedicatedAllocateInfo::default().image(guard.image);
+        let mut alloc_create_info = vk::MemoryAllocateInfo::default()
             .allocation_size(memory_reqs.size)
             .push_next(&mut export_memory_allocate_info);
+        if dedicated_reqs.requires_dedicated_allocation == vk::TRUE
+            || dedicated_reqs.prefers_dedicated_allocation == vk::TRUE
+        {
+            alloc_create_info = alloc_create_info.push_next(&mut dedicated_allocate_info);
+        }
 
         unsafe {
             // Allocate memory for the image.
