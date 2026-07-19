@@ -2,7 +2,7 @@
 
 use ash::vk;
 
-use crate::backend::allocator::Fourcc;
+use crate::backend::{SwapBuffersError, allocator::Fourcc};
 
 /// Error returned by the [`VulkanRenderer`](super::VulkanRenderer) and [`VulkanFrame`](super::VulkanFrame).
 #[derive(Debug, thiserror::Error)]
@@ -57,4 +57,23 @@ pub enum VulkanError {
     /// The dmabuf could not be imported
     #[error("Failed to import the dmabuf: {0}")]
     DmabufImport(&'static str),
+}
+
+impl From<VulkanError> for SwapBuffersError {
+    #[inline]
+    fn from(err: VulkanError) -> SwapBuffersError {
+        match err {
+            // Unrecoverable device or setup failures.
+            VulkanError::Vk(vk::Result::ERROR_DEVICE_LOST)
+            | VulkanError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED) => {
+                SwapBuffersError::ContextLost(Box::new(err))
+            }
+            x @ VulkanError::UnsupportedVersion(..)
+            | x @ VulkanError::MissingExtension(_)
+            | x @ VulkanError::NoGraphicsQueue
+            | x @ VulkanError::PipelineCreation => SwapBuffersError::ContextLost(Box::new(x)),
+            // Everything else is specific to one operation or buffer.
+            x => SwapBuffersError::TemporaryFailure(Box::new(x)),
+        }
+    }
 }

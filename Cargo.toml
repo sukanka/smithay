@@ -140,6 +140,10 @@ name = "vulkan_renderer"
 required-features = ["renderer_vulkan"]
 
 [[example]]
+name = "vulkan_multigpu"
+required-features = ["renderer_vulkan", "renderer_multi", "backend_gbm"]
+
+[[example]]
 name = "buffer_test"
 required-features = ["backend_drm", "backend_gbm", "backend_egl", "backend_vulkan", "renderer_gl"]
 
