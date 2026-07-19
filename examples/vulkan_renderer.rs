@@ -2,15 +2,17 @@
 //! results back and verifies the pixels.
 
 use drm_fourcc::{DrmFourcc, DrmModifier};
+use std::os::unix::io::AsFd;
+
 use smithay::{
     backend::{
         allocator::{
             Allocator,
-            dmabuf::AsDmabuf,
+            dmabuf::{AsDmabuf, SyncFileFlags, export_sync_file, import_sync_file},
             vulkan::{ImageUsageFlags, VulkanAllocator},
         },
         renderer::{
-            Bind, Color32F, ExportMem, Frame, ImportMem, Offscreen, Renderer,
+            Bind, Color32F, ExportMem, Frame, ImportDma, ImportMem, Offscreen, Renderer,
             sync::SyncPoint,
             vulkan::{VulkanRenderer, VulkanTexture},
         },
@@ -166,6 +168,52 @@ fn main() {
     check_pixel(data, 256, 80, 80, [255, 255, 255, 255], "white square");
     check_pixel(data, 256, 5, 250, [255, 0, 0, 255], "blue background (bottom)");
     println!("dmabuf rendering: OK");
+
+    // --- Implicit sync interop ---
+    // The frame should have attached a write fence to the dmabuf; export and re-import it.
+    let plane_fd = dmabuf.handles().next().unwrap();
+    match export_sync_file(plane_fd, SyncFileFlags::READ) {
+        Ok(sync_file) => {
+            import_sync_file(plane_fd, SyncFileFlags::WRITE, sync_file.as_fd()).expect("import sync file");
+            println!("dmabuf sync_file export/import: OK");
+        }
+        Err(err) => println!("dmabuf sync_file ioctls unsupported on this kernel: {err}"),
+    }
+
+    // Sample the just-rendered dmabuf into the offscreen buffer. Ordering between the two
+    // frames relies on the implicit-sync interop (plus same-queue submission order).
+    let dmabuf_texture = renderer
+        .import_dmabuf(&dmabuf, None)
+        .expect("import dmabuf texture");
+    let mut fb2 = renderer.bind(&mut offscreen).expect("rebind offscreen");
+    let mut frame = renderer
+        .render(&mut fb2, output_size, Transform::Normal)
+        .expect("begin sampling frame");
+    frame
+        .clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &[full])
+        .expect("clear black");
+    frame
+        .render_texture_from_to(
+            &dmabuf_texture,
+            Rectangle::from_size((256.0, 256.0).into()),
+            full,
+            &[full],
+            &[],
+            Transform::Normal,
+            1.0,
+        )
+        .expect("draw dmabuf texture");
+    let sync = frame.finish().expect("finish sampling frame");
+    sync.wait().expect("wait sampling frame");
+
+    let mapping = renderer
+        .copy_framebuffer(&fb2, Rectangle::from_size(size), DrmFourcc::Argb8888)
+        .expect("copy sampled framebuffer");
+    let data = renderer.map_texture(&mapping).expect("map sampled copy");
+    check_pixel(data, 256, 5, 5, [255, 0, 0, 255], "sampled blue background");
+    check_pixel(data, 256, 80, 80, [255, 255, 255, 255], "sampled white square");
+    println!("dmabuf texture sampling with implicit sync: OK");
+    drop(fb2);
 
     // --- Output transform ---
     let mut fb2 = renderer.bind(&mut offscreen).expect("rebind offscreen");

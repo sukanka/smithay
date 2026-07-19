@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     marker::PhantomData,
+    os::unix::io::OwnedFd,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -37,6 +38,8 @@ pub(super) struct InnerTexture {
     pub(super) y_inverted: bool,
     /// Whether the image was imported from a dmabuf and is owned by a foreign queue.
     pub(super) dmabuf_imported: bool,
+    /// Duplicated dmabuf plane fds for implicit sync interop, empty otherwise.
+    pub(super) dmabuf_fds: Vec<OwnedFd>,
     /// Whether the contents may be updated via [`ImportMem`](crate::backend::renderer::ImportMem).
     pub(super) writable: bool,
     /// Current image layout. Unused for dmabuf imports, which stay `GENERAL` under
@@ -111,6 +114,8 @@ pub(super) struct RenderBuffer {
     pub(super) format: Fourcc,
     pub(super) vk_format: vk::Format,
     pub(super) size: Size<i32, BufferCoord>,
+    /// Duplicated dmabuf plane fds for implicit sync interop.
+    pub(super) dmabuf_fds: Vec<OwnedFd>,
     /// Whether the image was transitioned away from `PREINITIALIZED` at least once.
     pub(super) transitioned: AtomicBool,
     pub(super) last_use: AtomicU64,

@@ -21,7 +21,7 @@ use crate::utils::{Buffer as BufferCoords, Size};
 #[cfg(feature = "wayland_frontend")]
 use crate::wayland::compositor::{Blocker, BlockerState};
 use std::hash::{Hash, Hasher};
-use std::os::unix::io::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 #[cfg(feature = "backend_drm")]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -400,6 +400,87 @@ struct dma_buf_sync {
 }
 
 const DMA_BUF_SYNC: rustix::ioctl::Opcode = rustix::ioctl::opcode::write::<dma_buf_sync>(b'b', 0);
+
+bitflags::bitflags! {
+    /// Access flags for [`export_sync_file`] and [`import_sync_file`].
+    ///
+    /// The flags describe the intended (for exports) or performed (for imports) access to the
+    /// dmabuf that the sync_file guards.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct SyncFileFlags: u32 {
+        /// Reading from the dmabuf
+        const READ = 1 << 0;
+        /// Writing to the dmabuf
+        #[allow(clippy::identity_op)]
+        const WRITE = 2 << 0;
+    }
+}
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+struct dma_buf_export_sync_file {
+    flags: u32,
+    fd: i32,
+}
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+struct dma_buf_import_sync_file {
+    flags: u32,
+    fd: i32,
+}
+
+const DMA_BUF_EXPORT_SYNC_FILE: rustix::ioctl::Opcode =
+    rustix::ioctl::opcode::read_write::<dma_buf_export_sync_file>(b'b', 2);
+const DMA_BUF_IMPORT_SYNC_FILE: rustix::ioctl::Opcode =
+    rustix::ioctl::opcode::write::<dma_buf_import_sync_file>(b'b', 3);
+
+/// Exports the implicit fences of a dmabuf (plane) fd as a sync_file.
+///
+/// With [`SyncFileFlags::READ`] the sync_file signals once all pending writes finished (wait
+/// before reading); with [`SyncFileFlags::READ`]` | `[`SyncFileFlags::WRITE`] it signals once
+/// all pending accesses finished (wait before writing).
+///
+/// Requires Linux 5.20 or newer; returns `ENOTTY` on older kernels.
+pub fn export_sync_file(dmabuf: BorrowedFd<'_>, flags: SyncFileFlags) -> std::io::Result<OwnedFd> {
+    let mut data = dma_buf_export_sync_file {
+        flags: flags.bits(),
+        fd: -1,
+    };
+    unsafe {
+        rustix::ioctl::ioctl(
+            dmabuf,
+            rustix::ioctl::Updater::<DMA_BUF_EXPORT_SYNC_FILE, dma_buf_export_sync_file>::new(&mut data),
+        )
+        .map_err(std::io::Error::from)?;
+        Ok(OwnedFd::from_raw_fd(data.fd))
+    }
+}
+
+/// Imports a sync_file into the implicit fences of a dmabuf (plane) fd.
+///
+/// With [`SyncFileFlags::WRITE`] the fence is added as a write (exclusive) fence, with
+/// [`SyncFileFlags::READ`] as a read (shared) fence.
+///
+/// Requires Linux 5.20 or newer; returns `ENOTTY` on older kernels.
+pub fn import_sync_file(
+    dmabuf: BorrowedFd<'_>,
+    flags: SyncFileFlags,
+    sync_file: BorrowedFd<'_>,
+) -> std::io::Result<()> {
+    let data = dma_buf_import_sync_file {
+        flags: flags.bits(),
+        fd: sync_file.as_raw_fd(),
+    };
+    unsafe {
+        rustix::ioctl::ioctl(
+            dmabuf,
+            rustix::ioctl::Setter::<DMA_BUF_IMPORT_SYNC_FILE, dma_buf_import_sync_file>::new(data),
+        )
+        .map_err(std::io::Error::from)?;
+    }
+    Ok(())
+}
 
 /// A mapping into a [`Dmabuf`]
 #[derive(Debug)]

@@ -8,7 +8,8 @@ use tracing::warn;
 
 use super::{
     PushConstants, VulkanError, VulkanRenderer, VulkanTexture, color_subresource_range, foreign_barrier,
-    image_barrier, target_transfer_state, texture::TargetInner, transfer_prepare, transfer_restore,
+    image_barrier, target_dmabuf_fds, target_transfer_state, texture::TargetInner, transfer_prepare,
+    transfer_restore,
 };
 use crate::{
     backend::renderer::{
@@ -36,6 +37,8 @@ pub struct VulkanFrame<'frame, 'buffer> {
     foreign_textures: Vec<VulkanTexture>,
     /// All textures used this frame, kept alive until submission.
     used_textures: Vec<VulkanTexture>,
+    /// Dmabuf-backed blit sources/destinations of this frame and whether they were written.
+    blit_buffers: Vec<(std::sync::Arc<super::texture::RenderBuffer>, bool)>,
     bound_pipeline: vk::Pipeline,
     /// Layout of an offscreen target texture before this frame started.
     target_initial_layout: vk::ImageLayout,
@@ -138,6 +141,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             buffer_size,
             foreign_textures: Vec::new(),
             used_textures: Vec::new(),
+            blit_buffers: Vec::new(),
             bound_pipeline: vk::Pipeline::null(),
             target_initial_layout,
             finished: AtomicBool::new(false),
@@ -444,9 +448,56 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             raw.end_command_buffer(pre_cb)?;
         }
 
+        // Wait for outstanding implicit-sync accesses: client writes to sampled dmabuf
+        // textures and any prior access (e.g. scanout) to the dmabuf render target.
+        let mut binary_waits = Vec::new();
+        for texture in &self.foreign_textures {
+            if !texture.0.dmabuf_fds.is_empty() {
+                self.renderer
+                    .implicit_acquire_waits(&texture.0.dmabuf_fds, false, &mut binary_waits);
+            }
+        }
+        let target_fds = target_dmabuf_fds(self.target);
+        if !target_fds.is_empty() {
+            self.renderer
+                .implicit_acquire_waits(target_fds, true, &mut binary_waits);
+        }
+        for (buffer, write) in &self.blit_buffers {
+            self.renderer
+                .implicit_acquire_waits(&buffer.dmabuf_fds, *write, &mut binary_waits);
+        }
+
         let (point, fence) = self
             .renderer
-            .submit(&[pre_cb, self.cb], Vec::new(), Vec::new(), true)?;
+            .submit(&[pre_cb, self.cb], binary_waits, Vec::new(), true)?;
+
+        // Attach our render fence to the dmabufs for implicit-sync consumers: a write fence
+        // on the target (scanout, screencast) and read fences on the sampled client buffers
+        // (buffer reuse).
+        {
+            use crate::backend::renderer::sync::Fence as _;
+            let has_texture_fds = self
+                .foreign_textures
+                .iter()
+                .any(|texture| !texture.0.dmabuf_fds.is_empty());
+            let target_fds = target_dmabuf_fds(self.target);
+            if (!target_fds.is_empty() || has_texture_fds || !self.blit_buffers.is_empty())
+                && fence.is_exportable()
+            {
+                if let Some(sync_file) = fence.export() {
+                    self.renderer
+                        .implicit_release_import(&sync_file, target_fds, true);
+                    for texture in &self.foreign_textures {
+                        self.renderer
+                            .implicit_release_import(&sync_file, &texture.0.dmabuf_fds, false);
+                    }
+                    for (buffer, write) in &self.blit_buffers {
+                        self.renderer
+                            .implicit_release_import(&sync_file, &buffer.dmabuf_fds, *write);
+                    }
+                }
+            }
+        }
 
         for texture in &self.used_textures {
             texture.0.mark_used(point);
@@ -747,6 +798,10 @@ impl VulkanFrame<'_, '_> {
                     *layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
                 }
             }
+        }
+        // Track dmabuf-backed blit partners for implicit sync handling at submission.
+        if let TargetInner::Dmabuf { buffer, .. } = &other.0 {
+            self.blit_buffers.push((buffer.clone(), to_other));
         }
 
         // The blit completes with this frame's submission.

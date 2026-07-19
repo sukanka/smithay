@@ -24,7 +24,7 @@ use std::{
     collections::HashMap,
     fmt,
     io::Cursor,
-    os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
+    os::unix::io::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64},
@@ -32,7 +32,7 @@ use std::{
 };
 
 use ash::{ext, khr, vk};
-use tracing::{info_span, instrument, warn};
+use tracing::{info_span, instrument, trace, warn};
 
 use crate::{
     backend::{
@@ -252,6 +252,11 @@ pub struct VulkanRenderer {
     upscale_filter: TextureFilter,
     debug_flags: DebugFlags,
 
+    /// Whether the kernel supports the dmabuf sync_file import/export ioctls.
+    ///
+    /// `None` until the first attempt.
+    implicit_interop: Option<bool>,
+
     span: tracing::Span,
 }
 
@@ -463,6 +468,7 @@ impl VulkanRenderer {
             downscale_filter: TextureFilter::Linear,
             upscale_filter: TextureFilter::Linear,
             debug_flags: DebugFlags::empty(),
+            implicit_interop: None,
             span: info_span!("renderer_vulkan"),
         })
     }
@@ -627,6 +633,7 @@ impl VulkanRenderer {
         &mut self,
         record: impl FnOnce(&ash::Device, vk::CommandBuffer) -> Result<(), VulkanError>,
         cleanup: Vec<CleanupItem>,
+        binary_waits: Vec<vk::Semaphore>,
         with_export: bool,
     ) -> Result<(u64, VulkanFence), VulkanError> {
         self.cleanup();
@@ -640,7 +647,7 @@ impl VulkanRenderer {
         record(&raw, cb)?;
         unsafe { raw.end_command_buffer(cb) }?;
 
-        let (point, fence) = self.submit(&[cb], Vec::new(), Vec::new(), with_export)?;
+        let (point, fence) = self.submit(&[cb], binary_waits, Vec::new(), with_export)?;
         self.device.defer_destroy(point, cleanup);
         Ok((point, fence))
     }
@@ -660,32 +667,106 @@ impl VulkanRenderer {
         }
 
         // Try to import a native fence as a temporary binary semaphore.
-        if let Some(ext) = self.device.external_semaphore_fd.clone() {
-            if let Some(fd) = sync.export() {
-                let create_info = vk::SemaphoreCreateInfo::default();
-                if let Ok(sem) = unsafe { self.device.raw.create_semaphore(&create_info, None) } {
-                    let import_info = vk::ImportSemaphoreFdInfoKHR::default()
-                        .semaphore(sem)
-                        .flags(vk::SemaphoreImportFlags::TEMPORARY)
-                        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
-                        .fd(fd.as_raw_fd());
-                    match unsafe { ext.import_semaphore_fd(&import_info) } {
-                        Ok(()) => {
-                            // SAFETY: on success ownership of the fd moved to Vulkan.
-                            std::mem::forget(fd);
-                            self.pending_binary_waits.push(sem);
-                            return Ok(());
-                        }
-                        Err(_) => unsafe {
-                            self.device.raw.destroy_semaphore(sem, None);
-                        },
-                    }
-                }
+        if let Some(fd) = sync.export() {
+            if let Some(sem) = self.import_sync_file_semaphore(fd) {
+                self.pending_binary_waits.push(sem);
+                return Ok(());
             }
         }
 
         // Fall back to a CPU wait.
         sync.wait().map_err(|_| VulkanError::SyncInterrupted)
+    }
+
+    /// Imports a sync_file fd as a temporary binary semaphore usable as a submission wait.
+    fn import_sync_file_semaphore(&self, fd: std::os::unix::io::OwnedFd) -> Option<vk::Semaphore> {
+        let ext = self.device.external_semaphore_fd.as_ref()?;
+        let create_info = vk::SemaphoreCreateInfo::default();
+        let sem = unsafe { self.device.raw.create_semaphore(&create_info, None) }.ok()?;
+        let import_info = vk::ImportSemaphoreFdInfoKHR::default()
+            .semaphore(sem)
+            .flags(vk::SemaphoreImportFlags::TEMPORARY)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+            .fd(fd.as_raw_fd());
+        match unsafe { ext.import_semaphore_fd(&import_info) } {
+            Ok(()) => {
+                // SAFETY: on success ownership of the fd moved to Vulkan.
+                std::mem::forget(fd);
+                Some(sem)
+            }
+            Err(_) => {
+                unsafe { self.device.raw.destroy_semaphore(sem, None) };
+                None
+            }
+        }
+    }
+
+    /// Collects wait semaphores for the implicit fences of a dmabuf-backed image.
+    ///
+    /// `write` accesses wait for all prior accesses, reads only for prior writes. When the
+    /// sync_file ioctls are unsupported this falls back to a bounded CPU wait.
+    pub(super) fn implicit_acquire_waits(
+        &mut self,
+        fds: &[std::os::unix::io::OwnedFd],
+        write: bool,
+        waits: &mut Vec<vk::Semaphore>,
+    ) {
+        use crate::backend::allocator::dmabuf::{SyncFileFlags, export_sync_file};
+
+        if self.implicit_interop == Some(false) || self.device.external_semaphore_fd.is_none() {
+            wait_dmabuf_fds_blocking(fds, write);
+            return;
+        }
+
+        let flags = if write {
+            SyncFileFlags::READ | SyncFileFlags::WRITE
+        } else {
+            SyncFileFlags::READ
+        };
+        for fd in fds {
+            match export_sync_file(fd.as_fd(), flags) {
+                Ok(sync_file) => {
+                    self.implicit_interop = Some(true);
+                    if let Some(sem) = self.import_sync_file_semaphore(sync_file) {
+                        waits.push(sem);
+                    }
+                }
+                Err(err) => {
+                    if self.implicit_interop.is_none() {
+                        warn!(
+                            ?err,
+                            "dmabuf sync_file export unsupported, falling back to blocking waits"
+                        );
+                        self.implicit_interop = Some(false);
+                    }
+                    wait_dmabuf_fds_blocking(std::slice::from_ref(fd), write);
+                }
+            }
+        }
+    }
+
+    /// Attaches a sync_file to the implicit fences of dmabuf-backed images.
+    pub(super) fn implicit_release_import(
+        &self,
+        sync_file: &std::os::unix::io::OwnedFd,
+        fds: &[std::os::unix::io::OwnedFd],
+        write: bool,
+    ) {
+        use crate::backend::allocator::dmabuf::{SyncFileFlags, import_sync_file};
+
+        if self.implicit_interop == Some(false) {
+            return;
+        }
+        let flags = if write {
+            SyncFileFlags::WRITE
+        } else {
+            SyncFileFlags::READ
+        };
+        for fd in fds {
+            if let Err(err) = import_sync_file(fd.as_fd(), flags, sync_file.as_fd()) {
+                trace!(?err, "Failed to import sync_file into dmabuf");
+            }
+        }
     }
 
     /// Returns (creating if necessary) the pipeline for the given key.
@@ -1211,6 +1292,7 @@ impl VulkanRenderer {
                 Ok(())
             },
             vec![CleanupItem::Buffer(buffer), CleanupItem::Memory(memory)],
+            Vec::new(),
             false,
         )?;
 
@@ -1285,6 +1367,38 @@ pub(super) fn foreign_barrier<'a>(
             .src_access_mask(access);
     }
     barrier
+}
+
+/// Duplicates all plane fds of a dmabuf for implicit sync interop.
+fn dup_dmabuf_fds(dmabuf: &Dmabuf) -> Vec<OwnedFd> {
+    dmabuf
+        .handles()
+        .filter_map(|fd| fd.try_clone_to_owned().ok())
+        .collect()
+}
+
+/// Blocking fallback wait on the implicit fences of dmabuf fds, bounded at one second.
+///
+/// Polling a dmabuf waits for outstanding writes (`POLLIN`, needed before reading) or all
+/// outstanding accesses (`POLLOUT`, needed before writing).
+pub(super) fn wait_dmabuf_fds_blocking(fds: &[OwnedFd], write: bool) {
+    use rustix::event::{PollFd, PollFlags, poll};
+
+    let flags = if write { PollFlags::OUT } else { PollFlags::IN };
+    for fd in fds {
+        let mut poll_fds = [PollFd::new(fd, flags)];
+        match poll(
+            &mut poll_fds,
+            Some(&rustix::time::Timespec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            }),
+        ) {
+            Ok(0) => warn!("Timed out waiting for dmabuf fence"),
+            Ok(_) => {}
+            Err(err) => warn!(?err, "Failed to poll dmabuf fence"),
+        }
+    }
 }
 
 fn create_shader_module(raw: &ash::Device, bytes: &[u8]) -> Result<vk::ShaderModule, VulkanError> {
@@ -1434,6 +1548,7 @@ impl ImportMem for VulkanRenderer {
             has_alpha: mapping.has_alpha,
             y_inverted: flipped,
             dmabuf_imported: false,
+            dmabuf_fds: Vec::new(),
             writable: true,
             layout: Mutex::new(vk::ImageLayout::UNDEFINED),
             last_use: AtomicU64::new(0),
@@ -1568,6 +1683,7 @@ impl ImportMemWl for VulkanRenderer {
                         has_alpha: mapping.has_alpha,
                         y_inverted: false,
                         dmabuf_imported: false,
+                        dmabuf_fds: Vec::new(),
                         writable: true,
                         layout: Mutex::new(vk::ImageLayout::UNDEFINED),
                         last_use: AtomicU64::new(0),
@@ -1634,6 +1750,7 @@ impl ImportDma for VulkanRenderer {
             has_alpha: mapping.has_alpha,
             y_inverted: dmabuf.y_inverted(),
             dmabuf_imported: true,
+            dmabuf_fds: dup_dmabuf_fds(dmabuf),
             writable: false,
             layout: Mutex::new(vk::ImageLayout::GENERAL),
             last_use: AtomicU64::new(0),
@@ -1690,6 +1807,7 @@ impl Bind<Dmabuf> for VulkanRenderer {
             format: format.code,
             vk_format: mapping.vk,
             size: dmabuf.size(),
+            dmabuf_fds: dup_dmabuf_fds(dmabuf),
             transitioned: AtomicBool::new(false),
             last_use: AtomicU64::new(0),
         });
@@ -1765,6 +1883,7 @@ impl Offscreen<VulkanTexture> for VulkanRenderer {
             has_alpha: mapping.has_alpha,
             y_inverted: false,
             dmabuf_imported: false,
+            dmabuf_fds: Vec::new(),
             writable: false,
             layout: Mutex::new(vk::ImageLayout::UNDEFINED),
             last_use: AtomicU64::new(0),
@@ -1790,11 +1909,13 @@ impl ExportMem for VulkanRenderer {
             TargetInner::Texture { texture, .. } => *texture.0.layout.lock().unwrap(),
         };
         let foreign = matches!(&target.0, TargetInner::Dmabuf { .. });
+        let src_fds = target_dmabuf_fds(target);
         let mapping = self.copy_image_to_memory(
             target.image(),
             target.vk_format(),
             src_layout,
             foreign,
+            src_fds,
             size,
             region,
             format,
@@ -1821,6 +1942,7 @@ impl ExportMem for VulkanRenderer {
             texture.0.vk_format,
             src_layout,
             texture.0.dmabuf_imported,
+            &texture.0.dmabuf_fds,
             texture.0.size,
             region,
             format,
@@ -1863,6 +1985,7 @@ impl VulkanRenderer {
         src_format: vk::Format,
         src_layout: vk::ImageLayout,
         src_foreign: bool,
+        src_fds: &[OwnedFd],
         src_size: Size<i32, BufferCoord>,
         region: Rectangle<i32, BufferCoord>,
         format: Fourcc,
@@ -1900,6 +2023,12 @@ impl VulkanRenderer {
         } else {
             None
         };
+
+        // Wait for outstanding implicit-sync writes before reading a dmabuf-backed source.
+        let mut binary_waits = Vec::new();
+        if !src_fds.is_empty() {
+            self.implicit_acquire_waits(src_fds, false, &mut binary_waits);
+        }
 
         let queue_family = self.device.queue_family;
         let result = self.submit_one_shot(
@@ -2068,10 +2197,11 @@ impl VulkanRenderer {
                 }
                 cleanup
             },
-            false,
+            binary_waits,
+            !src_fds.is_empty(),
         );
 
-        let (point, _) = match result {
+        let (point, fence) = match result {
             Ok(res) => res,
             Err(err) => {
                 unsafe {
@@ -2081,6 +2211,14 @@ impl VulkanRenderer {
                 return Err(err);
             }
         };
+
+        // Mark our read on the source for implicit-sync producers reusing the buffer.
+        if !src_fds.is_empty() {
+            use super::sync::Fence as _;
+            if let Some(sync_file) = fence.export() {
+                self.implicit_release_import(&sync_file, src_fds, false);
+            }
+        }
 
         Ok(VulkanTextureMapping {
             device: self.device.clone(),
@@ -2132,6 +2270,17 @@ impl Blit for VulkanRenderer {
         let dst_state = target_transfer_state(to);
         let src_image = from.image();
         let dst_image = to.image();
+
+        // Wait for outstanding implicit-sync accesses on dmabuf-backed targets.
+        let mut binary_waits = Vec::new();
+        let src_fds = target_dmabuf_fds(from);
+        let dst_fds = target_dmabuf_fds(to);
+        if !src_fds.is_empty() {
+            self.implicit_acquire_waits(src_fds, false, &mut binary_waits);
+        }
+        if !dst_fds.is_empty() {
+            self.implicit_acquire_waits(dst_fds, true, &mut binary_waits);
+        }
 
         let (point, fence) = self.submit_one_shot(
             |raw, cb| {
@@ -2190,8 +2339,20 @@ impl Blit for VulkanRenderer {
                 Ok(())
             },
             Vec::new(),
+            binary_waits,
             true,
         )?;
+
+        // Mark our accesses for implicit-sync consumers of the dmabufs.
+        {
+            use super::sync::Fence as _;
+            if (!src_fds.is_empty() || !dst_fds.is_empty()) && fence.is_exportable() {
+                if let Some(sync_file) = fence.export() {
+                    self.implicit_release_import(&sync_file, src_fds, false);
+                    self.implicit_release_import(&sync_file, dst_fds, true);
+                }
+            }
+        }
 
         from.mark_used(point);
         to.mark_used(point);
@@ -2223,6 +2384,14 @@ impl TransferState {
         } else {
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL
         }
+    }
+}
+
+/// The duplicated dmabuf plane fds of a target, if it is dmabuf-backed.
+pub(super) fn target_dmabuf_fds<'a>(target: &'a VulkanTarget<'_>) -> &'a [OwnedFd] {
+    match &target.0 {
+        TargetInner::Dmabuf { buffer, .. } => &buffer.dmabuf_fds,
+        TargetInner::Texture { .. } => &[],
     }
 }
 
