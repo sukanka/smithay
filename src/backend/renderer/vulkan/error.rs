@@ -54,6 +54,9 @@ pub enum VulkanError {
     /// A shader module or pipeline could not be created
     #[error("Failed to create a shader module or pipeline")]
     PipelineCreation,
+    /// A custom shader failed to compile
+    #[error("Failed to compile a custom shader: {0}")]
+    ShaderCompile(String),
     /// The dmabuf could not be imported
     #[error("Failed to import the dmabuf: {0}")]
     DmabufImport(&'static str),

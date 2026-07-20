@@ -7,9 +7,9 @@ use glam::{Mat3, Vec2};
 use tracing::warn;
 
 use super::{
-    CleanupItem, ColorBlendParams, PARAMS_FLOATS, PARAMS_SIZE, PushConstants, VulkanError, VulkanRenderer,
-    VulkanTexture, color_subresource_range, foreign_barrier, image_barrier, target_dmabuf_fds,
-    target_transfer_state, texture::TargetInner, transfer_prepare, transfer_restore,
+    CleanupItem, ColorBlendParams, PARAMS_FLOATS, PushConstants, VulkanError, VulkanRenderer, VulkanTexture,
+    color_subresource_range, foreign_barrier, image_barrier, target_dmabuf_fds, target_transfer_state,
+    texture::TargetInner, transfer_prepare, transfer_restore,
 };
 use crate::utils::user_data::UserDataMap;
 use crate::{
@@ -45,11 +45,17 @@ pub struct VulkanFrame<'frame, 'buffer> {
     target_initial_layout: vk::ImageLayout,
     /// Per-draw color blend parameter override, taking precedence over the renderer default.
     color_params_override: Option<ColorBlendParams>,
+    /// Custom texture program override applied to subsequent texture draws.
+    tex_program_override: Option<(super::VulkanPixelProgram, Vec<super::OwnedCustomUniform>)>,
     /// Ring buffer of color blend parameter slots for this frame.
     params_ring: Option<ParamsRing>,
     retired_params_rings: Vec<ParamsRing>,
-    /// The last parameter block written and bound, to avoid redundant slots.
+    /// The last builtin parameter block written and bound, to avoid redundant slots.
     params_last: Option<[f32; PARAMS_FLOATS]>,
+    /// The pipeline layout set 1 was last bound with.
+    params_bound_layout: Option<vk::PipelineLayout>,
+    /// Transient descriptor sets of this frame, freed once the submission completes.
+    transient_descriptor_sets: Vec<(vk::DescriptorPool, vk::DescriptorSet)>,
     finished: AtomicBool,
 }
 
@@ -60,7 +66,9 @@ struct ParamsRing {
     ptr: *mut u8,
     ds_pool: vk::DescriptorPool,
     ds: vk::DescriptorSet,
+    /// Ring capacity in bytes.
     capacity: u32,
+    /// Bytes used (next write starts at the aligned offset after this).
     used: u32,
 }
 
@@ -164,9 +172,12 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             bound_pipeline: vk::Pipeline::null(),
             target_initial_layout,
             color_params_override: None,
+            tex_program_override: None,
             params_ring: None,
             retired_params_rings: Vec::new(),
             params_last: None,
+            params_bound_layout: None,
+            transient_descriptor_sets: Vec::new(),
             finished: AtomicBool::new(false),
         })
     }
@@ -187,23 +198,246 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         self.color_params_override.take()
     }
 
-    /// Writes the parameter block into the ring and binds it for subsequent texture draws.
-    fn bind_params(&mut self, raw: &[f32; PARAMS_FLOATS]) -> Result<(), VulkanError> {
-        const RING_SLOTS: u32 = 256;
+    /// Draws a texture through a custom program (the tex program override path).
+    #[allow(clippy::too_many_arguments)]
+    fn draw_texture_custom(
+        &mut self,
+        program: &super::VulkanPixelProgram,
+        uniforms: &[super::OwnedCustomUniform],
+        texture: &VulkanTexture,
+        tex_mat: Mat3,
+        dest: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        alpha: f32,
+    ) -> Result<(), VulkanError> {
+        let format = self.target.vk_format();
+        let pipeline = self.renderer.get_custom_pipeline(program, format)?;
+        let layout = self.renderer.pipeline_layouts[program.0.texture_names.len()];
 
-        let slot_size = self.renderer.params_slot_size;
-        let needs_new = self
-            .params_ring
-            .as_ref()
-            .is_none_or(|ring| ring.used >= ring.capacity);
+        self.bind_pipeline(pipeline);
+
+        let ds = self.renderer.texture_descriptor_set(texture)?;
+        unsafe {
+            self.renderer.device().raw.cmd_bind_descriptor_sets(
+                self.cb,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &[ds],
+                &[],
+            );
+        }
+
+        let borrowed: Vec<super::CustomUniform<'_>> = uniforms.iter().map(|u| u.borrow()).collect();
+        let block = program.serialize_uniforms(&borrowed);
+        self.bind_params_raw(&block, layout)?;
+        self.params_last = None;
+
+        let pos_mat =
+            self.projection * Mat3::from_translation(Vec2::new(dest.loc.x as f32, dest.loc.y as f32));
+        let (mat_pos, pos_off) = decompose(&pos_mat);
+        let (mat_uv, uv_off) = decompose(&tex_mat);
+
+        let tint = if self.renderer.debug_flags.contains(DebugFlags::TINT) {
+            1.0
+        } else {
+            0.0
+        };
+        let pc = PushConstants {
+            mat_pos,
+            pos_off_rect: [pos_off[0], pos_off[1], 0.0, 0.0],
+            rect_size_misc: [0.0, 0.0, alpha, tint],
+            mat_uv,
+            uv_off: [uv_off[0], uv_off[1], 0.0, 0.0],
+            color: [0.0; 4],
+        };
+
+        let raw = self.renderer.device().raw.clone();
+        for rect in damage {
+            let rect_constrained_loc = rect.loc.constrain(Rectangle::from_size(dest.size));
+            let rect_clamped_size = rect
+                .size
+                .clamp((0, 0), (dest.size.to_point() - rect_constrained_loc).to_size());
+            if rect_clamped_size.w <= 0 || rect_clamped_size.h <= 0 {
+                continue;
+            }
+
+            let mut pc = pc;
+            pc.pos_off_rect[2] = rect_constrained_loc.x as f32;
+            pc.pos_off_rect[3] = rect_constrained_loc.y as f32;
+            pc.rect_size_misc[0] = rect_clamped_size.w as f32;
+            pc.rect_size_misc[1] = rect_clamped_size.h as f32;
+
+            unsafe {
+                raw.cmd_push_constants(
+                    self.cb,
+                    layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    pc.as_bytes(),
+                );
+                raw.cmd_draw(self.cb, 4, 1, 0, 0);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Sets (or clears) a custom texture program override.
+    ///
+    /// While set, texture draws through the default path use the program instead of the
+    /// built-in texture shader. The program must declare exactly one texture named `tex`
+    /// (bound to the drawn texture); `v_coords` interpolates over the texture's UV space
+    /// like the built-in shader.
+    pub fn set_tex_program_override(
+        &mut self,
+        program: Option<(super::VulkanPixelProgram, Vec<super::OwnedCustomUniform>)>,
+    ) {
+        self.tex_program_override = program;
+    }
+
+    /// Takes the current texture program override, leaving none in place.
+    pub fn take_tex_program_override(
+        &mut self,
+    ) -> Option<(super::VulkanPixelProgram, Vec<super::OwnedCustomUniform>)> {
+        self.tex_program_override.take()
+    }
+
+    /// Draws rectangles with a custom fragment shader program.
+    ///
+    /// `damage` is relative to `dst`. `v_coords` interpolates from 0 to 1 across `dst`.
+    /// `textures` are matched by name against the program's declared samplers and are
+    /// sampled with linear filtering and transparent border clamping. Uniform values are
+    /// matched by name against the program's declarations; missing values stay zero.
+    pub fn render_custom(
+        &mut self,
+        program: &super::VulkanPixelProgram,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        uniforms: &[super::CustomUniform<'_>],
+        textures: &[(&str, &VulkanTexture)],
+        alpha: f32,
+    ) -> Result<(), VulkanError> {
+        if damage.is_empty() || dst.size.is_empty() {
+            return Ok(());
+        }
+
+        // Resolve the program's declared textures by name.
+        let mut resolved = Vec::with_capacity(program.0.texture_names.len());
+        for name in &program.0.texture_names {
+            let texture = textures
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, t)| *t)
+                .ok_or(VulkanError::ShaderCompile(format!("missing texture {name}")))?;
+            resolved.push(texture);
+        }
+
+        for texture in &resolved {
+            if texture.0.dmabuf_imported
+                && !self
+                    .foreign_textures
+                    .iter()
+                    .any(|tex| tex.0.image == texture.0.image)
+            {
+                self.foreign_textures.push((*texture).clone());
+            }
+            self.used_textures.push((*texture).clone());
+        }
+
+        let format = self.target.vk_format();
+        let pipeline = self.renderer.get_custom_pipeline(program, format)?;
+        let layout = self.renderer.pipeline_layouts[program.0.texture_names.len()];
+
+        self.bind_pipeline(pipeline);
+
+        if !resolved.is_empty() {
+            let (pool, set) = self.renderer.custom_texture_descriptor_set(&resolved)?;
+            self.transient_descriptor_sets.push((pool, set));
+            unsafe {
+                self.renderer.device().raw.cmd_bind_descriptor_sets(
+                    self.cb,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+            }
+        }
+
+        let block = program.serialize_uniforms(uniforms);
+        self.bind_params_raw(&block, layout)?;
+        // The builtin texture path must rebind its own parameters afterwards.
+        self.params_last = None;
+
+        let pos_mat = self.projection * Mat3::from_translation(Vec2::new(dst.loc.x as f32, dst.loc.y as f32));
+        let (mat_pos, pos_off) = decompose(&pos_mat);
+        let uv_mat = [1.0 / dst.size.w as f32, 0.0, 0.0, 1.0 / dst.size.h as f32];
+
+        let tint = if self.renderer.debug_flags.contains(DebugFlags::TINT) {
+            1.0
+        } else {
+            0.0
+        };
+        let pc = PushConstants {
+            mat_pos,
+            pos_off_rect: [pos_off[0], pos_off[1], 0.0, 0.0],
+            rect_size_misc: [0.0, 0.0, alpha, tint],
+            mat_uv: uv_mat,
+            uv_off: [0.0; 4],
+            color: [0.0; 4],
+        };
+
+        let raw = self.renderer.device().raw.clone();
+        for rect in damage {
+            let rect_constrained_loc = rect.loc.constrain(Rectangle::from_size(dst.size));
+            let rect_clamped_size = rect
+                .size
+                .clamp((0, 0), (dst.size.to_point() - rect_constrained_loc).to_size());
+            if rect_clamped_size.w <= 0 || rect_clamped_size.h <= 0 {
+                continue;
+            }
+
+            let mut pc = pc;
+            pc.pos_off_rect[2] = rect_constrained_loc.x as f32;
+            pc.pos_off_rect[3] = rect_constrained_loc.y as f32;
+            pc.rect_size_misc[0] = rect_clamped_size.w as f32;
+            pc.rect_size_misc[1] = rect_clamped_size.h as f32;
+
+            unsafe {
+                raw.cmd_push_constants(
+                    self.cb,
+                    layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    pc.as_bytes(),
+                );
+                raw.cmd_draw(self.cb, 4, 1, 0, 0);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Writes a parameter block into the ring and binds it at set 1 of the given pipeline
+    /// layout for subsequent draws.
+    fn bind_params_raw(&mut self, raw: &[u8], layout: vk::PipelineLayout) -> Result<(), VulkanError> {
+        const RING_SIZE: u32 = 64 * 1024;
+        assert!(raw.len() as u32 <= super::PARAMS_RANGE);
+
+        let align = self.renderer.params_align;
+        let needs_new = self.params_ring.as_ref().is_none_or(|ring| {
+            let offset = ring.used.div_ceil(align) * align;
+            offset + super::PARAMS_RANGE > ring.capacity
+        });
         if needs_new {
             if let Some(old) = self.params_ring.take() {
                 self.retired_params_rings.push(old);
             }
-            let (buffer, memory, ptr) = self.renderer.create_host_buffer(
-                u64::from(slot_size) * u64::from(RING_SLOTS),
-                vk::BufferUsageFlags::UNIFORM_BUFFER,
-            )?;
+            let (buffer, memory, ptr) = self
+                .renderer
+                .create_host_buffer(u64::from(RING_SIZE), vk::BufferUsageFlags::UNIFORM_BUFFER)?;
             let (ds_pool, ds) = match self
                 .renderer
                 .allocate_descriptor_set(self.renderer.params_ds_layout)
@@ -221,7 +455,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             let buffer_info = [vk::DescriptorBufferInfo::default()
                 .buffer(buffer)
                 .offset(0)
-                .range(PARAMS_SIZE)];
+                .range(u64::from(super::PARAMS_RANGE))];
             let write = vk::WriteDescriptorSet::default()
                 .dst_set(ds)
                 .dst_binding(0)
@@ -235,32 +469,29 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 ptr: ptr as *mut u8,
                 ds_pool,
                 ds,
-                capacity: RING_SLOTS,
+                capacity: RING_SIZE,
                 used: 0,
             });
         }
 
         let ring = self.params_ring.as_mut().unwrap();
-        let offset = ring.used * slot_size;
+        let offset = ring.used.div_ceil(align) * align;
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                raw.as_ptr() as *const u8,
-                ring.ptr.add(offset as usize),
-                PARAMS_SIZE as usize,
-            );
+            std::ptr::copy_nonoverlapping(raw.as_ptr(), ring.ptr.add(offset as usize), raw.len());
         }
-        ring.used += 1;
+        ring.used = offset + raw.len() as u32;
 
         unsafe {
             self.renderer.device().raw.cmd_bind_descriptor_sets(
                 self.cb,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.renderer.pipeline_layout,
+                layout,
                 1,
                 &[ring.ds],
                 &[offset],
             );
         }
+        self.params_bound_layout = Some(layout);
         Ok(())
     }
 
@@ -385,6 +616,11 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             tex_mat = Mat3::from_cols_array(&[1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0]) * tex_mat;
         }
 
+        // A custom texture program replaces the entire built-in draw path.
+        if let Some((program, uniforms)) = self.tex_program_override.clone() {
+            return self.draw_texture_custom(&program, &uniforms, texture, tex_mat, dest, damage, alpha);
+        }
+
         let pos_mat =
             self.projection * Mat3::from_translation(Vec2::new(dest.loc.x as f32, dest.loc.y as f32));
         let (mat_pos, pos_off) = decompose(&pos_mat);
@@ -412,8 +648,13 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             .or(self.renderer.default_color_params)
             .map(|params| params.to_std140())
             .unwrap_or([0.0; PARAMS_FLOATS]);
-        if self.params_last != Some(raw_params) {
-            self.bind_params(&raw_params)?;
+        let builtin_layout = self.renderer.pipeline_layout;
+        if self.params_last != Some(raw_params) || self.params_bound_layout != Some(builtin_layout) {
+            let mut bytes = [0u8; PARAMS_FLOATS * 4];
+            for (i, value) in raw_params.iter().enumerate() {
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            self.bind_params_raw(&bytes, builtin_layout)?;
             self.params_last = Some(raw_params);
         }
 
@@ -636,6 +877,12 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         }
         self.target.mark_used(point);
 
+        // Free the transient descriptor sets once the submission completes.
+        for (pool, ds) in self.transient_descriptor_sets.drain(..) {
+            self.renderer
+                .device()
+                .defer_destroy(point, vec![CleanupItem::DescriptorSet(pool, ds)]);
+        }
         // Retire the parameter rings once the submission completes.
         for ring in self.retired_params_rings.drain(..).chain(self.params_ring.take()) {
             self.renderer.device().defer_destroy(

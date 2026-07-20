@@ -55,6 +55,7 @@ use crate::utils::user_data::UserDataMap;
 #[cfg(feature = "wayland_frontend")]
 use super::{ImportDmaWl, ImportMemWl};
 
+mod custom;
 mod error;
 mod fence;
 mod format;
@@ -62,6 +63,10 @@ mod frame;
 mod shaders;
 mod texture;
 
+pub use custom::{
+    CustomUniform, CustomUniformDecl, CustomUniformKind, CustomUniformValue, MAX_CUSTOM_PARAMS_SIZE,
+    MAX_CUSTOM_TEXTURES, OwnedCustomUniform, VulkanPixelProgram, texture_bindings_glsl, uniform_block_glsl,
+};
 pub use error::VulkanError;
 pub use fence::VulkanFence;
 pub use frame::{VulkanFrame, VulkanFrameGuard};
@@ -80,6 +85,7 @@ pub(super) enum CleanupItem {
     Buffer(vk::Buffer),
     Semaphore(vk::Semaphore),
     DescriptorSet(vk::DescriptorPool, vk::DescriptorSet),
+    ShaderModule(vk::ShaderModule),
 }
 
 /// Logical device state shared between the renderer, textures and fences.
@@ -126,6 +132,7 @@ impl Device {
                 CleanupItem::DescriptorSet(pool, set) => {
                     let _ = self.raw.free_descriptor_sets(pool, &[set]);
                 }
+                CleanupItem::ShaderModule(module) => self.raw.destroy_shader_module(module, None),
             }
         }
     }
@@ -204,7 +211,7 @@ pub struct ColorBlendParams {
 impl ColorBlendParams {
     /// std140 layout of the shader's parameter block: 12 tightly packed scalars followed
     /// by a mat3 (three vec4-aligned columns).
-    pub(super) fn to_std140(&self) -> [f32; PARAMS_FLOATS] {
+    pub(super) fn to_std140(self) -> [f32; PARAMS_FLOATS] {
         let mut out = [0.0f32; PARAMS_FLOATS];
         out[0] = self.hdr_pq;
         out[1] = self.ref_lum_scale;
@@ -227,10 +234,10 @@ impl ColorBlendParams {
     }
 }
 
-/// Number of floats in the std140 parameter block.
+/// Number of floats in the std140 color blend parameter block.
 pub(super) const PARAMS_FLOATS: usize = 24;
-/// Size in bytes of the std140 parameter block.
-pub(super) const PARAMS_SIZE: u64 = (PARAMS_FLOATS * 4) as u64;
+/// Fixed range of the ring buffer descriptor; parameter blocks must fit inside.
+pub(super) const PARAMS_RANGE: u32 = 512;
 
 /// Key identifying a cached graphics pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -294,11 +301,20 @@ pub struct VulkanRenderer {
     tex_frag_module: vk::ShaderModule,
     solid_frag_module: vk::ShaderModule,
     ds_layout: vk::DescriptorSetLayout,
+    /// Texture descriptor set layouts by texture count (0..=MAX_CUSTOM_TEXTURES);
+    /// index 1 equals `ds_layout`.
+    texture_ds_layouts: [vk::DescriptorSetLayout; custom::MAX_CUSTOM_TEXTURES + 1],
     params_ds_layout: vk::DescriptorSetLayout,
-    /// Uniform buffer slot size for the color blend params, honoring the device alignment.
-    pub(super) params_slot_size: u32,
+    /// Minimum alignment for parameter ring offsets.
+    pub(super) params_align: u32,
+    /// Pipeline layouts by texture count; index 1 equals `pipeline_layout`.
+    pub(super) pipeline_layouts: [vk::PipelineLayout; custom::MAX_CUSTOM_TEXTURES + 1],
     pipeline_layout: vk::PipelineLayout,
     pipelines: HashMap<PipelineKey, vk::Pipeline>,
+    custom_pipelines: HashMap<(usize, vk::Format), vk::Pipeline>,
+    /// Sampler for custom program textures: linear, clamp to transparent border.
+    custom_sampler: vk::Sampler,
+    shaderc: Option<shaderc::Compiler>,
     /// Samplers per (downscale, upscale) filter combination.
     samplers: HashMap<(TextureFilter, TextureFilter), vk::Sampler>,
     descriptor_pools: Vec<(vk::DescriptorPool, u32)>,
@@ -490,21 +506,52 @@ impl VulkanRenderer {
             unsafe { raw.create_descriptor_set_layout(&create_info, None) }?
         };
 
-        let params_slot_size = {
-            let align = phd.limits().min_uniform_buffer_offset_alignment.max(1) as u32;
-            (PARAMS_SIZE as u32).div_ceil(align) * align
-        };
+        let params_align = phd.limits().min_uniform_buffer_offset_alignment.max(4) as u32;
 
-        let pipeline_layout = {
-            let ranges = [vk::PushConstantRange::default()
-                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
-                .offset(0)
-                .size(std::mem::size_of::<PushConstants>() as u32)];
-            let layouts = [ds_layout, params_ds_layout];
+        // Texture descriptor set layouts for 0..=MAX_CUSTOM_TEXTURES combined samplers.
+        let mut texture_ds_layouts = [vk::DescriptorSetLayout::null(); custom::MAX_CUSTOM_TEXTURES + 1];
+        for (count, layout) in texture_ds_layouts.iter_mut().enumerate() {
+            if count == 1 {
+                *layout = ds_layout;
+                continue;
+            }
+            let bindings: Vec<_> = (0..count as u32)
+                .map(|binding| {
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(binding)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                })
+                .collect();
+            let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+            *layout = unsafe { raw.create_descriptor_set_layout(&create_info, None) }?;
+        }
+
+        let ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(std::mem::size_of::<PushConstants>() as u32)];
+        let mut pipeline_layouts = [vk::PipelineLayout::null(); custom::MAX_CUSTOM_TEXTURES + 1];
+        for (count, layout) in pipeline_layouts.iter_mut().enumerate() {
+            let layouts = [texture_ds_layouts[count], params_ds_layout];
             let create_info = vk::PipelineLayoutCreateInfo::default()
                 .set_layouts(&layouts)
                 .push_constant_ranges(&ranges);
-            unsafe { raw.create_pipeline_layout(&create_info, None) }?
+            *layout = unsafe { raw.create_pipeline_layout(&create_info, None) }?;
+        }
+        let pipeline_layout = pipeline_layouts[1];
+
+        let custom_sampler = {
+            let create_info = vk::SamplerCreateInfo::default()
+                .min_filter(vk::Filter::LINEAR)
+                .mag_filter(vk::Filter::LINEAR)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+                .border_color(vk::BorderColor::FLOAT_TRANSPARENT_BLACK)
+                .max_lod(0.25);
+            unsafe { raw.create_sampler(&create_info, None) }?
         };
 
         let mut samplers = HashMap::new();
@@ -541,10 +588,15 @@ impl VulkanRenderer {
             tex_frag_module,
             solid_frag_module,
             ds_layout,
+            texture_ds_layouts,
             params_ds_layout,
-            params_slot_size,
+            params_align,
+            pipeline_layouts,
             pipeline_layout,
             pipelines: HashMap::new(),
+            custom_pipelines: HashMap::new(),
+            custom_sampler,
+            shaderc: None,
             samplers,
             descriptor_pools: Vec::new(),
             pending_timeline_waits: Vec::new(),
@@ -588,6 +640,138 @@ impl VulkanRenderer {
     /// Sets a transform applied on the CPU to all solid colors (including clears).
     pub fn set_solid_color_transform(&mut self, transform: Option<Box<dyn Fn(Color32F) -> Color32F>>) {
         self.solid_color_transform = transform;
+    }
+
+    /// Compiles a custom fragment shader program from GLSL source.
+    ///
+    /// The source must target Vulkan GLSL (`#version 450`) and use the uniform block and
+    /// sampler declarations generated by [`uniform_block_glsl`] and [`texture_bindings_glsl`]
+    /// for the same `uniforms` and `texture_names`.
+    pub fn compile_custom_pixel_shader(
+        &mut self,
+        src: &str,
+        uniforms: &[CustomUniformDecl],
+        texture_names: &[&str],
+    ) -> Result<VulkanPixelProgram, VulkanError> {
+        if self.shaderc.is_none() {
+            self.shaderc =
+                Some(shaderc::Compiler::new().map_err(|err| VulkanError::ShaderCompile(err.to_string()))?);
+        }
+        custom::compile_program(
+            &self.device,
+            self.shaderc.as_ref().unwrap(),
+            src,
+            uniforms,
+            texture_names,
+        )
+    }
+
+    /// Returns (creating if necessary) the pipeline for a custom program and target format.
+    pub(super) fn get_custom_pipeline(
+        &mut self,
+        program: &VulkanPixelProgram,
+        format: vk::Format,
+    ) -> Result<vk::Pipeline, VulkanError> {
+        let key = (program.0.id, format);
+        if let Some(pipeline) = self.custom_pipelines.get(&key) {
+            return Ok(*pipeline);
+        }
+
+        let layout = self.pipeline_layouts[program.0.texture_names.len()];
+        let raw = &self.device.raw;
+        let entry = c"main";
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(self.vert_module)
+                .name(entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(program.0.module)
+                .name(entry),
+        ];
+
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_STRIP);
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let formats = [format];
+        let mut rendering_info =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
+
+        let create_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisample)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic_state)
+            .layout(layout)
+            .push_next(&mut rendering_info);
+
+        let pipeline =
+            unsafe { raw.create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None) }
+                .map_err(|_| VulkanError::PipelineCreation)?
+                .into_iter()
+                .next()
+                .ok_or(VulkanError::PipelineCreation)?;
+
+        self.custom_pipelines.insert(key, pipeline);
+        Ok(pipeline)
+    }
+
+    /// Allocates a transient descriptor set binding the given textures with the custom
+    /// sampler, for use within the current frame.
+    pub(super) fn custom_texture_descriptor_set(
+        &mut self,
+        textures: &[&VulkanTexture],
+    ) -> Result<(vk::DescriptorPool, vk::DescriptorSet), VulkanError> {
+        let layout = self.texture_ds_layouts[textures.len()];
+        let (pool, set) = self.allocate_descriptor_set(layout)?;
+        let image_infos: Vec<_> = textures
+            .iter()
+            .map(|texture| {
+                vk::DescriptorImageInfo::default()
+                    .sampler(self.custom_sampler)
+                    .image_view(texture.0.view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            })
+            .collect();
+        let writes: Vec<_> = image_infos
+            .iter()
+            .enumerate()
+            .map(|(binding, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(binding as u32)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(info))
+            })
+            .collect();
+        unsafe { self.device.raw.update_descriptor_sets(&writes, &[]) };
+        Ok((pool, set))
     }
 
     pub(super) fn device(&self) -> &Arc<Device> {
@@ -1535,9 +1719,21 @@ impl Drop for VulkanRenderer {
             for (_, pipeline) in self.pipelines.drain() {
                 raw.destroy_pipeline(pipeline, None);
             }
-            raw.destroy_pipeline_layout(self.pipeline_layout, None);
+            for (_, pipeline) in self.custom_pipelines.drain() {
+                raw.destroy_pipeline(pipeline, None);
+            }
+            for (count, layout) in self.pipeline_layouts.iter().enumerate() {
+                let _ = count;
+                raw.destroy_pipeline_layout(*layout, None);
+            }
+            for (count, layout) in self.texture_ds_layouts.iter().enumerate() {
+                if count != 1 {
+                    raw.destroy_descriptor_set_layout(*layout, None);
+                }
+            }
             raw.destroy_descriptor_set_layout(self.ds_layout, None);
             raw.destroy_descriptor_set_layout(self.params_ds_layout, None);
+            raw.destroy_sampler(self.custom_sampler, None);
             raw.destroy_shader_module(self.vert_module, None);
             raw.destroy_shader_module(self.tex_frag_module, None);
             raw.destroy_shader_module(self.solid_frag_module, None);
