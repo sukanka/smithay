@@ -228,7 +228,23 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             );
         }
 
-        let borrowed: Vec<super::CustomUniform<'_>> = uniforms.iter().map(|u| u.borrow()).collect();
+        let tint = if self.renderer.debug_flags.contains(DebugFlags::TINT) {
+            1.0
+        } else {
+            0.0
+        };
+
+        // The GLES texture shader interface provides `alpha` and `tint` as uniforms; custom
+        // tex programs declare them in their block.
+        let mut borrowed: Vec<super::CustomUniform<'_>> = uniforms.iter().map(|u| u.borrow()).collect();
+        borrowed.push(super::CustomUniform {
+            name: "alpha",
+            value: super::CustomUniformValue::Float(alpha),
+        });
+        borrowed.push(super::CustomUniform {
+            name: "tint",
+            value: super::CustomUniformValue::Float(tint),
+        });
         let block = program.serialize_uniforms(&borrowed);
         self.bind_params_raw(&block, layout)?;
         self.params_last = None;
@@ -237,12 +253,6 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             self.projection * Mat3::from_translation(Vec2::new(dest.loc.x as f32, dest.loc.y as f32));
         let (mat_pos, pos_off) = decompose(&pos_mat);
         let (mat_uv, uv_off) = decompose(&tex_mat);
-
-        let tint = if self.renderer.debug_flags.contains(DebugFlags::TINT) {
-            1.0
-        } else {
-            0.0
-        };
         let pc = PushConstants {
             mat_pos,
             pos_off_rect: [pos_off[0], pos_off[1], 0.0, 0.0],
