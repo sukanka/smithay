@@ -69,7 +69,7 @@ pub use custom::{
 };
 pub use error::VulkanError;
 pub use fence::VulkanFence;
-pub use frame::{VulkanFrame, VulkanFrameGuard};
+pub use frame::{CustomPass, VulkanFrame, VulkanFrameGuard};
 pub use texture::{VulkanTarget, VulkanTexture, VulkanTextureMapping};
 
 use fence::BinarySemaphore;
@@ -311,7 +311,7 @@ pub struct VulkanRenderer {
     pub(super) pipeline_layouts: [vk::PipelineLayout; custom::MAX_CUSTOM_TEXTURES + 1],
     pipeline_layout: vk::PipelineLayout,
     pipelines: HashMap<PipelineKey, vk::Pipeline>,
-    custom_pipelines: HashMap<(usize, vk::Format), vk::Pipeline>,
+    custom_pipelines: HashMap<(usize, vk::Format, bool), vk::Pipeline>,
     /// Sampler for custom program textures: linear, clamp to transparent border.
     custom_sampler: vk::Sampler,
     shaderc: Option<shaderc::Compiler>,
@@ -671,8 +671,9 @@ impl VulkanRenderer {
         &mut self,
         program: &VulkanPixelProgram,
         format: vk::Format,
+        blend: bool,
     ) -> Result<vk::Pipeline, VulkanError> {
-        let key = (program.0.id, format);
+        let key = (program.0.id, format, blend);
         if let Some(pipeline) = self.custom_pipelines.get(&key) {
             return Ok(*pipeline);
         }
@@ -704,7 +705,7 @@ impl VulkanRenderer {
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-            .blend_enable(true)
+            .blend_enable(blend)
             .src_color_blend_factor(vk::BlendFactor::ONE)
             .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
             .color_blend_op(vk::BlendOp::ADD)

@@ -48,6 +48,9 @@ pub enum VulkanError {
     /// Source and destination of a blit are the same
     #[error("Source and destination of the blit are the same image")]
     BlitSameImage,
+    /// A custom pass referenced a texture that is not renderer-owned
+    #[error("Custom passes require renderer-owned textures")]
+    ForeignTextureInPass,
     /// Waiting for a sync point was interrupted
     #[error("Waiting for a sync point was interrupted")]
     SyncInterrupted,

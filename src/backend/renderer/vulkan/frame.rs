@@ -132,26 +132,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             std::mem::swap(&mut output_size.w, &mut output_size.h);
         }
 
-        // Replicates the GLES renderer's projection setup. The final mapping — compositor
-        // pixel (0, 0) to the top-left of buffer memory — is identical in Vulkan since its
-        // NDC is y-down while framebuffer row 0 is the first row in memory.
-        let mut renderer_mat = Mat3::IDENTITY;
-        let t = Mat3::IDENTITY;
-        let x = 2.0 / (output_size.w as f32);
-        let y = 2.0 / (output_size.h as f32);
-
-        // Rotation & Reflection
-        renderer_mat.x_axis.x = x * t.x_axis.x;
-        renderer_mat.y_axis.x = x * t.x_axis.y;
-        renderer_mat.x_axis.y = y * -t.y_axis.x;
-        renderer_mat.y_axis.y = y * -t.y_axis.y;
-
-        // Translation
-        renderer_mat.z_axis.x = -(1.0f32.copysign(renderer_mat.x_axis.x + renderer_mat.y_axis.x));
-        renderer_mat.z_axis.y = -(1.0f32.copysign(renderer_mat.x_axis.y + renderer_mat.y_axis.y));
-
-        let flip180 = Mat3::from_cols_array(&[1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0]);
-        let projection = flip180 * transform.matrix() * renderer_mat;
+        let projection = compute_projection(output_size, transform);
 
         let target_initial_layout = match &target.0 {
             TargetInner::Texture { texture, .. } => *texture.0.layout.lock().unwrap(),
@@ -211,7 +192,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         alpha: f32,
     ) -> Result<(), VulkanError> {
         let format = self.target.vk_format();
-        let pipeline = self.renderer.get_custom_pipeline(program, format)?;
+        let pipeline = self.renderer.get_custom_pipeline(program, format, true)?;
         let layout = self.renderer.pipeline_layouts[program.0.texture_names.len()];
 
         self.bind_pipeline(pipeline);
@@ -356,7 +337,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         }
 
         let format = self.target.vk_format();
-        let pipeline = self.renderer.get_custom_pipeline(program, format)?;
+        let pipeline = self.renderer.get_custom_pipeline(program, format, true)?;
         let layout = self.renderer.pipeline_layouts[program.0.texture_names.len()];
 
         self.bind_pipeline(pipeline);
@@ -1208,6 +1189,276 @@ impl VulkanFrame<'_, '_> {
         // The blit completes with this frame's submission.
         Ok(SyncPoint::signaled())
     }
+}
+
+/// One pass of [`VulkanFrame::render_custom_passes`].
+#[derive(Debug)]
+pub struct CustomPass<'a> {
+    /// Renderer-owned destination texture. Previous contents are discarded and fully
+    /// overwritten by the pass.
+    pub dst: &'a VulkanTexture,
+    /// The custom pixel program to run.
+    pub program: &'a super::VulkanPixelProgram,
+    /// Values for the program's declared uniforms.
+    pub uniforms: &'a [super::CustomUniform<'a>],
+    /// Sampled textures for the program's declared texture bindings, by name.
+    pub textures: &'a [(&'a str, &'a VulkanTexture)],
+}
+
+impl VulkanFrame<'_, '_> {
+    /// Runs a sequence of full-destination custom-program passes into offscreen textures,
+    /// suspending the frame's active dynamic rendering scope for the duration.
+    ///
+    /// Each pass draws one destination-covering quad with blending disabled. Passes may
+    /// sample the destinations of earlier passes (ping-pong). All destination and sampled
+    /// textures must be renderer-owned; dmabuf imports are rejected.
+    pub fn render_custom_passes(&mut self, passes: &[CustomPass<'_>]) -> Result<(), VulkanError> {
+        if passes.is_empty() {
+            return Ok(());
+        }
+
+        let raw = self.renderer.device().raw.clone();
+
+        // Resolve pipelines, descriptor sets and uniform blocks upfront, so that recording
+        // cannot fail while the main rendering scope is suspended.
+        struct Prepared {
+            pipeline: vk::Pipeline,
+            layout: vk::PipelineLayout,
+            set: Option<vk::DescriptorSet>,
+            block: Vec<u8>,
+            sampled: Vec<VulkanTexture>,
+        }
+
+        let mut prepared = Vec::with_capacity(passes.len());
+        for pass in passes {
+            if pass.dst.0.dmabuf_imported {
+                return Err(VulkanError::ForeignTextureInPass);
+            }
+
+            let mut resolved = Vec::with_capacity(pass.program.0.texture_names.len());
+            for name in &pass.program.0.texture_names {
+                let texture = pass
+                    .textures
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, t)| *t)
+                    .ok_or(VulkanError::ShaderCompile(format!("missing texture {name}")))?;
+                if texture.0.dmabuf_imported {
+                    return Err(VulkanError::ForeignTextureInPass);
+                }
+                resolved.push(texture);
+            }
+
+            let pipeline = self
+                .renderer
+                .get_custom_pipeline(pass.program, pass.dst.0.vk_format, false)?;
+            let layout = self.renderer.pipeline_layouts[pass.program.0.texture_names.len()];
+            let set = if resolved.is_empty() {
+                None
+            } else {
+                let (pool, set) = self.renderer.custom_texture_descriptor_set(&resolved)?;
+                self.transient_descriptor_sets.push((pool, set));
+                Some(set)
+            };
+
+            let sampled: Vec<VulkanTexture> = resolved.iter().map(|t| (*t).clone()).collect();
+            for texture in &sampled {
+                self.used_textures.push(texture.clone());
+            }
+            self.used_textures.push(pass.dst.clone());
+
+            prepared.push(Prepared {
+                pipeline,
+                layout,
+                set,
+                block: pass.program.serialize_uniforms(pass.uniforms),
+                sampled,
+            });
+        }
+
+        unsafe {
+            raw.cmd_end_rendering(self.cb);
+        }
+
+        let mut result = Ok(());
+        'passes: for (pass, prep) in passes.iter().zip(&prepared) {
+            unsafe {
+                // Make sampled textures shader-readable.
+                for texture in &prep.sampled {
+                    let mut layout_guard = texture.0.layout.lock().unwrap();
+                    if *layout_guard != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+                        image_barrier(
+                            &raw,
+                            self.cb,
+                            texture.0.image,
+                            *layout_guard,
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            vk::PipelineStageFlags2::ALL_COMMANDS,
+                            vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+                            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                            vk::AccessFlags2::SHADER_READ,
+                        );
+                        *layout_guard = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                    }
+                }
+
+                // The destination contents are discarded, so transition from UNDEFINED.
+                image_barrier(
+                    &raw,
+                    self.cb,
+                    pass.dst.0.image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                    vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                );
+
+                let size = pass.dst.0.size;
+                let color_attachment = vk::RenderingAttachmentInfo::default()
+                    .image_view(pass.dst.0.view)
+                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .store_op(vk::AttachmentStoreOp::STORE);
+                let color_attachments = [color_attachment];
+                let rendering_info = vk::RenderingInfo::default()
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D {
+                            width: size.w as u32,
+                            height: size.h as u32,
+                        },
+                    })
+                    .layer_count(1)
+                    .color_attachments(&color_attachments);
+                raw.cmd_begin_rendering(self.cb, &rendering_info);
+
+                let viewport = vk::Viewport::default()
+                    .width(size.w as f32)
+                    .height(size.h as f32)
+                    .max_depth(1.0);
+                raw.cmd_set_viewport(self.cb, 0, &[viewport]);
+                let scissor = vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D {
+                        width: size.w as u32,
+                        height: size.h as u32,
+                    },
+                };
+                raw.cmd_set_scissor(self.cb, 0, &[scissor]);
+            }
+
+            self.bind_pipeline(prep.pipeline);
+            if let Some(set) = prep.set {
+                unsafe {
+                    raw.cmd_bind_descriptor_sets(
+                        self.cb,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        prep.layout,
+                        0,
+                        &[set],
+                        &[],
+                    );
+                }
+            }
+            if let Err(err) = self.bind_params_raw(&prep.block, prep.layout) {
+                result = Err(err);
+                unsafe {
+                    raw.cmd_end_rendering(self.cb);
+                }
+                break 'passes;
+            }
+
+            unsafe {
+                let size = pass.dst.0.size;
+                let phys_size: Size<i32, Physical> = Size::from((size.w, size.h));
+                let projection = compute_projection(phys_size, Transform::Normal);
+                let (mat_pos, pos_off) = decompose(&projection);
+                let tint = if self.renderer.debug_flags.contains(DebugFlags::TINT) {
+                    1.0
+                } else {
+                    0.0
+                };
+                let pc = PushConstants {
+                    mat_pos,
+                    pos_off_rect: [pos_off[0], pos_off[1], 0.0, 0.0],
+                    rect_size_misc: [size.w as f32, size.h as f32, 1.0, tint],
+                    mat_uv: [1.0 / size.w as f32, 0.0, 0.0, 1.0 / size.h as f32],
+                    uv_off: [0.0; 4],
+                    color: [0.0; 4],
+                };
+                raw.cmd_push_constants(
+                    self.cb,
+                    prep.layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    pc.as_bytes(),
+                );
+                raw.cmd_draw(self.cb, 4, 1, 0, 0);
+
+                raw.cmd_end_rendering(self.cb);
+
+                image_barrier(
+                    &raw,
+                    self.cb,
+                    pass.dst.0.image,
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                    vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    vk::AccessFlags2::SHADER_READ,
+                );
+                *pass.dst.0.layout.lock().unwrap() = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            }
+        }
+
+        // Resume the frame's rendering scope.
+        unsafe {
+            begin_rendering(&raw, self.cb, self.target, self.buffer_size);
+            let viewport = vk::Viewport::default()
+                .width(self.buffer_size.w as f32)
+                .height(self.buffer_size.h as f32)
+                .max_depth(1.0);
+            raw.cmd_set_viewport(self.cb, 0, &[viewport]);
+            let scissor = vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: self.buffer_size.w as u32,
+                    height: self.buffer_size.h as u32,
+                },
+            };
+            raw.cmd_set_scissor(self.cb, 0, &[scissor]);
+        }
+        // Force the builtin texture path to rebind its parameter block.
+        self.params_last = None;
+
+        result
+    }
+}
+
+/// Replicates the GLES renderer's projection setup. The final mapping — compositor
+/// pixel (0, 0) to the top-left of buffer memory — is identical in Vulkan since its
+/// NDC is y-down while framebuffer row 0 is the first row in memory.
+fn compute_projection(output_size: Size<i32, Physical>, transform: Transform) -> Mat3 {
+    let mut renderer_mat = Mat3::IDENTITY;
+    let t = Mat3::IDENTITY;
+    let x = 2.0 / (output_size.w as f32);
+    let y = 2.0 / (output_size.h as f32);
+
+    // Rotation & Reflection
+    renderer_mat.x_axis.x = x * t.x_axis.x;
+    renderer_mat.y_axis.x = x * t.x_axis.y;
+    renderer_mat.x_axis.y = y * -t.y_axis.x;
+    renderer_mat.y_axis.y = y * -t.y_axis.y;
+
+    // Translation
+    renderer_mat.z_axis.x = -(1.0f32.copysign(renderer_mat.x_axis.x + renderer_mat.y_axis.x));
+    renderer_mat.z_axis.y = -(1.0f32.copysign(renderer_mat.x_axis.y + renderer_mat.y_axis.y));
+
+    let flip180 = Mat3::from_cols_array(&[1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0]);
+    flip180 * transform.matrix() * renderer_mat
 }
 
 fn begin_rendering(
