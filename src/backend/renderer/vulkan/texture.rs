@@ -84,6 +84,11 @@ impl VulkanTexture {
     pub fn is_y_inverted(&self) -> bool {
         self.0.y_inverted
     }
+
+    /// Whether this is the only reference to this texture.
+    pub fn is_unique_reference(&mut self) -> bool {
+        std::sync::Arc::get_mut(&mut self.0).is_some()
+    }
 }
 
 impl Texture for VulkanTexture {
