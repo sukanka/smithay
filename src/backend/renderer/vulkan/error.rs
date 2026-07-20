@@ -51,6 +51,9 @@ pub enum VulkanError {
     /// A custom pass referenced a texture that is not renderer-owned
     #[error("Custom passes require renderer-owned textures")]
     ForeignTextureInPass,
+    /// EGL (wl_drm) buffer imports are not supported by the Vulkan renderer
+    #[error("EGL buffer imports are not supported")]
+    EglUnsupported,
     /// Waiting for a sync point was interrupted
     #[error("Waiting for a sync point was interrupted")]
     SyncInterrupted,

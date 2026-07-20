@@ -2087,6 +2087,36 @@ impl ImportDma for VulkanRenderer {
 }
 
 #[cfg(feature = "wayland_frontend")]
+#[cfg(all(
+    feature = "wayland_frontend",
+    feature = "backend_egl",
+    feature = "use_system_lib"
+))]
+impl crate::backend::renderer::ImportEgl for VulkanRenderer {
+    fn bind_wl_display(
+        &mut self,
+        _display: &wayland_server::DisplayHandle,
+    ) -> Result<(), crate::backend::egl::Error> {
+        // No wl_drm support on the Vulkan renderer; clients use dmabuf.
+        Err(crate::backend::egl::Error::DisplayNotSupported)
+    }
+
+    fn unbind_wl_display(&mut self) {}
+
+    fn egl_reader(&self) -> Option<&crate::backend::egl::display::EGLBufferReader> {
+        None
+    }
+
+    fn import_egl_buffer(
+        &mut self,
+        _buffer: &wayland_server::protocol::wl_buffer::WlBuffer,
+        _surface: Option<&crate::wayland::compositor::SurfaceData>,
+        _damage: &[Rectangle<i32, BufferCoord>],
+    ) -> Result<VulkanTexture, VulkanError> {
+        Err(VulkanError::EglUnsupported)
+    }
+}
+
 impl ImportDmaWl for VulkanRenderer {}
 
 impl Bind<Dmabuf> for VulkanRenderer {
