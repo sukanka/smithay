@@ -748,14 +748,20 @@ impl VulkanRenderer {
     pub(super) fn custom_texture_descriptor_set(
         &mut self,
         textures: &[&VulkanTexture],
+        edge_clamp: bool,
     ) -> Result<(vk::DescriptorPool, vk::DescriptorSet), VulkanError> {
         let layout = self.texture_ds_layouts[textures.len()];
         let (pool, set) = self.allocate_descriptor_set(layout)?;
+        let sampler = if edge_clamp {
+            self.samplers[&(TextureFilter::Linear, TextureFilter::Linear)]
+        } else {
+            self.custom_sampler
+        };
         let image_infos: Vec<_> = textures
             .iter()
             .map(|texture| {
                 vk::DescriptorImageInfo::default()
-                    .sampler(self.custom_sampler)
+                    .sampler(sampler)
                     .image_view(texture.0.view)
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             })

@@ -343,7 +343,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         self.bind_pipeline(pipeline);
 
         if !resolved.is_empty() {
-            let (pool, set) = self.renderer.custom_texture_descriptor_set(&resolved)?;
+            let (pool, set) = self.renderer.custom_texture_descriptor_set(&resolved, false)?;
             self.transient_descriptor_sets.push((pool, set));
             unsafe {
                 self.renderer.device().raw.cmd_bind_descriptor_sets(
@@ -1153,7 +1153,27 @@ impl VulkanFrame<'_, '_> {
                     vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                 );
             }
-            transfer_restore(&raw, self.cb, queue_family, other.image(), &other_state, to_other);
+            match &other.0 {
+                TargetInner::Texture { texture, .. } if to_other => {
+                    // Mid-frame blit destinations are meant to be sampled; leave the texture
+                    // shader-readable instead of restoring the previous layout.
+                    image_barrier(
+                        &raw,
+                        self.cb,
+                        texture.0.image,
+                        other_state.transfer_layout(true),
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::PipelineStageFlags2::TRANSFER,
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                        vk::AccessFlags2::SHADER_READ,
+                    );
+                    *texture.0.layout.lock().unwrap() = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                }
+                _ => {
+                    transfer_restore(&raw, self.cb, queue_family, other.image(), &other_state, to_other);
+                }
+            }
 
             begin_rendering(&raw, self.cb, self.target, self.buffer_size);
             self.bound_pipeline = vk::Pipeline::null();
@@ -1173,14 +1193,6 @@ impl VulkanFrame<'_, '_> {
             raw.cmd_set_scissor(self.cb, 0, &[scissor]);
         }
 
-        if to_other {
-            if let TargetInner::Texture { texture, .. } = &other.0 {
-                let mut layout = texture.0.layout.lock().unwrap();
-                if *layout == vk::ImageLayout::UNDEFINED {
-                    *layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
-                }
-            }
-        }
         // Track dmabuf-backed blit partners for implicit sync handling at submission.
         if let TargetInner::Dmabuf { buffer, .. } = &other.0 {
             self.blit_buffers.push((buffer.clone(), to_other));
@@ -1188,6 +1200,32 @@ impl VulkanFrame<'_, '_> {
 
         // The blit completes with this frame's submission.
         Ok(SyncPoint::signaled())
+    }
+}
+
+impl VulkanFrame<'_, '_> {
+    /// Blits a region of the bound target into a renderer-owned offscreen texture,
+    /// suspending the frame's rendering scope for the transfer.
+    ///
+    /// The texture is left shader-readable, ready to be sampled by later draws in this
+    /// frame.
+    pub fn blit_framebuffer_to_texture(
+        &mut self,
+        dst: &VulkanTexture,
+        src: Rectangle<i32, Physical>,
+        dst_rect: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+    ) -> Result<(), VulkanError> {
+        if dst.0.dmabuf_imported {
+            return Err(VulkanError::ForeignTextureInPass);
+        }
+        let target = VulkanTarget(TargetInner::Texture {
+            texture: dst.clone(),
+            _lifetime: std::marker::PhantomData,
+        });
+        let _sync = self.blit_internal(&target, src, dst_rect, filter, true)?;
+        self.used_textures.push(dst.clone());
+        Ok(())
     }
 }
 
@@ -1256,7 +1294,7 @@ impl VulkanFrame<'_, '_> {
             let set = if resolved.is_empty() {
                 None
             } else {
-                let (pool, set) = self.renderer.custom_texture_descriptor_set(&resolved)?;
+                let (pool, set) = self.renderer.custom_texture_descriptor_set(&resolved, true)?;
                 self.transient_descriptor_sets.push((pool, set));
                 Some(set)
             };
