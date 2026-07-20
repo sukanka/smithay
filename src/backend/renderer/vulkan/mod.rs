@@ -47,9 +47,10 @@ use crate::{
 };
 
 use super::{
-    Bind, Blit, ContextId, DebugFlags, ExportMem, ImportDma, ImportMem, Offscreen, Renderer, RendererSuper,
-    Texture, TextureFilter, sync::SyncPoint,
+    Bind, Blit, Color32F, ContextId, DebugFlags, ExportMem, ImportDma, ImportMem, Offscreen, Renderer,
+    RendererSuper, Texture, TextureFilter, sync::SyncPoint,
 };
+use crate::utils::user_data::UserDataMap;
 
 #[cfg(feature = "wayland_frontend")]
 use super::{ImportDmaWl, ImportMemWl};
@@ -172,6 +173,65 @@ impl Drop for Device {
     }
 }
 
+/// Per-draw color blend parameters of the built-in texture shader.
+///
+/// The parameter block is ported from niri's `niri_blend` GLSL stage: it can encode
+/// electrical sRGB content into PQ/BT.2020 for HDR outputs, handle extended-linear
+/// (scRGB-style) content, convert PQ content back to SDR with ICtCp tone mapping, and
+/// re-encode PQ content through a gamut matrix. All fields zero (the default) is a
+/// passthrough.
+///
+/// Boolean parameters use 0.0 / 1.0. See `shaders/texture.frag` for the exact semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[allow(missing_docs)]
+pub struct ColorBlendParams {
+    pub hdr_pq: f32,
+    pub ref_lum_scale: f32,
+    pub linear: f32,
+    pub linear_scale: f32,
+    pub linear_to_ref: f32,
+    pub hdr_to_sdr: f32,
+    pub pq_gamut: f32,
+    pub use_gamut: f32,
+    pub tonemap: f32,
+    pub tm_v: f32,
+    pub tm_ref_scale: f32,
+    pub tm_out_scale: f32,
+    /// Column-major 3x3 gamut conversion matrix, used when `use_gamut` is set.
+    pub gamut: [f32; 9],
+}
+
+impl ColorBlendParams {
+    /// std140 layout of the shader's parameter block: 12 tightly packed scalars followed
+    /// by a mat3 (three vec4-aligned columns).
+    pub(super) fn to_std140(&self) -> [f32; PARAMS_FLOATS] {
+        let mut out = [0.0f32; PARAMS_FLOATS];
+        out[0] = self.hdr_pq;
+        out[1] = self.ref_lum_scale;
+        out[2] = self.linear;
+        out[3] = self.linear_scale;
+        out[4] = self.linear_to_ref;
+        out[5] = self.hdr_to_sdr;
+        out[6] = self.pq_gamut;
+        out[7] = self.use_gamut;
+        out[8] = self.tonemap;
+        out[9] = self.tm_v;
+        out[10] = self.tm_ref_scale;
+        out[11] = self.tm_out_scale;
+        for col in 0..3 {
+            for row in 0..3 {
+                out[12 + col * 4 + row] = self.gamut[col * 3 + row];
+            }
+        }
+        out
+    }
+}
+
+/// Number of floats in the std140 parameter block.
+pub(super) const PARAMS_FLOATS: usize = 24;
+/// Size in bytes of the std140 parameter block.
+pub(super) const PARAMS_SIZE: u64 = (PARAMS_FLOATS * 4) as u64;
+
 /// Key identifying a cached graphics pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PipelineKey {
@@ -234,6 +294,9 @@ pub struct VulkanRenderer {
     tex_frag_module: vk::ShaderModule,
     solid_frag_module: vk::ShaderModule,
     ds_layout: vk::DescriptorSetLayout,
+    params_ds_layout: vk::DescriptorSetLayout,
+    /// Uniform buffer slot size for the color blend params, honoring the device alignment.
+    pub(super) params_slot_size: u32,
     pipeline_layout: vk::PipelineLayout,
     pipelines: HashMap<PipelineKey, vk::Pipeline>,
     /// Samplers per (downscale, upscale) filter combination.
@@ -251,6 +314,12 @@ pub struct VulkanRenderer {
     downscale_filter: TextureFilter,
     upscale_filter: TextureFilter,
     debug_flags: DebugFlags,
+
+    /// Default color blend parameters applied to texture draws without a per-draw override.
+    pub(super) default_color_params: Option<ColorBlendParams>,
+    /// CPU-side transform applied to solid colors (including clears).
+    pub(super) solid_color_transform: Option<Box<dyn Fn(Color32F) -> Color32F>>,
+    user_data: UserDataMap,
 
     /// Whether the kernel supports the dmabuf sync_file import/export ioctls.
     ///
@@ -411,12 +480,27 @@ impl VulkanRenderer {
             unsafe { raw.create_descriptor_set_layout(&create_info, None) }?
         };
 
+        let params_ds_layout = {
+            let bindings = [vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+            let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+            unsafe { raw.create_descriptor_set_layout(&create_info, None) }?
+        };
+
+        let params_slot_size = {
+            let align = phd.limits().min_uniform_buffer_offset_alignment.max(1) as u32;
+            (PARAMS_SIZE as u32).div_ceil(align) * align
+        };
+
         let pipeline_layout = {
             let ranges = [vk::PushConstantRange::default()
                 .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
                 .offset(0)
                 .size(std::mem::size_of::<PushConstants>() as u32)];
-            let layouts = [ds_layout];
+            let layouts = [ds_layout, params_ds_layout];
             let create_info = vk::PipelineLayoutCreateInfo::default()
                 .set_layouts(&layouts)
                 .push_constant_ranges(&ranges);
@@ -457,6 +541,8 @@ impl VulkanRenderer {
             tex_frag_module,
             solid_frag_module,
             ds_layout,
+            params_ds_layout,
+            params_slot_size,
             pipeline_layout,
             pipelines: HashMap::new(),
             samplers,
@@ -468,6 +554,9 @@ impl VulkanRenderer {
             downscale_filter: TextureFilter::Linear,
             upscale_filter: TextureFilter::Linear,
             debug_flags: DebugFlags::empty(),
+            default_color_params: None,
+            solid_color_transform: None,
+            user_data: UserDataMap::default(),
             implicit_interop: None,
             span: info_span!("renderer_vulkan"),
         })
@@ -476,6 +565,29 @@ impl VulkanRenderer {
     /// The underlying [`PhysicalDevice`].
     pub fn physical_device(&self) -> &PhysicalDevice {
         &self.device.phd
+    }
+
+    /// Returns a [`UserDataMap`] for renderer-associated state.
+    pub fn user_data(&self) -> &UserDataMap {
+        &self.user_data
+    }
+
+    /// Sets the default [`ColorBlendParams`] applied to texture draws.
+    ///
+    /// A per-draw override set on the frame takes precedence. `None` (the default) is a
+    /// passthrough.
+    pub fn set_default_color_params(&mut self, params: Option<ColorBlendParams>) {
+        self.default_color_params = params;
+    }
+
+    /// The current default [`ColorBlendParams`].
+    pub fn default_color_params(&self) -> Option<ColorBlendParams> {
+        self.default_color_params
+    }
+
+    /// Sets a transform applied on the CPU to all solid colors (including clears).
+    pub fn set_solid_color_transform(&mut self, transform: Option<Box<dyn Fn(Color32F) -> Color32F>>) {
+        self.solid_color_transform = transform;
     }
 
     pub(super) fn device(&self) -> &Arc<Device> {
@@ -869,7 +981,7 @@ impl VulkanRenderer {
             return Ok(*set);
         }
 
-        let (pool, set) = self.allocate_descriptor_set()?;
+        let (pool, set) = self.allocate_descriptor_set(self.ds_layout)?;
         let sampler = self.samplers[&filters];
         // Dmabuf-imported textures are moved to `SHADER_READ_ONLY_OPTIMAL` by the per-frame
         // foreign-queue acquire barrier; uploaded textures stay in that layout after upload.
@@ -893,10 +1005,13 @@ impl VulkanRenderer {
         Ok(set)
     }
 
-    fn allocate_descriptor_set(&mut self) -> Result<(vk::DescriptorPool, vk::DescriptorSet), VulkanError> {
+    pub(super) fn allocate_descriptor_set(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Result<(vk::DescriptorPool, vk::DescriptorSet), VulkanError> {
         for (pool, free) in self.descriptor_pools.iter_mut() {
             if *free > 0 {
-                let layouts = [self.ds_layout];
+                let layouts = [layout];
                 let allocate_info = vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(*pool)
                     .set_layouts(&layouts);
@@ -908,16 +1023,21 @@ impl VulkanRenderer {
         }
 
         // No free pool, create a new one.
-        let sizes = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(DESCRIPTOR_POOL_SIZE)];
+        let sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(DESCRIPTOR_POOL_SIZE),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+                .descriptor_count(64),
+        ];
         let create_info = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
             .max_sets(DESCRIPTOR_POOL_SIZE)
             .pool_sizes(&sizes);
         let pool = unsafe { self.device.raw.create_descriptor_pool(&create_info, None) }?;
 
-        let layouts = [self.ds_layout];
+        let layouts = [layout];
         let allocate_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool)
             .set_layouts(&layouts);
@@ -1417,6 +1537,7 @@ impl Drop for VulkanRenderer {
             }
             raw.destroy_pipeline_layout(self.pipeline_layout, None);
             raw.destroy_descriptor_set_layout(self.ds_layout, None);
+            raw.destroy_descriptor_set_layout(self.params_ds_layout, None);
             raw.destroy_shader_module(self.vert_module, None);
             raw.destroy_shader_module(self.tex_frag_module, None);
             raw.destroy_shader_module(self.solid_frag_module, None);

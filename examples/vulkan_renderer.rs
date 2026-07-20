@@ -251,5 +251,70 @@ fn main() {
     assert_eq!(yellow_corners, 1, "expected exactly one yellow corner");
     println!("transformed rendering: OK");
 
+    // --- Color blend params (PQ encode) ---
+    use smithay::backend::renderer::vulkan::ColorBlendParams;
+
+    let gray_pixels: Vec<u8> = std::iter::repeat_n([128u8, 128, 128, 255], 4).flatten().collect();
+    let gray = renderer
+        .import_memory(&gray_pixels, DrmFourcc::Argb8888, (2, 2).into(), false)
+        .expect("import gray");
+
+    let ref_lum_scale = 203.0f32 / 10000.0;
+    renderer.set_default_color_params(Some(ColorBlendParams {
+        hdr_pq: 1.0,
+        ref_lum_scale,
+        ..Default::default()
+    }));
+
+    let mut fb3 = renderer.bind(&mut offscreen).expect("rebind offscreen");
+    let mut frame = renderer
+        .render(&mut fb3, output_size, Transform::Normal)
+        .expect("begin pq frame");
+    frame
+        .clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &[full])
+        .expect("clear black");
+    frame
+        .render_texture_from_to(
+            &gray,
+            Rectangle::from_size((2.0, 2.0).into()),
+            full,
+            &[full],
+            &[],
+            Transform::Normal,
+            1.0,
+        )
+        .expect("draw gray");
+    let sync = frame.finish().expect("finish pq frame");
+    sync.wait().expect("wait pq frame");
+    renderer.set_default_color_params(None);
+
+    let mapping = renderer
+        .copy_framebuffer(&fb3, Rectangle::from_size(size), DrmFourcc::Argb8888)
+        .expect("copy pq framebuffer");
+    let data = renderer.map_texture(&mapping).expect("map pq copy");
+
+    // CPU reference: srgb 2.2 decode -> BT.709->BT.2020 (identity for gray) -> * ref scale
+    // -> PQ inverse EOTF.
+    fn pq_encode(lin: f32) -> f32 {
+        const M1: f32 = 0.1593017578125;
+        const M2: f32 = 78.84375;
+        const C1: f32 = 0.8359375;
+        const C2: f32 = 18.8515625;
+        const C3: f32 = 18.6875;
+        let y = lin.clamp(0.0, 1.0).powf(M1);
+        ((C1 + C2 * y) / (1.0 + C3 * y)).powf(M2)
+    }
+    let lin = (128.0f32 / 255.0).powf(2.2);
+    let expected = (pq_encode(lin * ref_lum_scale) * 255.0).round() as i32;
+    let idx = ((100 * 256 + 100) * 4) as usize;
+    for channel in 0..3 {
+        let actual = data[idx + channel] as i32;
+        assert!(
+            (actual - expected).abs() <= 2,
+            "pq encode mismatch on channel {channel}: got {actual}, expected {expected}"
+        );
+    }
+    println!("color blend params (pq encode): OK (value {expected})");
+
     println!("all vulkan renderer smoke tests passed");
 }

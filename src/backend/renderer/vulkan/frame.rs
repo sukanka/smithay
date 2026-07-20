@@ -7,10 +7,11 @@ use glam::{Mat3, Vec2};
 use tracing::warn;
 
 use super::{
-    PushConstants, VulkanError, VulkanRenderer, VulkanTexture, color_subresource_range, foreign_barrier,
-    image_barrier, target_dmabuf_fds, target_transfer_state, texture::TargetInner, transfer_prepare,
-    transfer_restore,
+    CleanupItem, ColorBlendParams, PARAMS_FLOATS, PARAMS_SIZE, PushConstants, VulkanError, VulkanRenderer,
+    VulkanTexture, color_subresource_range, foreign_barrier, image_barrier, target_dmabuf_fds,
+    target_transfer_state, texture::TargetInner, transfer_prepare, transfer_restore,
 };
+use crate::utils::user_data::UserDataMap;
 use crate::{
     backend::renderer::{
         BlitFrame, Color32F, ContextId, DebugFlags, Frame, FrameContext, Texture, TextureFilter,
@@ -42,7 +43,25 @@ pub struct VulkanFrame<'frame, 'buffer> {
     bound_pipeline: vk::Pipeline,
     /// Layout of an offscreen target texture before this frame started.
     target_initial_layout: vk::ImageLayout,
+    /// Per-draw color blend parameter override, taking precedence over the renderer default.
+    color_params_override: Option<ColorBlendParams>,
+    /// Ring buffer of color blend parameter slots for this frame.
+    params_ring: Option<ParamsRing>,
+    retired_params_rings: Vec<ParamsRing>,
+    /// The last parameter block written and bound, to avoid redundant slots.
+    params_last: Option<[f32; PARAMS_FLOATS]>,
     finished: AtomicBool,
+}
+
+/// Host-visible uniform buffer suballocated into per-draw parameter slots.
+struct ParamsRing {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    ptr: *mut u8,
+    ds_pool: vk::DescriptorPool,
+    ds: vk::DescriptorSet,
+    capacity: u32,
+    used: u32,
 }
 
 impl std::fmt::Debug for VulkanFrame<'_, '_> {
@@ -144,8 +163,105 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             blit_buffers: Vec::new(),
             bound_pipeline: vk::Pipeline::null(),
             target_initial_layout,
+            color_params_override: None,
+            params_ring: None,
+            retired_params_rings: Vec::new(),
+            params_last: None,
             finished: AtomicBool::new(false),
         })
+    }
+
+    /// Returns the [`UserDataMap`] of the underlying renderer.
+    pub fn user_data(&self) -> &UserDataMap {
+        self.renderer.user_data()
+    }
+
+    /// Sets (or clears) the per-draw [`ColorBlendParams`] override for subsequent texture
+    /// draws, taking precedence over the renderer default.
+    pub fn set_color_params_override(&mut self, params: Option<ColorBlendParams>) {
+        self.color_params_override = params;
+    }
+
+    /// Takes the current per-draw color params override, leaving none in place.
+    pub fn take_color_params_override(&mut self) -> Option<ColorBlendParams> {
+        self.color_params_override.take()
+    }
+
+    /// Writes the parameter block into the ring and binds it for subsequent texture draws.
+    fn bind_params(&mut self, raw: &[f32; PARAMS_FLOATS]) -> Result<(), VulkanError> {
+        const RING_SLOTS: u32 = 256;
+
+        let slot_size = self.renderer.params_slot_size;
+        let needs_new = self
+            .params_ring
+            .as_ref()
+            .is_none_or(|ring| ring.used >= ring.capacity);
+        if needs_new {
+            if let Some(old) = self.params_ring.take() {
+                self.retired_params_rings.push(old);
+            }
+            let (buffer, memory, ptr) = self.renderer.create_host_buffer(
+                u64::from(slot_size) * u64::from(RING_SLOTS),
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+            )?;
+            let (ds_pool, ds) = match self
+                .renderer
+                .allocate_descriptor_set(self.renderer.params_ds_layout)
+            {
+                Ok(res) => res,
+                Err(err) => {
+                    let raw_device = &self.renderer.device().raw;
+                    unsafe {
+                        raw_device.free_memory(memory, None);
+                        raw_device.destroy_buffer(buffer, None);
+                    }
+                    return Err(err);
+                }
+            };
+            let buffer_info = [vk::DescriptorBufferInfo::default()
+                .buffer(buffer)
+                .offset(0)
+                .range(PARAMS_SIZE)];
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+                .buffer_info(&buffer_info);
+            unsafe { self.renderer.device().raw.update_descriptor_sets(&[write], &[]) };
+
+            self.params_ring = Some(ParamsRing {
+                buffer,
+                memory,
+                ptr: ptr as *mut u8,
+                ds_pool,
+                ds,
+                capacity: RING_SLOTS,
+                used: 0,
+            });
+        }
+
+        let ring = self.params_ring.as_mut().unwrap();
+        let offset = ring.used * slot_size;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                raw.as_ptr() as *const u8,
+                ring.ptr.add(offset as usize),
+                PARAMS_SIZE as usize,
+            );
+        }
+        ring.used += 1;
+
+        unsafe {
+            self.renderer.device().raw.cmd_bind_descriptor_sets(
+                self.cb,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.renderer.pipeline_layout,
+                1,
+                &[ring.ds],
+                &[offset],
+            );
+        }
+        Ok(())
     }
 
     fn bind_pipeline(&mut self, pipeline: vk::Pipeline) {
@@ -210,6 +326,11 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         if damage.is_empty() {
             return Ok(());
         }
+
+        let color = match &self.renderer.solid_color_transform {
+            Some(transform) => transform(color),
+            None => color,
+        };
 
         let pipeline = self.renderer.get_pipeline(self.target.vk_format(), true, blend)?;
         self.bind_pipeline(pipeline);
@@ -284,6 +405,17 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         };
 
         let ds = self.renderer.texture_descriptor_set(texture)?;
+
+        // Bind the color blend parameters for this draw (write a new slot only on change).
+        let raw_params = self
+            .color_params_override
+            .or(self.renderer.default_color_params)
+            .map(|params| params.to_std140())
+            .unwrap_or([0.0; PARAMS_FLOATS]);
+        if self.params_last != Some(raw_params) {
+            self.bind_params(&raw_params)?;
+            self.params_last = Some(raw_params);
+        }
 
         // Split the damage into opaque and non-opaque regions to disable blending where
         // possible, mirroring the GLES renderer.
@@ -503,6 +635,18 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             texture.0.mark_used(point);
         }
         self.target.mark_used(point);
+
+        // Retire the parameter rings once the submission completes.
+        for ring in self.retired_params_rings.drain(..).chain(self.params_ring.take()) {
+            self.renderer.device().defer_destroy(
+                point,
+                vec![
+                    CleanupItem::Buffer(ring.buffer),
+                    CleanupItem::Memory(ring.memory),
+                    CleanupItem::DescriptorSet(ring.ds_pool, ring.ds),
+                ],
+            );
+        }
 
         Ok(SyncPoint::from(fence))
     }
