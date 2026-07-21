@@ -3,3 +3,6 @@
 [default.extend-words]
 WRONLY = "WRONLY"
 eis = "eis"
+Ser = "Ser"
+cll = "cll"
+lod = "lod"
