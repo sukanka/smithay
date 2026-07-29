@@ -127,6 +127,11 @@ is used for timestamps for synthesized events.
 
 - Add `WmWindowProperty::Other` to forward unrecognized X11 property changes to the compositor.
 
+- The xdg-decoration global is now advertised at version 2, which allows clients to create a
+  toplevel decoration object after the toplevel already has a buffer attached or committed.
+  `XdgDecorationHandler` gained an optional `decoration_destroyed` method notifying the
+  compositor that the client destroyed the decoration object, so it can switch the surface
+  back to client-side decorations on the next commit as the protocol requires.
 - ExtBackgroundEffect protocol is now available in `smithay::wayland::background_effect` module.
 - `DrmSurface::use_color_state` (and the corresponding `DrmCompositor::use_color_state`) allows
   staging connector color state — `Colorspace`, `HDR_OUTPUT_METADATA` and `max bpc` — which is

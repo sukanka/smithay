@@ -102,8 +102,13 @@ use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum, backend::GlobalId,
 };
 
-use super::{ToplevelSurface, XdgShellHandler};
-use crate::wayland::{Dispatch2, GlobalData, GlobalDispatch2, shell::xdg::XdgShellSurfaceUserData};
+use super::{ToplevelSurface, XdgShellHandler, XdgToplevelSurfaceData};
+use crate::wayland::{
+    Dispatch2, GlobalData, GlobalDispatch2, compositor, shell::xdg::XdgShellSurfaceUserData,
+};
+
+/// The role-specific version of the xdg-decoration global.
+const DECORATION_VERSION: u32 = 2;
 
 /// Delegate type for handling xdg decoration events.
 #[derive(Debug)]
@@ -149,8 +154,10 @@ impl XdgDecorationState {
         let data = XdgDecorationManagerGlobalData {
             filter: Box::new(filter),
         };
-        let global =
-            display.create_global::<D, zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _>(1, data);
+        let global = display.create_global::<D, zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _>(
+            DECORATION_VERSION,
+            data,
+        );
 
         XdgDecorationState { global }
     }
@@ -171,6 +178,16 @@ pub trait XdgDecorationHandler {
 
     /// Notification the client does not prefer a particular decoration mode on the toplevel.
     fn unset_mode(&mut self, toplevel: ToplevelSurface);
+
+    /// Notification the client destroyed the decoration object of the toplevel.
+    ///
+    /// According to the protocol, the surface should switch back to a mode without any
+    /// server-side decorations at the next commit, unless a new decoration object is
+    /// created for the toplevel first (in which case, for version 2 and above, the
+    /// previously negotiated mode is retained).
+    fn decoration_destroyed(&mut self, toplevel: ToplevelSurface) {
+        let _ = toplevel;
+    }
 }
 
 pub(super) fn send_decoration_configure(
@@ -293,6 +310,20 @@ where
                 if let Some(data) = self.xdg_toplevel().data::<XdgShellSurfaceUserData>() {
                     data.decoration.lock().unwrap().take();
                 }
+
+                // A decoration object created later for this toplevel must receive a configure
+                // event of its own, even if the decoration mode does not change.
+                compositor::with_states(self.wl_surface(), |states| {
+                    states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .initial_decoration_configure_sent = false;
+                });
+
+                state.decoration_destroyed(self.clone());
             }
 
             _ => unreachable!(),
