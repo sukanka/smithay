@@ -194,6 +194,9 @@ impl Drop for Device {
 pub struct ColorBlendParams {
     pub hdr_pq: f32,
     pub ref_lum_scale: f32,
+    /// Scale from HDR content reference white to the output reference white.
+    /// 1.0 means no adjustment.
+    pub hdr_ref_scale: f32,
     pub linear: f32,
     pub linear_scale: f32,
     pub linear_to_ref: f32,
@@ -209,25 +212,26 @@ pub struct ColorBlendParams {
 }
 
 impl ColorBlendParams {
-    /// std140 layout of the shader's parameter block: 12 tightly packed scalars followed
-    /// by a mat3 (three vec4-aligned columns).
+    /// std140 layout of the shader's parameter block: 13 tightly packed scalars, rounded up
+    /// to the next 16-byte boundary, followed by a mat3 (three vec4-aligned columns).
     pub(super) fn to_std140(self) -> [f32; PARAMS_FLOATS] {
         let mut out = [0.0f32; PARAMS_FLOATS];
         out[0] = self.hdr_pq;
         out[1] = self.ref_lum_scale;
-        out[2] = self.linear;
-        out[3] = self.linear_scale;
-        out[4] = self.linear_to_ref;
-        out[5] = self.hdr_to_sdr;
-        out[6] = self.pq_gamut;
-        out[7] = self.use_gamut;
-        out[8] = self.tonemap;
-        out[9] = self.tm_v;
-        out[10] = self.tm_ref_scale;
-        out[11] = self.tm_out_scale;
+        out[2] = self.hdr_ref_scale;
+        out[3] = self.linear;
+        out[4] = self.linear_scale;
+        out[5] = self.linear_to_ref;
+        out[6] = self.hdr_to_sdr;
+        out[7] = self.pq_gamut;
+        out[8] = self.use_gamut;
+        out[9] = self.tonemap;
+        out[10] = self.tm_v;
+        out[11] = self.tm_ref_scale;
+        out[12] = self.tm_out_scale;
         for col in 0..3 {
             for row in 0..3 {
-                out[12 + col * 4 + row] = self.gamut[col * 3 + row];
+                out[16 + col * 4 + row] = self.gamut[col * 3 + row];
             }
         }
         out
@@ -235,7 +239,7 @@ impl ColorBlendParams {
 }
 
 /// Number of floats in the std140 color blend parameter block.
-pub(super) const PARAMS_FLOATS: usize = 24;
+pub(super) const PARAMS_FLOATS: usize = 28;
 /// Fixed range of the ring buffer descriptor; parameter blocks must fit inside.
 pub(super) const PARAMS_RANGE: u32 = 512;
 

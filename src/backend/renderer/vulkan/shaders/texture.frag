@@ -18,6 +18,7 @@ layout(set = 0, binding = 0) uniform sampler2D tex;
 layout(std140, set = 1, binding = 0) uniform NiriBlend {
     float niri_hdr_pq;
     float niri_ref_lum_scale;
+    float niri_hdr_ref_scale;
     float niri_linear;
     float niri_linear_scale;
     float niri_linear_to_ref;
@@ -124,6 +125,9 @@ vec4 niri_blend(vec4 color) {
 
         rgb = niri_pq_eotf(rgb);
 
+        // Scale the content's reference white to the capture's, as the PQ paths do.
+        rgb = rgb * (niri_hdr_ref_scale > 0.0 ? niri_hdr_ref_scale : 1.0);
+
         // Compress the headroom above the reference white into the SDR range instead of
         // clipping it below.
         rgb = niri_tonemap_apply(rgb);
@@ -146,13 +150,24 @@ vec4 niri_blend(vec4 color) {
     if (niri_pq_gamut > 0.5) {
         float a = color.a;
         vec3 rgb = a > 0.0 ? color.rgb / a : color.rgb;
-        rgb = niri_tonemap_apply(niri_gamut * niri_pq_eotf(rgb));
+        rgb = niri_pq_eotf(rgb) * (niri_hdr_ref_scale > 0.0 ? niri_hdr_ref_scale : 1.0);
+        rgb = niri_tonemap_apply(niri_gamut * rgb);
         rgb = niri_pq_inv_eotf(rgb);
         return vec4(rgb * a, a);
     }
 
-    if (niri_hdr_pq < 0.5 && niri_linear < 0.5)
+    if (niri_hdr_pq < 0.5 && niri_linear < 0.5) {
+        // BT.2020-container PQ content within the output peak otherwise passes through
+        // numerically; rescale it in linear light when its reference white differs from the
+        // output's. A zero scale means the parameter block was never filled in.
+        if (niri_hdr_ref_scale > 0.0 && abs(niri_hdr_ref_scale - 1.0) > 0.00001) {
+            float a = color.a;
+            vec3 rgb = a > 0.0 ? color.rgb / a : color.rgb;
+            rgb = niri_pq_inv_eotf(niri_pq_eotf(rgb) * niri_hdr_ref_scale);
+            return vec4(rgb * a, a);
+        }
         return color;
+    }
 
     float a = color.a;
     vec3 rgb = a > 0.0 ? color.rgb / a : color.rgb;
