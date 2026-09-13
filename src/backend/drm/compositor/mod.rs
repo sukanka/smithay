@@ -138,7 +138,7 @@ use std::{
 
 use drm::{
     Device, DriverCapability,
-    control::{Device as _, Mode, PageFlipFlags, PlaneType, connector, crtc, framebuffer, plane},
+    control::{Device as _, Mode, PageFlipFlags, PlaneType, connector, crtc, framebuffer, plane, property},
 };
 use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
 use indexmap::{IndexMap, IndexSet};
@@ -181,7 +181,7 @@ use crate::{
 use super::{
     DrmSurface, Framebuffer, PlaneClaim, PlaneInfo, Planes,
     color::{Colorspace, ConnectorColorState},
-    colorop::{ColorPipeline, ResolvedColorPipeline, ScanoutColorTransform},
+    colorop::{ColorPipeline, OwnedBlob, PostBlendEncode, ResolvedColorPipeline, ScanoutColorTransform},
     error::AccessError,
     exporter::{ExportBuffer, ExportFramebuffer, gbm::GbmFramebufferExporter, gbm::NodeFilter},
     surface::VrrSupport,
@@ -536,6 +536,8 @@ struct PlaneElementState {
     commit: CommitCounter,
     z_index: usize,
     cursor_size: Option<Size<i32, Physical>>,
+    /// For cursor planes: whether the contents went through the post-blend cursor transform.
+    cursor_post_blend: bool,
 }
 
 #[derive(Debug)]
@@ -886,6 +888,15 @@ pub type CursorBufferTransformFn = Box<dyn Fn(&mut [u8], u32, (u32, u32)) + Send
 
 struct CursorBufferTransform(CursorBufferTransformFn);
 
+/// State of an enabled post-blend encode offload.
+#[derive(Debug)]
+struct PostBlendState {
+    encode: PostBlendEncode,
+    /// The per-element transforms retargeted at the normalized linear intermediate.
+    transforms: HashMap<Id, ScanoutColorTransform>,
+    lut: Arc<OwnedBlob>,
+}
+
 impl Debug for CursorBufferTransform {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CursorBufferTransform")
@@ -966,6 +977,9 @@ struct CursorCacheKey {
     alpha: f32,
     output_transform: Transform,
     scale: Scale<f64>,
+    /// Whether the buffer went through the post-blend cursor transform, see
+    /// [`DrmCompositor::set_cursor_buffer_transform_post_blend`].
+    post_blend: bool,
 }
 
 struct CursorCacheEntry<F: Framebuffer> {
@@ -1026,6 +1040,12 @@ impl<F: Framebuffer> CursorBufferCache<F> {
     fn clear(&mut self) {
         self.entries.clear();
         self.bytes = 0;
+    }
+
+    /// Drops the entries filled with one of the two cursor transforms, keeping the other's.
+    fn clear_mode(&mut self, post_blend: bool) {
+        self.entries.retain(|entry| entry.key.post_blend != post_blend);
+        self.bytes = self.entries.iter().map(|entry| entry.bytes).sum();
     }
 }
 
@@ -1283,7 +1303,12 @@ where
     element_color_transforms: HashMap<Id, Option<ScanoutColorTransform>>,
     deny_untransformed_scanout: bool,
     cursor_buffer_transform: Option<CursorBufferTransform>,
+    /// The cursor transform for frames offloading the encode behind blending.
+    cursor_buffer_transform_post_blend: Option<CursorBufferTransform>,
     cursor_buffer_transform_dirty: bool,
+    /// Whether the cursor plane of the frame being assigned is filled for the post-blend
+    /// encode offload.
+    cursor_post_blend: bool,
     resolved_color_pipelines: RefCell<
         Vec<(
             plane::Handle,
@@ -1291,6 +1316,15 @@ where
             Option<Arc<ResolvedColorPipeline>>,
         )>,
     >,
+    /// The CRTC's `GAMMA_LUT` property and `GAMMA_LUT_SIZE`, if any.
+    gamma_lut_prop: Option<(property::Handle, u32)>,
+    /// The post-blend encode offload, see [`DrmCompositor::use_post_blend_encode`].
+    post_blend: Option<PostBlendState>,
+    /// The offload was disabled, but a frame resetting the gamma LUT has not been committed
+    /// yet; until then the compositor still owns the CRTC gamma LUT.
+    post_blend_draining: bool,
+    /// A bypassed primary plane pipeline that resets the CRTC gamma LUT.
+    post_blend_reset: Option<Arc<ResolvedColorPipeline>>,
 
     debug_flags: DebugFlags,
     span: tracing::Span,
@@ -1483,8 +1517,14 @@ where
                         element_color_transforms: HashMap::new(),
                         deny_untransformed_scanout: false,
                         cursor_buffer_transform: None,
+                        cursor_buffer_transform_post_blend: None,
                         cursor_buffer_transform_dirty: false,
+                        cursor_post_blend: false,
                         resolved_color_pipelines: RefCell::new(Vec::new()),
+                        gamma_lut_prop: None,
+                        post_blend: None,
+                        post_blend_draining: false,
+                        post_blend_reset: None,
                         supports_fencing,
                         debug_flags: DebugFlags::empty(),
                         span,
@@ -1673,8 +1713,14 @@ where
             element_color_transforms: HashMap::new(),
             deny_untransformed_scanout: false,
             cursor_buffer_transform: None,
+            cursor_buffer_transform_post_blend: None,
             cursor_buffer_transform_dirty: false,
+            cursor_post_blend: false,
             resolved_color_pipelines: RefCell::new(Vec::new()),
+            gamma_lut_prop: None,
+            post_blend: None,
+            post_blend_draining: false,
+            post_blend_reset: None,
             supports_fencing,
             debug_flags: DebugFlags::empty(),
             span,
@@ -2071,7 +2117,7 @@ where
                 damage_clips: None,
                 plane_claim,
                 sync: None,
-                color_pipeline: None,
+                color_pipeline: self.with_post_blend_reset(None),
             }),
         };
 
@@ -2200,6 +2246,30 @@ where
             output_elements.push((element, element_geometry, element_visible_area, element_is_opaque));
         }
         self.element_opaque_regions_workhouse = element_opaque_regions_workhouse;
+
+        // The CRTC gamma LUT of the post-blend encode offload applies to the cursor plane too, so
+        // the cursor has to be filled for it before we know whether the primary plane will
+        // actually offload. Decide up front whether this frame is a candidate: the bottom
+        // element covers the output and needs the offload, with at most a cursor above it.
+        // If the primary plane ends up not offloading, the cursor is filled again below.
+        self.cursor_post_blend = self.cursor_buffer_transform_post_blend.is_some()
+            && frame_flags.intersects(
+                FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY,
+            )
+            && match output_elements.as_slice() {
+                [(bottom, geometry, _, _)] | [(_, _, _, _), (bottom, geometry, _, _)] => {
+                    (output_elements.len() == 1 || output_elements[0].0.kind() == Kind::Cursor)
+                        && geometry.contains_rect(output_geometry)
+                        && self
+                            .post_blend
+                            .as_ref()
+                            .is_some_and(|state| state.transforms.contains_key(bottom.id()))
+                        && self
+                            .scanout_color_pipeline(bottom.id(), self.surface.plane())
+                            .is_err()
+                }
+                _ => false,
+            };
 
         // This will hold the element that has been selected for direct scan-out on
         // the primary plane if any
@@ -2406,6 +2476,61 @@ where
                 self.overlay_plane_element_ids.remove_plane(handle);
             }
         }
+
+        // A cursor filled for the post-blend encode offload is only correct if the primary plane
+        // offloads; otherwise fill it again for the output's signal, or composite it.
+        if self.cursor_post_blend {
+            self.cursor_post_blend = false;
+            let primary_offloads = next_frame_state
+                .plane_state(self.surface.plane())
+                .and_then(|state| state.config.as_ref())
+                .and_then(|config| config.color_pipeline.as_ref())
+                .and_then(|pipeline| pipeline.post_blend())
+                == Some(true);
+            let cursor_plane = self
+                .planes
+                .cursor
+                .iter()
+                .map(|info| info.handle)
+                .find(|handle| next_frame_state.is_assigned(*handle));
+            if let (false, Some(handle), Some(element)) =
+                (primary_offloads, cursor_plane, cursor_plane_element)
+            {
+                trace!("primary plane did not offload the encode, re-filling the cursor plane");
+                let state = next_frame_state.plane_state_mut(handle).unwrap();
+                let z_index = state.element_state.take().map(|s| s.z_index).unwrap_or_default();
+                state.config = None;
+                state.skip = false;
+                state.needs_test = false;
+
+                let reassigned = self.try_assign_cursor_plane(
+                    renderer,
+                    element,
+                    z_index,
+                    element.geometry(output_scale),
+                    output_scale,
+                    &mut next_frame_state,
+                    output_transform,
+                    output_geometry,
+                    frame_flags,
+                    presentation_mode,
+                );
+                if reassigned.is_none() {
+                    // The primary plane isn't scanning anything out (that is what the offload
+                    // was for), so the cursor can be composited into its buffer.
+                    cursor_plane_element = None;
+                    render_element_states.states.remove(element.id());
+                    primary_plane_elements.insert(0, element);
+                }
+            }
+        }
+
+        // Re-borrow, re-filling the cursor plane above needed `self` mutably.
+        let previous_state = self
+            .pending_frame
+            .as_ref()
+            .map(|pending| &pending.frame)
+            .unwrap_or(&self.current_frame);
 
         let render = next_frame_state
             .plane_buffer(self.surface.plane())
@@ -2806,6 +2931,7 @@ where
             self.queued_frame = None;
             self.pending_frame = None;
             self.current_frame = prepared_frame.frame;
+            self.update_post_blend_draining();
         }
 
         res.map(|_| ())
@@ -2988,6 +3114,7 @@ where
         };
 
         std::mem::swap(&mut frame, &mut self.current_frame);
+        self.update_post_blend_draining();
         if self.queued_frame.is_some() {
             self.submit()?;
         }
@@ -3172,18 +3299,7 @@ where
         }
         self.element_color_transforms = transforms;
         self.deny_untransformed_scanout = deny_unlisted;
-
-        // Previously recorded scan-out failures may have been transform-related; forget them
-        // so planes are re-tested against the new transforms.
-        for state in self
-            .element_states
-            .values_mut()
-            .chain(self.previous_element_states.values_mut())
-        {
-            for instance in &mut state.instances {
-                instance.failed_planes = Default::default();
-            }
-        }
+        self.forget_failed_planes();
     }
 
     /// Sets a post-processing transform for cursor plane contents.
@@ -3200,7 +3316,26 @@ where
         self.cursor_buffer_transform = transform.map(CursorBufferTransform);
         self.cursor_buffer_transform_dirty = true;
         if let Some(cursor_state) = self.cursor_state.as_mut() {
-            cursor_state.buffer_cache.clear();
+            cursor_state.buffer_cache.clear_mode(false);
+        }
+    }
+
+    /// Sets the transform for cursor plane contents on frames that offload the encode behind
+    /// blending (see [`use_post_blend_encode`](Self::use_post_blend_encode)).
+    ///
+    /// The CRTC gamma LUT applies to the cursor plane too, so on those frames the cursor must
+    /// be converted to the same normalized linear light as the scanned out element instead of
+    /// the output's signal. Without this transform the offload is only used while no cursor
+    /// is on the cursor plane.
+    ///
+    /// Buffers filled with either transform are cached separately, so frames switching
+    /// between the offload and regular scanout reuse them. Only call this when the transform
+    /// actually changes.
+    pub fn set_cursor_buffer_transform_post_blend(&mut self, transform: Option<CursorBufferTransformFn>) {
+        self.cursor_buffer_transform_post_blend = transform.map(CursorBufferTransform);
+        self.cursor_buffer_transform_dirty = true;
+        if let Some(cursor_state) = self.cursor_state.as_mut() {
+            cursor_state.buffer_cache.clear_mode(true);
         }
     }
 
@@ -3222,13 +3357,21 @@ where
         if transform.is_identity() {
             return Ok(None);
         }
+        self.resolve_color_transform(plane, transform).map(Some).ok_or(())
+    }
 
+    /// Resolves a non-identity transform against the pipelines of `plane`, caching the result.
+    fn resolve_color_transform(
+        &self,
+        plane: plane::Handle,
+        transform: ScanoutColorTransform,
+    ) -> Option<Arc<ResolvedColorPipeline>> {
         let mut cache = self.resolved_color_pipelines.borrow_mut();
         if let Some((_, _, resolved)) = cache
             .iter()
             .find(|(handle, cached, _)| *handle == plane && *cached == transform)
         {
-            return resolved.clone().map(Some).ok_or(());
+            return resolved.clone();
         }
 
         let resolved = self
@@ -3251,7 +3394,196 @@ where
             cache.remove(0);
         }
         cache.push((plane, transform, resolved.clone()));
-        resolved.map(Some).ok_or(())
+        resolved
+    }
+
+    /// Enables moving the encode of a single scanned out element behind blending, onto the
+    /// CRTC's `GAMMA_LUT`, see [`PostBlendEncode`].
+    ///
+    /// This is for plane color pipelines that always end in linear light (nvidia's), which
+    /// cannot express a transform with an encode stage. When an element listed in
+    /// [`use_color_transforms`](Self::use_color_transforms) can't be scanned out on the
+    /// primary plane with its transform, and nothing else is on any other plane, it is
+    /// scanned out with its entry in `transforms` instead: the same conversion without the
+    /// encode, and normalized to [`PostBlendEncode::linear_max`]. The gamma LUT is set in the
+    /// same atomic commit.
+    ///
+    /// While enabled (and after disabling, until a frame without the offload has been
+    /// committed), the compositor owns the CRTC gamma LUT: every primary plane commit resets it
+    /// unless it carries the offload, so it must not be changed by other means. Check
+    /// [`post_blend_encode_owns_gamma`](Self::post_blend_encode_owns_gamma) before doing so.
+    ///
+    /// Returns whether the offload is enabled; it is not supported without a `GAMMA_LUT`, or
+    /// without color pipelines on the primary plane.
+    #[allow(clippy::mutable_key_type)] // Id's Eq/Hash are stable.
+    pub fn use_post_blend_encode(
+        &mut self,
+        encode: Option<PostBlendEncode>,
+        transforms: HashMap<Id, ScanoutColorTransform>,
+    ) -> bool {
+        let Some(encode) = encode else {
+            if self.post_blend.take().is_some() {
+                self.post_blend_draining = true;
+                self.forget_failed_planes();
+            }
+            return false;
+        };
+
+        if let Some(state) = self.post_blend.as_mut() {
+            if state.encode == encode {
+                if state.transforms != transforms {
+                    state.transforms = transforms;
+                    self.forget_failed_planes();
+                }
+                return true;
+            }
+        }
+
+        if !self.plane_color_pipelines.contains_key(&self.surface.plane()) {
+            return false;
+        }
+        if self.gamma_lut_prop.is_none() {
+            self.gamma_lut_prop = self.query_gamma_lut_prop();
+        }
+        let Some((gamma_lut_prop, size)) = self.gamma_lut_prop else {
+            return false;
+        };
+        let Some(lut) = encode.create_gamma_lut(self.surface.device_fd(), size) else {
+            warn!("failed to create the post-blend encode gamma LUT");
+            return false;
+        };
+        if self.post_blend_reset.is_none() {
+            self.post_blend_reset = Some(Arc::new(ResolvedColorPipeline::with_gamma_lut(
+                None,
+                self.surface.crtc().into(),
+                gamma_lut_prop,
+                None,
+            )));
+        }
+
+        self.post_blend = Some(PostBlendState {
+            encode,
+            transforms,
+            lut,
+        });
+        self.post_blend_draining = false;
+        self.forget_failed_planes();
+        true
+    }
+
+    /// Whether the compositor currently owns the CRTC gamma LUT because of the post-blend
+    /// encode offload (enabled, or disabled but not drained yet).
+    pub fn post_blend_encode_owns_gamma(&self) -> bool {
+        self.post_blend.is_some() || self.post_blend_draining
+    }
+
+    fn query_gamma_lut_prop(&self) -> Option<(property::Handle, u32)> {
+        let crtc = self.surface.crtc();
+        let props = self.surface.get_properties(crtc).ok()?;
+        let (handles, values) = props.as_props_and_values();
+        let mut lut = None;
+        let mut size = None;
+        for (handle, value) in handles.iter().zip(values) {
+            let Ok(info) = self.surface.get_property(*handle) else {
+                continue;
+            };
+            match info.name().to_str() {
+                Ok("GAMMA_LUT") => lut = Some(*handle),
+                Ok("GAMMA_LUT_SIZE") => size = u32::try_from(*value).ok(),
+                _ => {}
+            }
+        }
+        Some((lut?, size?))
+    }
+
+    /// Previously recorded scan-out failures may have been transform-related; forget them so
+    /// planes are re-tested.
+    fn forget_failed_planes(&mut self) {
+        for state in self
+            .element_states
+            .values_mut()
+            .chain(self.previous_element_states.values_mut())
+        {
+            for instance in &mut state.instances {
+                instance.failed_planes = Default::default();
+            }
+        }
+    }
+
+    /// Adds the CRTC gamma LUT reset to a primary plane pipeline while the compositor owns the
+    /// gamma LUT.
+    fn with_post_blend_reset(
+        &self,
+        pipeline: Option<Arc<ResolvedColorPipeline>>,
+    ) -> Option<Arc<ResolvedColorPipeline>> {
+        if !self.post_blend_encode_owns_gamma() {
+            return pipeline;
+        }
+        let (Some((gamma_lut_prop, _)), Some(reset)) = (self.gamma_lut_prop, &self.post_blend_reset) else {
+            return pipeline;
+        };
+        match pipeline {
+            None => Some(reset.clone()),
+            Some(pipeline) => Some(Arc::new(ResolvedColorPipeline::with_gamma_lut(
+                Some(&pipeline),
+                self.surface.crtc().into(),
+                gamma_lut_prop,
+                None,
+            ))),
+        }
+    }
+
+    /// The primary plane pipeline scanning out `element_id` with its encode offloaded behind
+    /// blending, if the offload applies to this element and frame.
+    fn post_blend_offload_pipeline(
+        &self,
+        element_id: &Id,
+        frame_state: &CompositorFrameState<A, F>,
+    ) -> Option<Arc<ResolvedColorPipeline>> {
+        let state = self.post_blend.as_ref()?;
+        let (gamma_lut_prop, _) = self.gamma_lut_prop?;
+        let primary = self.surface.plane();
+        // The gamma LUT applies to the whole output, so nothing else may be visible, except a
+        // cursor that was filled for the offload.
+        if frame_state.planes.iter().any(|(handle, plane_state)| {
+            let post_blend_cursor = self.planes.cursor.iter().any(|info| info.handle == *handle)
+                && plane_state
+                    .element_state
+                    .as_ref()
+                    .is_some_and(|state| state.cursor_post_blend);
+            *handle != primary && plane_state.config.is_some() && !post_blend_cursor
+        }) {
+            return None;
+        }
+        let transform = *state.transforms.get(element_id)?;
+        let base = if transform.is_identity() {
+            None
+        } else {
+            Some(self.resolve_color_transform(primary, transform)?)
+        };
+        Some(Arc::new(ResolvedColorPipeline::with_gamma_lut(
+            base.as_deref(),
+            self.surface.crtc().into(),
+            gamma_lut_prop,
+            Some(&state.lut),
+        )))
+    }
+
+    /// Ends draining once a frame resetting the gamma LUT has been committed.
+    fn update_post_blend_draining(&mut self) {
+        if !self.post_blend_draining || self.post_blend.is_some() {
+            return;
+        }
+        let reset = self
+            .current_frame
+            .plane_state(self.surface.plane())
+            .and_then(|state| state.config.as_ref())
+            .and_then(|config| config.color_pipeline.as_ref())
+            .and_then(|pipeline| pipeline.post_blend())
+            == Some(false);
+        if reset {
+            self.post_blend_draining = false;
+        }
     }
 
     /// Returns the valid range of the given connector's `max bpc` property, if any.
@@ -3710,6 +4042,7 @@ where
         // if the output transform or scale change we have to (re-)render the cursor plane,
         // also if the element changed or reports damage we have to render it
         let render = self.cursor_buffer_transform_dirty
+            || previous_element_state.is_some_and(|state| state.cursor_post_blend != self.cursor_post_blend)
             || cursor_state
                 .previous_output_transform
                 .map(|t| t != output_transform)
@@ -3790,6 +4123,7 @@ where
             alpha: element.alpha(),
             output_transform,
             scale,
+            post_blend: self.cursor_post_blend,
         });
         let cached = cache_key
             .as_ref()
@@ -3955,7 +4289,12 @@ where
                 }
             };
 
-            if let Some(transform) = self.cursor_buffer_transform.as_ref() {
+            let transform = if self.cursor_post_blend {
+                self.cursor_buffer_transform_post_blend.as_ref()
+            } else {
+                self.cursor_buffer_transform.as_ref()
+            };
+            if let Some(transform) = transform {
                 let res = cursor_buffer.map_mut(
                     0,
                     0,
@@ -4036,6 +4375,7 @@ where
                 commit: element.current_commit(),
                 z_index: element_zindex,
                 cursor_size: Some(element_size),
+                cursor_post_blend: self.cursor_post_blend,
             }),
             config: Some(config),
         };
@@ -4576,15 +4916,29 @@ where
         // Elements with a color transform may only reach a plane whose pipeline can express
         // it; without color transform state, elements the current policy denies must be
         // rendered instead.
+        let is_primary = plane.handle == self.surface.plane();
         let color_pipeline = match self.scanout_color_pipeline(element_id, plane.handle) {
+            Ok(pipeline) if is_primary => self.with_post_blend_reset(pipeline),
             Ok(pipeline) => pipeline,
-            Err(()) => {
-                trace!(
-                    "skipping direct scan-out on {:?} with zpos {:?} for element {:?}, color transform not expressible",
-                    plane.handle, plane.zpos, element_id,
-                );
-                return Err(Some(RenderingReason::ColorTransformUnsupported));
-            }
+            Err(()) => match is_primary
+                .then(|| self.post_blend_offload_pipeline(element_id, frame_state))
+                .flatten()
+            {
+                Some(pipeline) => {
+                    trace!(
+                        "scanning out element {:?} on primary {:?} with the encode offloaded behind blending",
+                        element_id, plane.handle,
+                    );
+                    Some(pipeline)
+                }
+                None => {
+                    trace!(
+                        "skipping direct scan-out on {:?} with zpos {:?} for element {:?}, color transform not expressible",
+                        plane.handle, plane.zpos, element_id,
+                    );
+                    return Err(Some(RenderingReason::ColorTransformUnsupported));
+                }
+            },
         };
 
         // Try to assign the element to a plane
@@ -4707,6 +5061,7 @@ where
                 commit: element.current_commit(),
                 z_index: element_config.z_index,
                 cursor_size: None,
+                cursor_post_blend: false,
             }),
             config: Some(config),
         };
