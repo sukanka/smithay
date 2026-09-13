@@ -21,6 +21,8 @@
 use std::collections::HashMap;
 use std::io;
 use std::num::NonZeroU32;
+use std::os::unix::io::AsFd;
+use std::sync::Arc;
 
 use drm::control::{Device as ControlDevice, RawResourceHandle, from_u32, plane, property};
 
@@ -71,6 +73,75 @@ impl Curve1DType {
             Curve1DType::Bt2020Oetf => "BT.2020 OETF",
             Curve1DType::Gamma22 => "Gamma 2.2",
             Curve1DType::Gamma22Inv => "Gamma 2.2 Inverse",
+        }
+    }
+
+    /// Evaluates the curve for a single channel value, in the value scale of the kernel's
+    /// curves (see [`ScanoutColorTransform`]): the `PQ 125` EOTF maps \[0, 1\] to \[0, 125\] and
+    /// its inverse maps \[0, 125\] back to \[0, 1\]; every other curve maps \[0, 1\] to \[0, 1\].
+    /// Inputs outside the domain are clamped.
+    pub fn eval(&self, x: f64) -> f64 {
+        // SMPTE ST 2084
+        const M1: f64 = 2610. / 16384.;
+        const M2: f64 = 2523. / 4096. * 128.;
+        const C1: f64 = 3424. / 4096.;
+        const C2: f64 = 2413. / 4096. * 32.;
+        const C3: f64 = 2392. / 4096. * 32.;
+        // ITU-R BT.2020
+        const ALPHA: f64 = 1.09929682680944;
+        const BETA: f64 = 0.018053968510807;
+
+        match self {
+            Curve1DType::SrgbEotf => {
+                let x = x.clamp(0., 1.);
+                if x <= 0.04045 {
+                    x / 12.92
+                } else {
+                    ((x + 0.055) / 1.055).powf(2.4)
+                }
+            }
+            Curve1DType::SrgbInvEotf => {
+                let x = x.clamp(0., 1.);
+                if x <= 0.0031308 {
+                    x * 12.92
+                } else {
+                    1.055 * x.powf(1. / 2.4) - 0.055
+                }
+            }
+            Curve1DType::Pq125Eotf => {
+                let p = x.clamp(0., 1.).powf(1. / M2);
+                125. * ((p - C1).max(0.) / (C2 - C3 * p)).powf(1. / M1)
+            }
+            Curve1DType::Pq125InvEotf => {
+                let y = (x / 125.).clamp(0., 1.).powf(M1);
+                ((C1 + C2 * y) / (1. + C3 * y)).powf(M2)
+            }
+            Curve1DType::Bt2020InvOetf => {
+                let x = x.clamp(0., 1.);
+                if x < 4.5 * BETA {
+                    x / 4.5
+                } else {
+                    ((x + ALPHA - 1.) / ALPHA).powf(1. / 0.45)
+                }
+            }
+            Curve1DType::Bt2020Oetf => {
+                let x = x.clamp(0., 1.);
+                if x < BETA {
+                    4.5 * x
+                } else {
+                    ALPHA * x.powf(0.45) - (ALPHA - 1.)
+                }
+            }
+            Curve1DType::Gamma22 => x.clamp(0., 1.).powf(2.2),
+            Curve1DType::Gamma22Inv => x.clamp(0., 1.).powf(1. / 2.2),
+        }
+    }
+
+    /// The largest value [`Self::eval`] returns.
+    fn output_max(&self) -> f64 {
+        match self {
+            Curve1DType::Pq125Eotf => 125.,
+            _ => 1.,
         }
     }
 
@@ -439,90 +510,236 @@ impl ScanoutColorTransform {
     /// Resolves this transform against a color pipeline, producing the property values to
     /// program.
     ///
-    /// Walks the pipeline's operations in order, assigning each stage of the transform to the
-    /// first operation that can express it and bypassing all others. Operations without a
-    /// `BYPASS` property are programmed to an identity where possible (matrix, multiplier);
-    /// pipelines with other non-bypassable unused operations are rejected, as are pipelines
-    /// that cannot express every stage.
+    /// Searches for an assignment of the transform's stages to the pipeline's operations, in
+    /// order. Named curves take the decode and encode stages; a 1D LUT can take the decode
+    /// stage too, filled with the curve (which makes SDR decodes possible on pipelines whose
+    /// curve ops only offer PQ, like nvidia's). The gain goes to a multiplier or is folded
+    /// into a matrix, and is folded into a decode LUT when that keeps the LUT's output within
+    /// \[0, 1\]. Among all working assignments the one using the fewest LUTs is picked, as
+    /// named curves are exact and cheap.
     ///
-    /// The `device` is used to create property blobs (e.g. the CTM matrix); their lifetime is
+    /// Unused operations are bypassed; operations without a `BYPASS` property are programmed
+    /// to an identity where possible (matrix, multiplier, 1D LUT). Pipelines with other
+    /// non-bypassable unused operations are rejected, as are pipelines that cannot express
+    /// every stage.
+    ///
+    /// The `device` is used to create property blobs (matrices and LUTs); their lifetime is
     /// tied to the returned value.
     ///
     /// Returns `None` if the pipeline cannot express the transform.
     pub fn resolve(&self, device: &DrmDeviceFd, pipeline: &ColorPipeline) -> Option<ResolvedColorPipeline> {
+        let plan = self.plan(pipeline)?;
+
         let mut resolved = ResolvedColorPipeline {
             pipeline_id: pipeline.id,
             props: Vec::new(),
             blobs: Vec::new(),
+            post_blend: None,
         };
-
-        // The remaining transform stages, in application order.
-        let mut decode = self.decode;
-        let mut multiplier = (self.multiplier != 1.0).then_some(self.multiplier);
-        let mut ctm = self.ctm;
-        let mut encode = self.encode;
-
-        for op in &pipeline.ops {
-            let mut used = false;
-
-            match &op.kind {
-                ColorOpKind::Curve1D { supported } => {
-                    // A curve op can take the decode stage, or the encode stage once
-                    // everything before it is placed.
-                    let stage = if decode.is_some() {
-                        &mut decode
-                    } else if multiplier.is_none() && ctm.is_none() {
-                        &mut encode
-                    } else {
-                        &mut None
-                    };
-                    if let Some(curve) = *stage {
-                        if let Some(&(_, value)) = supported.iter().find(|(c, _)| *c == curve) {
-                            resolved.set(op, "CURVE_1D_TYPE", value)?;
-                            *stage = None;
-                            used = true;
-                        }
-                    }
+        for (op, plan) in pipeline.ops.iter().zip(plan) {
+            match plan {
+                OpPlan::Bypass => resolved.bypass(op)?,
+                OpPlan::Curve(value) => resolved.set(op, "CURVE_1D_TYPE", value)?,
+                OpPlan::Multiplier(gain) => resolved.set(op, "MULTIPLIER", to_s31_32(gain))?,
+                OpPlan::Ctm(matrix) => resolved.set_ctm(device, op, &matrix)?,
+                OpPlan::LutDecode { curve, gain } => {
+                    resolved.set_lut1d(device, op, |u| curve.eval(u) * gain)?
                 }
-                ColorOpKind::Multiplier => {
-                    if decode.is_none() {
-                        if let Some(gain) = multiplier {
-                            resolved.set(op, "MULTIPLIER", to_s31_32(gain))?;
-                            multiplier = None;
-                            used = true;
-                        }
-                    }
-                }
-                ColorOpKind::Ctm3x4 => {
-                    if decode.is_none() && (multiplier.is_some() || ctm.is_some()) {
-                        // Fold a pending gain into the matrix: out = M × (g × in) scales the
-                        // three input columns, leaving the offset column untouched.
-                        let gain = multiplier.take().unwrap_or(1.0);
-                        let mut matrix = ctm.take().unwrap_or(CTM_3X4_IDENTITY);
-                        for row in 0..3 {
-                            for col in 0..3 {
-                                matrix[row * 4 + col] *= gain;
-                            }
-                        }
-                        resolved.set_ctm(device, op, &matrix)?;
-                        used = true;
-                    }
-                }
-                ColorOpKind::Lut1D { .. } | ColorOpKind::Lut3D { .. } | ColorOpKind::Unknown { .. } => {}
+                OpPlan::LutIdentity => resolved.set_lut1d(device, op, |u| u)?,
             }
-
-            if !used {
-                resolved.bypass(device, op)?;
-            }
-        }
-
-        // Every stage must have found an operation.
-        if decode.is_some() || multiplier.is_some() || ctm.is_some() || encode.is_some() {
-            return None;
         }
 
         Some(resolved)
     }
+
+    /// Finds how to program every op of `pipeline` for this transform, without touching the
+    /// device. See [`Self::resolve`].
+    fn plan(&self, pipeline: &ColorPipeline) -> Option<Vec<OpPlan>> {
+        let stages = PendingStages {
+            decode: self.decode,
+            gain: self.multiplier,
+            ctm: self.ctm,
+            encode: self.encode,
+        };
+        let mut best = None;
+        let mut current = Vec::with_capacity(pipeline.ops.len());
+        plan_ops(&pipeline.ops, stages, 0, &mut current, &mut best);
+        best.map(|(_, plan)| plan)
+    }
+}
+
+/// How a single colorop is programmed by a resolved transform.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OpPlan {
+    Bypass,
+    /// Select a named curve, by its raw `CURVE_1D_TYPE` value.
+    Curve(u64),
+    Multiplier(f64),
+    Ctm([f64; 12]),
+    /// Fill a 1D LUT with `curve(u) * gain`.
+    LutDecode {
+        curve: Curve1DType,
+        gain: f64,
+    },
+    /// Fill a non-bypassable 1D LUT with the identity.
+    LutIdentity,
+}
+
+/// The stages of a [`ScanoutColorTransform`] that are not placed on an op yet.
+#[derive(Debug, Clone, Copy)]
+struct PendingStages {
+    decode: Option<Curve1DType>,
+    /// A gain still to be applied to the (decoded) values; 1.0 once placed. A decode LUT can
+    /// leave a gain behind when the decoded range doesn't fit its \[0, 1\] output.
+    gain: f64,
+    ctm: Option<[f64; 12]>,
+    encode: Option<Curve1DType>,
+}
+
+impl PendingStages {
+    fn gain_placed(&self) -> bool {
+        (self.gain - 1.0).abs() < 1e-9
+    }
+
+    fn is_done(&self) -> bool {
+        self.decode.is_none() && self.gain_placed() && self.ctm.is_none() && self.encode.is_none()
+    }
+}
+
+/// Depth-first search over the ways to program `ops`, keeping the cheapest complete plan.
+fn plan_ops(
+    ops: &[ColorOp],
+    stages: PendingStages,
+    cost: u32,
+    current: &mut Vec<OpPlan>,
+    best: &mut Option<(u32, Vec<OpPlan>)>,
+) {
+    if best.as_ref().is_some_and(|(best_cost, _)| *best_cost <= cost) {
+        return;
+    }
+    let Some((op, rest)) = ops.split_first() else {
+        if stages.is_done() {
+            *best = Some((cost, current.clone()));
+        }
+        return;
+    };
+    for (plan, next, op_cost) in op_options(op, stages) {
+        current.push(plan);
+        plan_ops(rest, next, cost + op_cost, current, best);
+        current.pop();
+    }
+}
+
+/// The ways a single op can be programmed given the pending stages, as (plan, remaining
+/// stages, cost), placing stages before bypassing so that equal-cost plans use the earliest
+/// ops.
+fn op_options(op: &ColorOp, stages: PendingStages) -> Vec<(OpPlan, PendingStages, u32)> {
+    let mut options = Vec::with_capacity(2);
+    match &op.kind {
+        ColorOpKind::Curve1D { supported } => {
+            let find = |curve: Curve1DType| supported.iter().find(|(c, _)| *c == curve).map(|(_, v)| *v);
+            if let Some(value) = stages.decode.and_then(find) {
+                options.push((
+                    OpPlan::Curve(value),
+                    PendingStages {
+                        decode: None,
+                        ..stages
+                    },
+                    0,
+                ));
+            } else if stages.decode.is_none() && stages.gain_placed() && stages.ctm.is_none() {
+                // A curve op takes the encode stage once everything before it is placed.
+                if let Some(value) = stages.encode.and_then(find) {
+                    options.push((
+                        OpPlan::Curve(value),
+                        PendingStages {
+                            encode: None,
+                            ..stages
+                        },
+                        0,
+                    ));
+                }
+            }
+            if op.bypassable {
+                options.push((OpPlan::Bypass, stages, 0));
+            }
+        }
+        ColorOpKind::Multiplier => {
+            if stages.decode.is_none() && !stages.gain_placed() {
+                options.push((
+                    OpPlan::Multiplier(stages.gain),
+                    PendingStages { gain: 1.0, ..stages },
+                    0,
+                ));
+            }
+            if op.bypassable {
+                options.push((OpPlan::Bypass, stages, 0));
+            } else {
+                options.push((OpPlan::Multiplier(1.0), stages, 0));
+            }
+        }
+        ColorOpKind::Ctm3x4 => {
+            if stages.decode.is_none() && (stages.ctm.is_some() || !stages.gain_placed()) {
+                // Fold a pending gain into the matrix: out = M × (g × in) scales the three
+                // input columns, leaving the offset column untouched.
+                let mut matrix = stages.ctm.unwrap_or(CTM_3X4_IDENTITY);
+                for row in 0..3 {
+                    for col in 0..3 {
+                        matrix[row * 4 + col] *= stages.gain;
+                    }
+                }
+                options.push((
+                    OpPlan::Ctm(matrix),
+                    PendingStages {
+                        gain: 1.0,
+                        ctm: None,
+                        ..stages
+                    },
+                    0,
+                ));
+            }
+            if op.bypassable {
+                options.push((OpPlan::Bypass, stages, 0));
+            } else {
+                options.push((OpPlan::Ctm(CTM_3X4_IDENTITY), stages, 0));
+            }
+        }
+        ColorOpKind::Lut1D { size, .. } if *size >= 2 => {
+            if let Some(curve) = stages.decode {
+                // The LUT output is limited to [0, 1]: fold the gain in if the decoded range
+                // still fits, otherwise normalize and leave the rest of the gain pending.
+                let range = curve.output_max() * stages.gain;
+                let (lut_gain, remaining) = if range <= 1.0 {
+                    (stages.gain, 1.0)
+                } else {
+                    (1.0 / curve.output_max(), range)
+                };
+                options.push((
+                    OpPlan::LutDecode {
+                        curve,
+                        gain: lut_gain,
+                    },
+                    PendingStages {
+                        decode: None,
+                        gain: remaining,
+                        ..stages
+                    },
+                    1,
+                ));
+            }
+            if op.bypassable {
+                options.push((OpPlan::Bypass, stages, 0));
+            } else {
+                options.push((OpPlan::LutIdentity, stages, 1));
+            }
+        }
+        ColorOpKind::Lut1D { .. } | ColorOpKind::Lut3D { .. } | ColorOpKind::Unknown { .. } => {
+            if op.bypassable {
+                options.push((OpPlan::Bypass, stages, 0));
+            }
+        }
+    }
+    options
 }
 
 const CTM_3X4_IDENTITY: [f64; 12] = [
@@ -544,9 +761,21 @@ struct CtmBlob {
     matrix: [u64; 12],
 }
 
+/// Creates a property blob from plain integer data.
+fn create_blob<T: Copy>(device: &DrmDeviceFd, data: &[T]) -> Option<OwnedBlob> {
+    // SAFETY: only used with slices of plain unsigned integers, which have no padding.
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(data.as_ptr() as *mut u8, std::mem::size_of_val(data)) };
+    let blob = drm_ffi::mode::create_property_blob(device.as_fd(), bytes).ok()?;
+    Some(OwnedBlob {
+        device: device.clone(),
+        id: u64::from(blob.blob_id),
+    })
+}
+
 /// A property blob owned by a [`ResolvedColorPipeline`], destroyed when dropped.
 #[derive(Debug)]
-struct OwnedBlob {
+pub(super) struct OwnedBlob {
     device: DrmDeviceFd,
     id: u64,
 }
@@ -558,18 +787,70 @@ impl Drop for OwnedBlob {
     }
 }
 
+/// An encode applied after blending, on the CRTC's `GAMMA_LUT`, instead of on each plane.
+///
+/// Plane color pipelines on some hardware (nvidia) can decode, scale and convert the gamut of
+/// plane contents, but always end in linear light: they cannot apply the final encode to the
+/// output's signal. When a single plane makes up the whole output, that encode can move behind
+/// blending instead. The plane is then programmed to output *normalized* linear light, where
+/// 1.0 corresponds to `linear_max` (in the linear scale of [`ScanoutColorTransform`], i.e.
+/// 1.0 = 80 cd/m² for the PQ curves), and the CRTC gamma LUT maps that to `encode(u ×
+/// linear_max)`.
+///
+/// Note that a gamma LUT indexed by linear light has little precision near black; the
+/// smaller `linear_max`, the better (e.g. the output's peak luminance rather than 10,000
+/// cd/m²).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PostBlendEncode {
+    /// The curve encoding the blended, linear values to the output's signal.
+    pub encode: Curve1DType,
+    /// The linear value that the plane output 1.0 stands for.
+    pub linear_max: f64,
+}
+
+impl PostBlendEncode {
+    /// Creates the `GAMMA_LUT` blob (`struct drm_color_lut` entries) for this encode.
+    pub(super) fn create_gamma_lut(&self, device: &DrmDeviceFd, size: u32) -> Option<Arc<OwnedBlob>> {
+        if size < 2 {
+            return None;
+        }
+        let data = (0..size)
+            .flat_map(|i| {
+                let u = f64::from(i) / f64::from(size - 1);
+                let value = to_unorm16(self.encode.eval(u * self.linear_max));
+                [value, value, value, 0]
+            })
+            .collect::<Vec<u16>>();
+        create_blob(device, &data).map(Arc::new)
+    }
+}
+
+fn to_unorm16(value: f64) -> u16 {
+    (value.clamp(0.0, 1.0) * f64::from(u16::MAX)).round() as u16
+}
+
+fn to_unorm32(value: f64) -> u32 {
+    (value.clamp(0.0, 1.0) * f64::from(u32::MAX)).round() as u32
+}
+
 /// A [`ScanoutColorTransform`] resolved against a specific [`ColorPipeline`]: the plane's
 /// `COLOR_PIPELINE` value plus the property values of every colorop in the chain, ready to be
 /// added to an atomic commit via [`PlaneConfig::color_pipeline`](super::PlaneConfig::color_pipeline).
 ///
-/// Owns the property blobs (e.g. the CTM matrix) referenced by the values; they are destroyed
+/// It may also carry the CRTC `GAMMA_LUT` value of a [`PostBlendEncode`] (or its reset), which
+/// has to change atomically with the plane.
+///
+/// Owns the property blobs (matrices and LUTs) referenced by the values; they are destroyed
 /// when the resolved pipeline is dropped, so it must be kept alive as long as a commit uses it.
 #[derive(Debug)]
 pub struct ResolvedColorPipeline {
     pipeline_id: u64,
     props: Vec<(RawResourceHandle, property::Handle, u64)>,
     #[allow(dead_code)] // Held to keep the kernel blobs alive.
-    blobs: Vec<OwnedBlob>,
+    blobs: Vec<Arc<OwnedBlob>>,
+    /// `Some(true)` if this carries a post-blend encode on the CRTC, `Some(false)` if it
+    /// resets the CRTC gamma LUT.
+    post_blend: Option<bool>,
 }
 
 impl ResolvedColorPipeline {
@@ -578,9 +859,47 @@ impl ResolvedColorPipeline {
         self.pipeline_id
     }
 
-    /// The colorop property values to add to the atomic commit.
+    /// The colorop (and CRTC) property values to add to the atomic commit.
     pub(super) fn props(&self) -> &[(RawResourceHandle, property::Handle, u64)] {
         &self.props
+    }
+
+    /// Whether this carries a post-blend encode (`Some(true)`) or a reset of it
+    /// (`Some(false)`) on the CRTC gamma LUT.
+    pub(super) fn post_blend(&self) -> Option<bool> {
+        self.post_blend
+    }
+
+    /// A copy of `base` (or of a bypassed pipeline if `None`) that also sets the CRTC's
+    /// `GAMMA_LUT` to `lut`, or resets it to no LUT.
+    pub(super) fn with_gamma_lut(
+        base: Option<&ResolvedColorPipeline>,
+        crtc: RawResourceHandle,
+        gamma_lut_prop: property::Handle,
+        lut: Option<&Arc<OwnedBlob>>,
+    ) -> ResolvedColorPipeline {
+        let mut resolved = match base {
+            Some(base) => ResolvedColorPipeline {
+                pipeline_id: base.pipeline_id,
+                props: base.props.clone(),
+                blobs: base.blobs.clone(),
+                post_blend: None,
+            },
+            None => ResolvedColorPipeline {
+                pipeline_id: 0,
+                props: Vec::new(),
+                blobs: Vec::new(),
+                post_blend: None,
+            },
+        };
+        resolved
+            .props
+            .push((crtc, gamma_lut_prop, lut.map_or(0, |lut| lut.id)));
+        if let Some(lut) = lut {
+            resolved.blobs.push(lut.clone());
+        }
+        resolved.post_blend = Some(lut.is_some());
+        resolved
     }
 
     fn op_handle(op: &ColorOp) -> Option<RawResourceHandle> {
@@ -605,27 +924,41 @@ impl ResolvedColorPipeline {
         let property::Value::Blob(id) = device.create_property_blob(&blob).ok()? else {
             return None;
         };
-        self.blobs.push(OwnedBlob {
+        self.blobs.push(Arc::new(OwnedBlob {
             device: device.clone(),
             id,
-        });
+        }));
         self.set(op, "DATA", id)
     }
 
-    /// Bypasses an unused colorop, or programs it to an identity if it cannot be bypassed.
-    fn bypass(&mut self, device: &DrmDeviceFd, op: &ColorOp) -> Option<()> {
-        if op.bypassable {
-            let handle = Self::op_handle(op)?;
-            self.props.push((handle, *op.props.get("BYPASS")?, 1));
-            return Some(());
+    /// Programs the `DATA` blob (`struct drm_color_lut32` entries) of a 1D LUT colorop with
+    /// `f` sampled over \[0, 1\], and selects linear interpolation.
+    fn set_lut1d(&mut self, device: &DrmDeviceFd, op: &ColorOp, f: impl Fn(f64) -> f64) -> Option<()> {
+        let ColorOpKind::Lut1D { size, interpolation } = op.kind else {
+            return None;
+        };
+        let data = (0..size)
+            .flat_map(|i| {
+                let value = to_unorm32(f(f64::from(i) / f64::from(size - 1)));
+                [value, value, value, 0]
+            })
+            .collect::<Vec<u32>>();
+        let blob = create_blob(device, &data)?;
+        let id = blob.id;
+        self.blobs.push(Arc::new(blob));
+        if interpolation != Lut1DInterpolation::Linear {
+            // Linear is the only interpolation the kernel defines; an unknown current value
+            // is left alone.
+            trace!(op = op.id, "1D LUT colorop with unknown interpolation");
         }
-        match &op.kind {
-            ColorOpKind::Multiplier => self.set(op, "MULTIPLIER", to_s31_32(1.0)),
-            ColorOpKind::Ctm3x4 => self.set_ctm(device, op, &CTM_3X4_IDENTITY),
-            // Curves and LUTs have no identity we can program without uploading data;
-            // reject the pipeline.
-            _ => None,
-        }
+        self.set(op, "DATA", id)
+    }
+
+    /// Bypasses an unused colorop.
+    fn bypass(&mut self, op: &ColorOp) -> Option<()> {
+        let handle = Self::op_handle(op)?;
+        self.props.push((handle, *op.props.get("BYPASS")?, 1));
+        Some(())
     }
 }
 
@@ -638,13 +971,6 @@ impl PartialEq for ResolvedColorPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A dummy device for resolve() calls that never create property blobs (no CTM stage and
-    /// no non-bypassable matrix): the fd is only dereferenced when a blob is created.
-    fn dummy_device() -> DrmDeviceFd {
-        let null = std::fs::File::open("/dev/null").unwrap();
-        DrmDeviceFd::new(crate::utils::DeviceFd::from(std::os::fd::OwnedFd::from(null)))
-    }
 
     fn op(id: u32, kind: ColorOpKind, bypassable: bool) -> ColorOp {
         // resolve() looks up properties by name; hand every op the full set with arbitrary
@@ -677,8 +1003,14 @@ mod tests {
         )
     }
 
-    /// The pipelines advertised by nvidia-drm 610.43.03 on a GeForce RTX 5070 Ti
-    /// (`COLOR_PIPELINE` enum on the primary plane), as discovered via drm_info:
+    /// The pipelines advertised by nvidia-drm on a GeForce RTX 5070 Ti, as discovered via
+    /// drm_info. Identical in shape on 610.43.03 and 615.71.09 (kernel 7.3), and on every
+    /// primary and overlay plane (cursor planes advertise no `COLOR_PIPELINE`). The colorop
+    /// object ids used here are the 610.43.03 primary plane's; they differ per plane and shift
+    /// between driver versions (+6 on 615.71.09), so nothing may depend on them.
+    ///
+    /// The same driver exposes 1024-entry `GAMMA_LUT` and `DEGAMMA_LUT`, a `CTM` and the
+    /// vendor `NV_CRTC_REGAMMA_LUT` on the CRTCs.
     ///
     /// "NVIDIA Full": 3x4 Matrix, 1D Curve {PQ 125 EOTF}, 1D LUT, Multiplier, 3x4 Matrix,
     /// 1D Curve {PQ 125 Inverse EOTF} (non-bypassable), 3x4 Matrix, 1D LUT, 3x4 Matrix,
@@ -779,27 +1111,31 @@ mod tests {
     }
 
     fn resolve_any(transform: &ScanoutColorTransform, pipelines: &[ColorPipeline]) -> bool {
-        let device = dummy_device();
-        pipelines.iter().any(|p| transform.resolve(&device, p).is_some())
+        pipelines.iter().any(|p| transform.plan(p).is_some())
     }
 
+    const BT709_TO_BT2020: [f64; 12] = [
+        0.6274, 0.3293, 0.0433, 0.0, //
+        0.0691, 0.9195, 0.0114, 0.0, //
+        0.0164, 0.0880, 0.8956, 0.0,
+    ];
+
     /// The transform shapes niri uses on HDR (PQ blend space) outputs are inexpressible on
-    /// the nvidia-drm pipelines: the curve ops only offer the PQ 125 pair (no Gamma 2.2 /
-    /// sRGB curves), and the trailing non-bypassable `PQ 125 Inverse EOTF` / `PQ 125 EOTF`
-    /// pair means every pipeline ends in linear light, so a transform whose final stage is a
-    /// PQ encode can never resolve. The result is that direct scan-out is denied for
-    /// essentially all non-identity content on these pipelines.
+    /// the nvidia-drm pipelines as long as they include the encode: the curve ops only offer
+    /// the PQ 125 pair (no Gamma 2.2 / sRGB curves), and the trailing non-bypassable
+    /// `PQ 125 Inverse EOTF` / `PQ 125 EOTF` pair means every pipeline ends in linear light,
+    /// so a transform whose final stage is an encode can never resolve. The encode has to
+    /// move behind blending instead, see [`PostBlendEncode`].
     #[test]
     fn nvidia_pipelines_reject_pq_blend_transforms() {
         let pipelines = nvidia_pipelines();
 
-        // SDR content on an HDR output: gamma 2.2 decode, reference-white gain, PQ encode.
-        // (The real transform also carries a BT.709->BT.2020 CTM; resolution fails before
-        // the CTM is placed, so the blob-free variant exercises the same path.)
+        // SDR content on an HDR output: gamma 2.2 decode, reference-white gain, gamut
+        // conversion, PQ encode.
         let sdr_on_hdr = ScanoutColorTransform {
             decode: Some(Curve1DType::Gamma22),
             multiplier: 203. / 80.,
-            ctm: None,
+            ctm: Some(BT709_TO_BT2020),
             encode: Some(Curve1DType::Pq125InvEotf),
         };
         assert!(!resolve_any(&sdr_on_hdr, &pipelines));
@@ -824,9 +1160,13 @@ mod tests {
         assert!(!resolve_any(&hdr_on_sdr, &pipelines));
     }
 
-    /// Transforms that end in linear light (no encode stage) fit the "NVIDIA Lite" pipeline,
-    /// confirming the hardware model: nvidia planes decode and gain before a linear-light
-    /// blend, and the wire encode happens after blending (CRTC regamma).
+    /// Transforms that end in linear light (no encode stage) fit the "NVIDIA Lite" pipeline:
+    /// nvidia planes decode and gain before blending, and the wire encode has to happen after
+    /// blending, on the CRTC `GAMMA_LUT`. KWin relies on exactly this split on nvidia: for a
+    /// single fullscreen scanout layer it retargets the plane at a normalized linear
+    /// intermediate and merges the trailing encode into the CRTC gamma LUT (KWin commit
+    /// 9ca199df4d, "offload a single fullscreen layer's trailing encode to the output
+    /// post-blend pipeline").
     #[test]
     fn nvidia_lite_accepts_linear_output_transforms() {
         let decode_and_gain = ScanoutColorTransform {
@@ -835,10 +1175,105 @@ mod tests {
             ctm: None,
             encode: None,
         };
-        assert!(resolve_any(&decode_and_gain, &[nvidia_lite()]));
+        let plan = decode_and_gain.plan(&nvidia_lite()).unwrap();
+        // The named curve is preferred over filling the LUT with PQ.
+        assert_eq!(
+            plan,
+            [
+                OpPlan::Bypass,
+                OpPlan::Curve(Curve1DType::Pq125Eotf as u64),
+                OpPlan::Bypass,
+                OpPlan::Multiplier(2.0),
+                OpPlan::Bypass,
+            ]
+        );
         // The Full pipeline still rejects it: its trailing non-bypassable PQ pair is not
         // recognized as an identity.
         assert!(!resolve_any(&decode_and_gain, &[nvidia_full()]));
+    }
+
+    /// SDR content retargeted at a normalized linear intermediate (the plane half of a
+    /// post-blend encode) resolves on "NVIDIA Lite" by decoding gamma 2.2 in the 1D LUT, as
+    /// the pipeline has no SDR curve.
+    #[test]
+    fn nvidia_lite_decodes_sdr_in_lut() {
+        let linear_max = 1000. / 80.;
+        let sdr_linear = ScanoutColorTransform {
+            decode: Some(Curve1DType::Gamma22),
+            multiplier: 203. / 80. / linear_max,
+            ctm: Some(BT709_TO_BT2020),
+            encode: None,
+        };
+        let plan = sdr_linear.plan(&nvidia_lite()).unwrap();
+        // The gain (0.2) keeps the decoded range within [0, 1], so it is folded into the LUT
+        // and the matrix at the end only converts the gamut.
+        assert_eq!(
+            plan,
+            [
+                OpPlan::Bypass,
+                OpPlan::Bypass,
+                OpPlan::LutDecode {
+                    curve: Curve1DType::Gamma22,
+                    gain: 203. / 80. / linear_max,
+                },
+                OpPlan::Bypass,
+                OpPlan::Ctm(BT709_TO_BT2020),
+            ]
+        );
+
+        // With a gain above 1 the LUT normalizes and a later op applies the gain.
+        let sdr_gain = ScanoutColorTransform {
+            decode: Some(Curve1DType::Gamma22),
+            multiplier: 2.5,
+            ctm: None,
+            encode: None,
+        };
+        let plan = sdr_gain.plan(&nvidia_lite()).unwrap();
+        assert_eq!(
+            plan[2],
+            OpPlan::LutDecode {
+                curve: Curve1DType::Gamma22,
+                gain: 1.0
+            }
+        );
+        assert_eq!(plan[3], OpPlan::Multiplier(2.5));
+
+        // PQ content with a gamut conversion, normalized: named PQ curve, gain, matrix.
+        let pq_linear = ScanoutColorTransform {
+            decode: Some(Curve1DType::Pq125Eotf),
+            multiplier: 1. / linear_max,
+            ctm: Some(BT709_TO_BT2020),
+            encode: None,
+        };
+        let plan = pq_linear.plan(&nvidia_lite()).unwrap();
+        assert_eq!(plan[1], OpPlan::Curve(Curve1DType::Pq125Eotf as u64));
+        assert_eq!(plan[2], OpPlan::Bypass);
+        assert_eq!(plan[3], OpPlan::Multiplier(1. / linear_max));
+        assert_eq!(plan[4], OpPlan::Ctm(BT709_TO_BT2020));
+
+        // "NVIDIA FP Lite" (two matrices) cannot decode at all.
+        assert!(sdr_linear.plan(&nvidia_fp_lite()).is_none());
+    }
+
+    #[test]
+    fn curves_round_trip() {
+        let pairs = [
+            (Curve1DType::SrgbEotf, Curve1DType::SrgbInvEotf),
+            (Curve1DType::Pq125Eotf, Curve1DType::Pq125InvEotf),
+            (Curve1DType::Bt2020InvOetf, Curve1DType::Bt2020Oetf),
+            (Curve1DType::Gamma22, Curve1DType::Gamma22Inv),
+        ];
+        for (decode, encode) in pairs {
+            for i in 0..=100 {
+                let x = f64::from(i) / 100.;
+                let y = encode.eval(decode.eval(x));
+                assert!((x - y).abs() < 1e-6, "{decode:?}/{encode:?} at {x}: {y}");
+            }
+        }
+        // PQ 125: 1.0 = 80 cd/m², 125.0 = 10,000 cd/m².
+        assert!((Curve1DType::Pq125Eotf.eval(1.0) - 125.).abs() < 1e-9);
+        // 203 cd/m² encodes to ~0.58 in PQ.
+        assert!((Curve1DType::Pq125InvEotf.eval(203. / 80.) - 0.5806).abs() < 1e-3);
     }
 
     /// Control: an AMD-style pipeline (every op bypassable, SDR + PQ curves available)

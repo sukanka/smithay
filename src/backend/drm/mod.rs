@@ -92,7 +92,7 @@ use crate::utils::{DevPath, Physical, Size};
 pub use color::{Colorspace, ConnectorColorState, CtaCoordinate, Eotf, HdrOutputMetadata};
 pub use colorop::{
     ColorOp, ColorOpKind, ColorPipeline, Curve1DType, Lut1DInterpolation, Lut3DInterpolation,
-    ResolvedColorPipeline, ScanoutColorTransform,
+    PostBlendEncode, ResolvedColorPipeline, ScanoutColorTransform,
 };
 pub use device::{
     DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmEvent, EventMetadata as DrmEventMetadata, PlaneClaim,
