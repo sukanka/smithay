@@ -167,7 +167,7 @@ use crate::{
             damage::{Error as OutputDamageTrackerError, OutputDamageTracker},
             element::{
                 Element, Id, Kind, RenderElement, RenderElementPresentationState, RenderElementState,
-                RenderElementStates, RenderingReason, UnderlyingStorage,
+                RenderElementStates, RenderingReason, UnderlyingStorage, WeakId,
             },
             sync::SyncPoint,
             utils::{CommitCounter, DamageBag},
@@ -893,13 +893,149 @@ impl Debug for CursorBufferTransform {
 }
 
 #[derive(Debug)]
-struct CursorState<G: AsFd + 'static> {
+struct CursorState<G: AsFd + 'static, F: Framebuffer> {
     allocator: GbmAllocator<G>,
     framebuffer_exporter: GbmFramebufferExporter<G>,
     previous_output_transform: Option<Transform>,
     previous_output_scale: Option<Scale<f64>>,
+    buffer_cache: CursorBufferCache<F>,
     #[cfg(feature = "renderer_pixman")]
     pixman_renderer: Option<PixmanRenderer>,
+}
+
+/// Identifies the source pixels of a cursor plane element.
+#[derive(PartialEq)]
+enum CursorContentKey {
+    /// Contents that stay the same for as long as the element id and commit do, e.g. memory
+    /// buffers that are kept around for every image of a cursor theme.
+    Element { id: WeakId, commit: CommitCounter },
+    /// Client cursor surfaces commit a new buffer on every `set_cursor`, even when the image
+    /// is the same as one shown before, so they are identified by their pixels instead.
+    Shm {
+        format: wayland_server::protocol::wl_shm::Format,
+        width: i32,
+        height: i32,
+        stride: i32,
+        data: Vec<u8>,
+    },
+}
+
+impl CursorContentKey {
+    fn new<R: Renderer, E: RenderElement<R>>(renderer: &mut R, element: &E) -> Option<Self> {
+        match element.underlying_storage(renderer)? {
+            UnderlyingStorage::Wayland(buffer) => shm::with_buffer_contents(buffer, |ptr, len, data| {
+                let expected_len = (data.stride * data.height) as usize;
+                if data.offset < 0 || data.offset as usize + expected_len > len {
+                    return None;
+                }
+                let contents =
+                    unsafe { std::slice::from_raw_parts(ptr.offset(data.offset as isize), expected_len) };
+                Some(CursorContentKey::Shm {
+                    format: data.format,
+                    width: data.width,
+                    height: data.height,
+                    stride: data.stride,
+                    data: contents.to_vec(),
+                })
+            })
+            .ok()
+            .flatten(),
+            UnderlyingStorage::Memory(_) => Some(CursorContentKey::Element {
+                id: element.id().downgrade(),
+                commit: element.current_commit(),
+            }),
+        }
+    }
+
+    fn size_bytes(&self) -> usize {
+        match self {
+            CursorContentKey::Element { .. } => 0,
+            CursorContentKey::Shm { data, .. } => data.len(),
+        }
+    }
+}
+
+/// Everything that determines the final contents of a cursor plane buffer.
+#[derive(PartialEq)]
+struct CursorCacheKey {
+    content: CursorContentKey,
+    element_size: Size<i32, Physical>,
+    plane_size: Size<i32, Physical>,
+    src: Rectangle<f64, BufferCoords>,
+    element_transform: Transform,
+    alpha: f32,
+    output_transform: Transform,
+    scale: Scale<f64>,
+}
+
+struct CursorCacheEntry<F: Framebuffer> {
+    key: CursorCacheKey,
+    buffer: Arc<GbmBuffer>,
+    fb: CachedDrmFramebuffer<F>,
+    bytes: usize,
+}
+
+/// Recently shown cursor plane buffers, ready to be scanned out again.
+///
+/// Filling a cursor buffer means allocating it, adding a framebuffer, copying or
+/// software-rendering the element and running the cursor buffer transform. Moving the
+/// pointer across regions that switch between a few cursor images (or showing an animated
+/// cursor) repeats that work for the same handful of images, so the finished buffers are
+/// kept and re-attached instead. Entries are never written to after insertion, so sharing
+/// them with the current or pending frame is fine.
+struct CursorBufferCache<F: Framebuffer> {
+    /// Most recently used first.
+    entries: std::collections::VecDeque<CursorCacheEntry<F>>,
+    bytes: usize,
+}
+
+impl<F: Framebuffer> CursorBufferCache<F> {
+    /// Enough for every frame of a 60 frame animated cursor at 256x256.
+    const MAX_BYTES: usize = 16 * 1024 * 1024;
+
+    fn new() -> Self {
+        Self {
+            entries: Default::default(),
+            bytes: 0,
+        }
+    }
+
+    fn get(&mut self, key: &CursorCacheKey) -> Option<(Arc<GbmBuffer>, CachedDrmFramebuffer<F>)> {
+        let pos = self.entries.iter().position(|entry| entry.key == *key)?;
+        let entry = self.entries.remove(pos).unwrap();
+        let ret = (entry.buffer.clone(), entry.fb.clone());
+        self.entries.push_front(entry);
+        Some(ret)
+    }
+
+    fn insert(&mut self, key: CursorCacheKey, buffer: Arc<GbmBuffer>, fb: CachedDrmFramebuffer<F>) {
+        let bytes = key.content.size_bytes() + (key.plane_size.w * key.plane_size.h * 4) as usize;
+        self.bytes += bytes;
+        self.entries.push_front(CursorCacheEntry {
+            key,
+            buffer,
+            fb,
+            bytes,
+        });
+        while self.bytes > Self::MAX_BYTES && self.entries.len() > 1 {
+            let evicted = self.entries.pop_back().unwrap();
+            self.bytes -= evicted.bytes;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+}
+
+impl<F: Framebuffer> Debug for CursorBufferCache<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CursorBufferCache")
+            .field("entries", &self.entries.len())
+            .field("bytes", &self.bytes)
+            .finish()
+    }
 }
 
 #[derive(Debug, thiserror::Error, Copy, Clone)]
@@ -1136,7 +1272,7 @@ where
     swapchain: Swapchain<A>,
 
     cursor_size: Size<i32, Physical>,
-    cursor_state: Option<CursorState<G>>,
+    cursor_state: Option<CursorState<G, <F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
 
     element_states: IndexMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
     previous_element_states: IndexMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
@@ -1310,6 +1446,7 @@ where
                             framebuffer_exporter,
                             previous_output_scale: None,
                             previous_output_transform: None,
+                            buffer_cache: CursorBufferCache::new(),
                             #[cfg(feature = "renderer_pixman")]
                             pixman_renderer,
                         }
@@ -1499,6 +1636,7 @@ where
                 framebuffer_exporter,
                 previous_output_scale: None,
                 previous_output_transform: None,
+                buffer_cache: CursorBufferCache::new(),
                 #[cfg(feature = "renderer_pixman")]
                 pixman_renderer,
             }
@@ -2860,6 +2998,9 @@ where
     /// Reset the underlying buffers
     pub fn reset_buffers(&mut self) {
         self.swapchain.reset_buffers();
+        if let Some(cursor_state) = self.cursor_state.as_mut() {
+            cursor_state.buffer_cache.clear();
+        }
     }
 
     /// Reset the age for all buffers.
@@ -3058,6 +3199,9 @@ where
     pub fn set_cursor_buffer_transform(&mut self, transform: Option<CursorBufferTransformFn>) {
         self.cursor_buffer_transform = transform.map(CursorBufferTransform);
         self.cursor_buffer_transform_dirty = true;
+        if let Some(cursor_state) = self.cursor_state.as_mut() {
+            cursor_state.buffer_cache.clear();
+        }
     }
 
     /// The pipeline configuration required to scan out the given element on the given plane:
@@ -3635,175 +3779,209 @@ where
             plane_info.handle
         );
 
-        // if we fail to create a buffer we can just return false and
-        // force the cursor to be rendered on the primary plane
-        let mut cursor_buffer = match cursor_state.allocator.create_buffer(
-            cursor_plane_size.w as u32,
-            cursor_plane_size.h as u32,
-            DrmFourcc::Argb8888,
-            &[DrmModifier::Linear],
-        ) {
-            Ok(buffer) => buffer,
-            Err(err) => {
-                debug!("failed to create cursor buffer: {}", err);
-                return None;
-            }
-        };
-
-        // if we fail to export a framebuffer for our buffer we can skip the rest
-        let framebuffer = match cursor_state.framebuffer_exporter.add_framebuffer(
-            self.surface.device_fd(),
-            ExportBuffer::Allocator(&cursor_buffer),
-            false,
-        ) {
-            Ok(Some(fb)) => fb,
-            Ok(None) => {
-                debug!(
-                    "failed to export framebuffer for cursor {:?}: no framebuffer available",
-                    plane_info.handle
-                );
-                return None;
-            }
-            Err(err) => {
-                debug!(
-                    "failed to export framebuffer for cursor {:?}: {}",
-                    plane_info.handle, err
-                );
-                return None;
-            }
-        };
-
         let cursor_buffer_size = cursor_plane_size.to_logical(1).to_buffer(1, Transform::Normal);
 
-        #[cfg(not(feature = "renderer_pixman"))]
-        if !copy_element_to_cursor_bo(
-            renderer,
-            element,
+        let cache_key = CursorContentKey::new(renderer, element).map(|content| CursorCacheKey {
+            content,
             element_size,
-            cursor_plane_size,
+            plane_size: cursor_plane_size,
+            src: element.src(),
+            element_transform: element.transform(),
+            alpha: element.alpha(),
             output_transform,
-            &mut cursor_buffer,
-        ) {
-            tracing::trace!("failed to copy element to cursor bo, skipping element on cursor plane");
-            return None;
-        }
+            scale,
+        });
+        let cached = cache_key
+            .as_ref()
+            .and_then(|key| cursor_state.buffer_cache.get(key));
 
-        #[cfg(feature = "renderer_pixman")]
-        if !copy_element_to_cursor_bo(
-            renderer,
-            element,
-            element_size,
-            cursor_plane_size,
-            output_transform,
-            &mut cursor_buffer,
-        ) {
-            profiling::scope!("render cursor plane");
-            tracing::trace!("cursor fast-path copy failed, falling back to rendering using offscreen buffer");
-
-            let Some(storage) = element.underlying_storage(renderer) else {
-                trace!("Can't obtain cursor's underlying storage");
-                return None;
+        let (cursor_buffer, framebuffer) = if let Some(cached) = cached {
+            trace!("reusing cached cursor buffer for element {:?}", element.id());
+            cached
+        } else {
+            // if we fail to create a buffer we can just return false and
+            // force the cursor to be rendered on the primary plane
+            let mut cursor_buffer = match cursor_state.allocator.create_buffer(
+                cursor_plane_size.w as u32,
+                cursor_plane_size.h as u32,
+                DrmFourcc::Argb8888,
+                &[DrmModifier::Linear],
+            ) {
+                Ok(buffer) => buffer,
+                Err(err) => {
+                    debug!("failed to create cursor buffer: {}", err);
+                    return None;
+                }
             };
 
-            let pixman_renderer = cursor_state.pixman_renderer.as_mut()?;
+            // if we fail to export a framebuffer for our buffer we can skip the rest
+            let framebuffer = match cursor_state.framebuffer_exporter.add_framebuffer(
+                self.surface.device_fd(),
+                ExportBuffer::Allocator(&cursor_buffer),
+                false,
+            ) {
+                Ok(Some(fb)) => fb,
+                Ok(None) => {
+                    debug!(
+                        "failed to export framebuffer for cursor {:?}: no framebuffer available",
+                        plane_info.handle
+                    );
+                    return None;
+                }
+                Err(err) => {
+                    debug!(
+                        "failed to export framebuffer for cursor {:?}: {}",
+                        plane_info.handle, err
+                    );
+                    return None;
+                }
+            };
 
-            // Create a pixman image from the source cursor data. This will either be set by the
-            // client, or the compositor's choice.
-            let cursor_texture = match storage {
-                UnderlyingStorage::Wayland(buffer) => pixman_renderer
-                    .import_buffer(buffer, None, &[element.src().to_i32_up()])
-                    .transpose()
-                    .ok()
-                    .flatten(),
-                UnderlyingStorage::Memory(memory) => {
-                    let format = memory.format();
-                    let size = memory.size();
-                    let Ok(pixman_format) = pixman::FormatCode::try_from(format) else {
-                        debug!("No pixman format for {format}");
-                        return None;
-                    };
-                    unsafe {
-                        match pixman::Image::from_raw_mut(
-                            pixman_format,
-                            size.w as usize,
-                            size.h as usize,
-                            memory.as_ptr() as *mut u32,
-                            memory.stride() as usize,
-                            false,
-                        ) {
-                            Ok(image) => Some(PixmanTexture::from(image)),
-                            Err(e) => {
-                                debug!("pixman cursor: {e}");
-                                None
+            #[cfg(not(feature = "renderer_pixman"))]
+            if !copy_element_to_cursor_bo(
+                renderer,
+                element,
+                element_size,
+                cursor_plane_size,
+                output_transform,
+                &mut cursor_buffer,
+            ) {
+                tracing::trace!("failed to copy element to cursor bo, skipping element on cursor plane");
+                return None;
+            }
+
+            #[cfg(feature = "renderer_pixman")]
+            if !copy_element_to_cursor_bo(
+                renderer,
+                element,
+                element_size,
+                cursor_plane_size,
+                output_transform,
+                &mut cursor_buffer,
+            ) {
+                profiling::scope!("render cursor plane");
+                tracing::trace!(
+                    "cursor fast-path copy failed, falling back to rendering using offscreen buffer"
+                );
+
+                let Some(storage) = element.underlying_storage(renderer) else {
+                    trace!("Can't obtain cursor's underlying storage");
+                    return None;
+                };
+
+                let pixman_renderer = cursor_state.pixman_renderer.as_mut()?;
+
+                // Create a pixman image from the source cursor data. This will either be set by the
+                // client, or the compositor's choice.
+                let cursor_texture = match storage {
+                    UnderlyingStorage::Wayland(buffer) => pixman_renderer
+                        .import_buffer(buffer, None, &[element.src().to_i32_up()])
+                        .transpose()
+                        .ok()
+                        .flatten(),
+                    UnderlyingStorage::Memory(memory) => {
+                        let format = memory.format();
+                        let size = memory.size();
+                        let Ok(pixman_format) = pixman::FormatCode::try_from(format) else {
+                            debug!("No pixman format for {format}");
+                            return None;
+                        };
+                        unsafe {
+                            match pixman::Image::from_raw_mut(
+                                pixman_format,
+                                size.w as usize,
+                                size.h as usize,
+                                memory.as_ptr() as *mut u32,
+                                memory.stride() as usize,
+                                false,
+                            ) {
+                                Ok(image) => Some(PixmanTexture::from(image)),
+                                Err(e) => {
+                                    debug!("pixman cursor: {e}");
+                                    None
+                                }
                             }
                         }
                     }
+                }?;
+
+                let ret = cursor_buffer
+                    .map_mut::<_, Result<_, PixmanError>>(
+                        0,
+                        0,
+                        cursor_buffer_size.w as u32,
+                        cursor_buffer_size.h as u32,
+                        |mbo| {
+                            let plane_pixman_format =
+                                pixman::FormatCode::try_from(DrmFourcc::Argb8888).unwrap();
+                            let mut cursor_dst = unsafe {
+                                pixman::Image::from_raw_mut(
+                                    plane_pixman_format,
+                                    mbo.width() as usize,
+                                    mbo.height() as usize,
+                                    mbo.buffer_mut().as_mut_ptr() as *mut u32,
+                                    mbo.stride() as usize,
+                                    false,
+                                )
+                            }
+                            .map_err(|_| PixmanError::ImportFailed)?;
+                            let mut framebuffer = pixman_renderer.bind(&mut cursor_dst)?;
+                            let mut frame = pixman_renderer.render(
+                                &mut framebuffer,
+                                cursor_plane_size,
+                                output_transform,
+                            )?;
+                            frame.clear(Color32F::TRANSPARENT, &[Rectangle::from_size(cursor_plane_size)])?;
+                            let src = element.src();
+                            let dst = Rectangle::from_size(element_geometry.size);
+                            frame.render_texture_from_to(
+                                &cursor_texture,
+                                src,
+                                dst,
+                                &[dst],
+                                &[],
+                                element.transform(),
+                                element.alpha(),
+                            )?;
+                            let _ = frame.finish()?.wait(); // what can we do?
+                            Ok(())
+                        },
+                    )
+                    .expect("Lost track of cursor device");
+
+                if let Err(err) = ret {
+                    debug!("{err}");
+                    return None;
                 }
-            }?;
+            };
 
-            let ret = cursor_buffer
-                .map_mut::<_, Result<_, PixmanError>>(
+            if let Some(transform) = self.cursor_buffer_transform.as_ref() {
+                let res = cursor_buffer.map_mut(
                     0,
                     0,
-                    cursor_buffer_size.w as u32,
-                    cursor_buffer_size.h as u32,
+                    cursor_plane_size.w as u32,
+                    cursor_plane_size.h as u32,
                     |mbo| {
-                        let plane_pixman_format = pixman::FormatCode::try_from(DrmFourcc::Argb8888).unwrap();
-                        let mut cursor_dst = unsafe {
-                            pixman::Image::from_raw_mut(
-                                plane_pixman_format,
-                                mbo.width() as usize,
-                                mbo.height() as usize,
-                                mbo.buffer_mut().as_mut_ptr() as *mut u32,
-                                mbo.stride() as usize,
-                                false,
-                            )
-                        }
-                        .map_err(|_| PixmanError::ImportFailed)?;
-                        let mut framebuffer = pixman_renderer.bind(&mut cursor_dst)?;
-                        let mut frame =
-                            pixman_renderer.render(&mut framebuffer, cursor_plane_size, output_transform)?;
-                        frame.clear(Color32F::TRANSPARENT, &[Rectangle::from_size(cursor_plane_size)])?;
-                        let src = element.src();
-                        let dst = Rectangle::from_size(element_geometry.size);
-                        frame.render_texture_from_to(
-                            &cursor_texture,
-                            src,
-                            dst,
-                            &[dst],
-                            &[],
-                            element.transform(),
-                            element.alpha(),
-                        )?;
-                        let _ = frame.finish()?.wait(); // what can we do?
-                        Ok(())
+                        let stride = mbo.stride();
+                        let size = (mbo.width(), mbo.height());
+                        (transform.0)(mbo.buffer_mut(), stride, size);
                     },
-                )
-                .expect("Lost track of cursor device");
-
-            if let Err(err) = ret {
-                debug!("{err}");
-                return None;
+                );
+                if let Err(err) = res {
+                    debug!("failed to apply cursor buffer transform: {err}");
+                    return None;
+                }
             }
+
+            let cursor_buffer = Arc::new(cursor_buffer);
+            let framebuffer = CachedDrmFramebuffer::new(DrmFramebuffer::Gbm(framebuffer));
+            if let Some(key) = cache_key {
+                cursor_state
+                    .buffer_cache
+                    .insert(key, cursor_buffer.clone(), framebuffer.clone());
+            }
+            (cursor_buffer, framebuffer)
         };
-
-        if let Some(transform) = self.cursor_buffer_transform.as_ref() {
-            let res = cursor_buffer.map_mut(
-                0,
-                0,
-                cursor_plane_size.w as u32,
-                cursor_plane_size.h as u32,
-                |mbo| {
-                    let stride = mbo.stride();
-                    let size = (mbo.width(), mbo.height());
-                    (transform.0)(mbo.buffer_mut(), stride, size);
-                },
-            );
-            if let Err(err) = res {
-                debug!("failed to apply cursor buffer transform: {err}");
-                return None;
-            }
-        }
         self.cursor_buffer_transform_dirty = false;
 
         let src = Rectangle::from_size(cursor_buffer_size).to_f64();
@@ -3818,8 +3996,8 @@ where
                 format: framebuffer.format(),
             },
             buffer: DrmScanoutBuffer {
-                buffer: ScanoutBuffer::Cursor(Arc::new(cursor_buffer)),
-                fb: CachedDrmFramebuffer::new(DrmFramebuffer::Gbm(framebuffer)),
+                buffer: ScanoutBuffer::Cursor(cursor_buffer),
+                fb: framebuffer,
             },
             damage_clips: None,
             plane_claim,
