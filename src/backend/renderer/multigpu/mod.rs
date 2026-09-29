@@ -952,6 +952,7 @@ where
     dst_transform: Transform,
     size: Size<i32, Physical>,
     damage: Vec<Rectangle<i32, Physical>>,
+    sampled_dma_textures: Vec<MultiTexture>,
     span: tracing::span::EnteredSpan,
 }
 
@@ -1376,6 +1377,7 @@ where
             dst_transform,
             size,
             damage: Vec::new(),
+            sampled_dma_textures: Vec::new(),
             span,
         })
     }
@@ -1550,7 +1552,24 @@ where
     #[profiling::function]
     fn finish_internal(&mut self) -> Result<sync::SyncPoint, Error<R, T>> {
         if let Some(frame) = self.frame.take() {
-            let sync = frame.finish().map_err(Error::Render)?;
+            let render_id = frame.context_id().erased();
+            let sync = match frame.finish() {
+                Ok(sync) => sync,
+                Err(err) => {
+                    // A failed finish gives no completion fence. Do not reuse these
+                    // shadows for subsequent copies while earlier reads may be pending.
+                    for texture in self.sampled_dma_textures.drain(..) {
+                        texture.discard_shadow(&render_id);
+                    }
+                    return Err(Error::Render(err));
+                }
+            };
+
+            // A surface's DMA shadow is reused across client buffers. The source GPU
+            // must wait for this consumer read before copying the next buffer into it.
+            for texture in self.sampled_dma_textures.drain(..) {
+                texture.record_read_sync(&render_id, &sync);
+            }
 
             // now the frame is gone, lets use our unholy ptr till the end of this call:
             // SAFETY:
@@ -1874,18 +1893,28 @@ impl MultiTexture {
             .cloned()
     }
 
-    fn needs_synchronization<A: GraphicsApi + 'static>(
-        &self,
-        render_id: &ContextId<<<A::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>,
-    ) -> Option<SyncPoint> {
+    fn needs_synchronization(&self, render_id: &ErasedContextId) -> Option<SyncPoint> {
         let mut tex = self.0.lock().unwrap();
-        tex.textures
-            .get_mut(&render_id.erased())
-            .and_then(|texture| match texture {
-                GpuSingleTexture::Direct(_) => None,
-                GpuSingleTexture::Dma { sync, .. } => sync.take(),
-                GpuSingleTexture::Mem { .. } => None,
-            })
+        tex.textures.get_mut(render_id).and_then(|texture| match texture {
+            GpuSingleTexture::Direct(_) => None,
+            GpuSingleTexture::Dma { sync, .. } => sync.take(),
+            GpuSingleTexture::Mem { .. } => None,
+        })
+    }
+
+    fn record_read_sync(&self, render_id: &ErasedContextId, read_sync: &SyncPoint) {
+        if let Some(GpuSingleTexture::Dma { sync, .. }) = self.0.lock().unwrap().textures.get_mut(render_id) {
+            // Reads on this renderer are ordered. The newest submission
+            // therefore protects all of its earlier reads of this shadow buffer.
+            *sync = Some(read_sync.clone());
+        }
+    }
+
+    fn discard_shadow(&self, render_id: &ErasedContextId) {
+        let mut inner = self.0.lock().unwrap();
+        if matches!(inner.textures.get(render_id), Some(GpuSingleTexture::Dma { .. })) {
+            inner.textures.remove(render_id);
+        }
     }
 
     fn reimport<A: GraphicsApi + 'static>(
@@ -2086,11 +2115,23 @@ where
         alpha: f32,
     ) -> Result<(), Error<R, T>> {
         let render_id = self.frame.as_mut().unwrap().context_id();
-        let sync = texture.needs_synchronization::<R>(&render_id);
+        let is_dma_shadow = matches!(
+            texture.0.lock().unwrap().textures.get(&render_id.erased()),
+            Some(GpuSingleTexture::Dma { .. })
+        );
+        if is_dma_shadow
+            && !self
+                .sampled_dma_textures
+                .iter()
+                .any(|other| Arc::ptr_eq(&other.0, &texture.0))
+        {
+            self.sampled_dma_textures.push(texture.clone());
+        }
+        let sync = texture.needs_synchronization(&render_id.erased());
         if let Some(sync) = sync {
             if let Err(err) = self.frame.as_mut().unwrap().wait(&sync) {
                 trace!(?err, "Failed to import sync point, blocking");
-                let _ = sync.wait();
+                wait_for_sync(&sync);
             }
         }
         texture
@@ -2429,6 +2470,12 @@ where
     }
 }
 
+fn wait_for_sync(sync: &SyncPoint) {
+    // A failed GPU-side wait must not turn an interrupted CPU wait into permission
+    // to sample unfinished writes or overwrite a shadow still in use by another GPU.
+    while sync.wait().is_err() {}
+}
+
 fn dma_shadow_copy<S, T>(
     src_texture: &<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,
     damage: Option<&[Rectangle<i32, BufferCoords>]>,
@@ -2538,7 +2585,7 @@ where
     if let Some(sync) = existing_sync_point.take() {
         if let Err(err) = src_renderer.wait(&sync) {
             debug!(?err, "Unable to wait for existing sync_point, blocking..");
-            let _ = sync.wait();
+            wait_for_sync(&sync);
         }
     }
     let mut framebuffer = src_renderer.bind(shadow_buffer).map_err(Error::Render)?;
@@ -3547,6 +3594,7 @@ where
             dst_transform,
             size,
             damage: Vec::new(),
+            sampled_dma_textures: Vec::new(),
             span,
         })
     }
@@ -3927,5 +3975,193 @@ where
             .as_mut()
             .blit(from_fb, to_fb, src, dst, filter)
             .map_err(Error::Render)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::OwnedFd;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::backend::allocator::dmabuf::DmabufFlags;
+    use crate::backend::renderer::sync::{Fence, Interrupted};
+
+    #[derive(Debug)]
+    struct TestFence {
+        name: &'static str,
+        attempts: Arc<AtomicUsize>,
+        interruptions: usize,
+    }
+
+    impl Fence for TestFence {
+        fn is_signaled(&self) -> bool {
+            self.attempts.load(Ordering::Relaxed) > self.interruptions
+        }
+
+        fn wait(&self) -> Result<(), Interrupted> {
+            if self.attempts.fetch_add(1, Ordering::Relaxed) < self.interruptions {
+                Err(Interrupted)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn is_exportable(&self) -> bool {
+            false
+        }
+
+        fn export(&self) -> Option<OwnedFd> {
+            None
+        }
+    }
+
+    fn fence(name: &'static str, interruptions: usize) -> (SyncPoint, Arc<AtomicUsize>) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        (
+            TestFence {
+                name,
+                attempts: attempts.clone(),
+                interruptions,
+            }
+            .into(),
+            attempts,
+        )
+    }
+
+    fn shadow(sync: SyncPoint) -> GpuSingleTexture {
+        // The test only uses buffer metadata; it never imports this fd into a renderer.
+        let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let mut builder = Dmabuf::builder((16, 16), Fourcc::Argb8888, Modifier::Linear, DmabufFlags::empty());
+        builder.add_plane(fd, 0, 64);
+        GpuSingleTexture::Dma {
+            texture: Box::new(()),
+            dmabuf: builder.build().unwrap(),
+            sync: Some(sync),
+        }
+    }
+
+    fn texture() -> MultiTexture {
+        MultiTexture::new(
+            (16, 16).into(),
+            Format {
+                code: Fourcc::Argb8888,
+                modifier: Modifier::Linear,
+            },
+        )
+    }
+
+    #[test]
+    fn shadow_reuse_waits_for_the_last_reader_on_its_own_gpu() {
+        let first_gpu = ContextId::<MultiTexture>::new().erased();
+        let other_gpu = ContextId::<MultiTexture>::new().erased();
+        let texture = texture();
+        let (producer, producer_waits) = fence("producer", 1);
+        let (other_producer, other_waits) = fence("other producer", 0);
+        {
+            let mut inner = texture.0.lock().unwrap();
+            inner.textures.insert(first_gpu.clone(), shadow(producer));
+            inner.textures.insert(other_gpu.clone(), shadow(other_producer));
+        }
+
+        // The first draw consumes the copy's producer dependency.
+        let producer = texture.needs_synchronization(&first_gpu).unwrap();
+        assert_eq!(producer.get::<TestFence>().unwrap().name, "producer");
+        wait_for_sync(&producer);
+        assert_eq!(producer_waits.load(Ordering::Relaxed), 2);
+        assert!(texture.needs_synchronization(&first_gpu).is_none());
+
+        // Two frames read the same shadow without a client buffer update in between.
+        // The next copy must wait for the last read, not reuse the consumed producer fence.
+        let (first_read, first_read_waits) = fence("first reader", 0);
+        let (last_read, last_read_waits) = fence("last reader", 2);
+        texture.record_read_sync(&first_gpu, &first_read);
+        texture.record_read_sync(&first_gpu, &last_read);
+        let before_reuse = texture.needs_synchronization(&first_gpu).unwrap();
+        assert_eq!(before_reuse.get::<TestFence>().unwrap().name, "last reader");
+        assert!(!before_reuse.is_reached());
+        wait_for_sync(&before_reuse);
+        assert!(before_reuse.is_reached());
+        assert_eq!(last_read_waits.load(Ordering::Relaxed), 3);
+        assert_eq!(first_read_waits.load(Ordering::Relaxed), 0);
+
+        // A different GPU's shadow retains its independent dependency.
+        let other = texture.needs_synchronization(&other_gpu).unwrap();
+        assert_eq!(other.get::<TestFence>().unwrap().name, "other producer");
+        assert_eq!(other_waits.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn consumer_fences_do_not_create_or_replace_non_shadow_textures() {
+        let direct_gpu = ContextId::<MultiTexture>::new().erased();
+        let absent_gpu = ContextId::<MultiTexture>::new().erased();
+        let texture = texture();
+        texture
+            .0
+            .lock()
+            .unwrap()
+            .textures
+            .insert(direct_gpu.clone(), GpuSingleTexture::Direct(Box::new(42_u32)));
+        let (read, _) = fence("reader", 0);
+
+        texture.record_read_sync(&direct_gpu, &read);
+        texture.record_read_sync(&absent_gpu, &read);
+        assert!(texture.needs_synchronization(&direct_gpu).is_none());
+        assert!(texture.needs_synchronization(&absent_gpu).is_none());
+        let inner = texture.0.lock().unwrap();
+        assert_eq!(inner.textures.len(), 1);
+        let GpuSingleTexture::Direct(value) = &inner.textures[&direct_gpu] else {
+            panic!("recording a read replaced a direct texture");
+        };
+        assert_eq!(value.downcast_ref::<u32>(), Some(&42));
+    }
+
+    #[test]
+    fn cpu_wait_fallback_retries_until_completion() {
+        let (sync, attempts) = fence("interrupted fence", 4);
+        wait_for_sync(&sync);
+        assert_eq!(attempts.load(Ordering::Relaxed), 5);
+        assert!(sync.is_reached());
+
+        // The no-fence fallback must also work and finish immediately.
+        wait_for_sync(&SyncPoint::signaled());
+    }
+
+    #[test]
+    fn failed_frame_discards_only_the_affected_gpu_shadow() {
+        let failed_gpu = ContextId::<MultiTexture>::new().erased();
+        let other_gpu = ContextId::<MultiTexture>::new().erased();
+        let direct_gpu = ContextId::<MultiTexture>::new().erased();
+        let texture = texture();
+        let failed_shadow = shadow(SyncPoint::signaled());
+        let old_buffer = match &failed_shadow {
+            GpuSingleTexture::Dma { dmabuf, .. } => dmabuf.weak(),
+            _ => unreachable!(),
+        };
+        {
+            let mut inner = texture.0.lock().unwrap();
+            inner.textures.insert(failed_gpu.clone(), failed_shadow);
+            inner
+                .textures
+                .insert(other_gpu.clone(), shadow(fence("other GPU", 0).0));
+            inner
+                .textures
+                .insert(direct_gpu.clone(), GpuSingleTexture::Direct(Box::new(())));
+        }
+
+        // A finish failure must make the next import allocate a fresh DMA shadow,
+        // even after the failed frame consumed the previous producer dependency.
+        let _producer = texture.needs_synchronization(&failed_gpu).unwrap();
+        texture.discard_shadow(&failed_gpu);
+        assert!(old_buffer.is_gone());
+        assert!(!texture.0.lock().unwrap().textures.contains_key(&failed_gpu));
+        let other = texture.needs_synchronization(&other_gpu).unwrap();
+        assert_eq!(other.get::<TestFence>().unwrap().name, "other GPU");
+
+        texture.discard_shadow(&direct_gpu);
+        assert!(matches!(
+            texture.0.lock().unwrap().textures.get(&direct_gpu),
+            Some(GpuSingleTexture::Direct(_))
+        ));
     }
 }
