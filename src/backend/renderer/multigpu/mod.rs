@@ -2411,24 +2411,23 @@ where
         }
         None => {
             // try them all
-            let node = if let Some(imported) = render
-                .can_do_cross_device_imports()
-                .then(|| {
-                    render
-                        .renderer_mut()
-                        .import_dmabuf(dmabuf, damage)
-                        .inspect_err(|err| {
-                            debug!(?err, "failed to import dmabuf on render node {0}", render.node())
-                        })
-                        .ok()
-                })
-                .flatten()
+            let node = if let Some(imported) = (render.can_do_cross_device_imports()
+                && render.renderer().has_dmabuf_format(dmabuf.format()))
+            .then(|| {
+                render
+                    .renderer_mut()
+                    .import_dmabuf(dmabuf, damage)
+                    .inspect_err(|err| {
+                        debug!(?err, "failed to import dmabuf on render node {0}", render.node())
+                    })
+                    .ok()
+            })
+            .flatten()
             {
                 texture.insert_texture::<R>(&render.renderer().context_id(), imported);
                 *render.node()
             } else if let Some(imported) = target.as_mut().and_then(|target| {
-                target
-                    .can_do_cross_device_imports()
+                (target.can_do_cross_device_imports() && target.renderer().has_dmabuf_format(dmabuf.format()))
                     .then(|| {
                         target
                             .renderer_mut()
@@ -2444,8 +2443,7 @@ where
                 texture.insert_texture::<T>(&target.renderer().context_id(), imported);
                 *target.node()
             } else if let Some((other, imported)) = others.find_map(|other| {
-                other
-                    .can_do_cross_device_imports()
+                (other.can_do_cross_device_imports() && other.renderer().has_dmabuf_format(dmabuf.format()))
                     .then(|| {
                         other
                             .renderer_mut()
@@ -2563,6 +2561,20 @@ where
                 &modifiers,
             )
             .map_err(Error::AllocatorError)?;
+
+        // Allocators may fall back to an implicit layout even when an explicit
+        // modifier was requested. Such a buffer is not covered by the shared
+        // capabilities above and must not be imported on the receiving GPU.
+        let allocated_format = shadow_buffer.format();
+        if allocated_format.code != transfer_format || !modifiers.contains(&allocated_format.modifier) {
+            debug!(
+                ?allocated_format,
+                ?transfer_format,
+                ?modifiers,
+                "Shadow allocation does not match the negotiated format"
+            );
+            return Err(Error::ImportFailed);
+        }
 
         let target_texture = if let Some(target) = target.as_mut() {
             Box::<<<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>::new(
