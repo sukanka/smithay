@@ -1,6 +1,102 @@
 use super::*;
 
 #[test]
+fn primary_failure_cache_preserves_color_rejection_and_feedback() {
+    use crate::{
+        backend::renderer::element::utils::select_dmabuf_feedback, wayland::dmabuf::DmabufFeedbackBuilder,
+    };
+
+    let format = DrmFormat {
+        code: DrmFourcc::Argb8888,
+        modifier: DrmModifier::Linear,
+    };
+    let default_feedback = DmabufFeedbackBuilder::new(0, [format]).build().unwrap();
+    let scanout_feedback = DmabufFeedbackBuilder::new(1, [format]).build().unwrap();
+    let async_feedback = DmabufFeedbackBuilder::new(2, [format]).build().unwrap();
+    let id = Id::new();
+    let mut states = RenderElementStates::default();
+
+    for reason in [Some(RenderingReason::ColorTransformUnsupported), None] {
+        let previous = FailedPlanes {
+            primary: Some(reason.into()),
+            ..Default::default()
+        };
+        // Matching element/plane properties carry the failure into following frames.
+        let next = previous;
+        for mode in [PresentationMode::VSync, PresentationMode::Async] {
+            let failure = next.primary.unwrap();
+            assert!(failure.applies_to(mode));
+            let cached_reason = failure.rendering_reason(mode);
+            assert_eq!(cached_reason, reason);
+            let mut state = RenderElementState::rendered(800 * 600);
+            state.presentation_state = RenderElementPresentationState::Rendering {
+                reason: cached_reason,
+            };
+            states.states.insert(id.clone(), state);
+            let feedback = select_dmabuf_feedback(
+                id.clone(),
+                &states,
+                &default_feedback,
+                &scanout_feedback,
+                &async_feedback,
+            );
+            assert!(std::ptr::eq(
+                feedback,
+                if reason.is_some() {
+                    &scanout_feedback
+                } else {
+                    &default_feedback
+                }
+            ));
+        }
+    }
+}
+
+#[test]
+fn primary_failure_cache_rechecks_formats_after_mode_change() {
+    for (reason, same_mode, other_mode) in [
+        (
+            RenderingReason::FormatUnsupported,
+            PresentationMode::VSync,
+            PresentationMode::Async,
+        ),
+        (
+            RenderingReason::AsyncFormatUnsupported,
+            PresentationMode::Async,
+            PresentationMode::VSync,
+        ),
+    ] {
+        let failure = PrimaryPlaneFailure::from(Some(reason));
+        assert!(failure.applies_to(same_mode));
+        assert_eq!(failure.rendering_reason(same_mode), Some(reason));
+        assert!(
+            !failure.applies_to(other_mode),
+            "format support must be checked again when the presentation mode changes"
+        );
+    }
+}
+
+#[test]
+fn primary_failure_cache_keeps_scanout_failure_presentation_mode() {
+    for reason in [
+        RenderingReason::ScanoutFailed,
+        RenderingReason::AsyncScanoutFailed,
+    ] {
+        let failure = PrimaryPlaneFailure::from(Some(reason));
+        assert!(failure.applies_to(PresentationMode::VSync));
+        assert!(failure.applies_to(PresentationMode::Async));
+        assert_eq!(
+            failure.rendering_reason(PresentationMode::VSync),
+            Some(RenderingReason::ScanoutFailed)
+        );
+        assert_eq!(
+            failure.rendering_reason(PresentationMode::Async),
+            Some(RenderingReason::AsyncScanoutFailed)
+        );
+    }
+}
+
+#[test]
 fn overlay_failure_preserves_primary_content_when_restoring_composition() {
     use crate::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
     let primary_buffer = SolidColorBuffer::new((800, 600), [0., 1., 0., 1.]);

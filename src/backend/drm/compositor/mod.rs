@@ -401,11 +401,57 @@ struct PlanesSnapshot {
     overlay_bitmask: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PrimaryPlaneFailure {
+    /// A failed atomic test or commit. Report it for the requested presentation mode.
+    Scanout,
+    /// Policy, format, or color rejection, including failures without a specific reason.
+    Other(Option<RenderingReason>),
+}
+
+impl From<Option<RenderingReason>> for PrimaryPlaneFailure {
+    fn from(reason: Option<RenderingReason>) -> Self {
+        match reason {
+            Some(RenderingReason::ScanoutFailed | RenderingReason::AsyncScanoutFailed) => Self::Scanout,
+            reason => Self::Other(reason),
+        }
+    }
+}
+
+impl PrimaryPlaneFailure {
+    fn applies_to(self, mode: PresentationMode) -> bool {
+        // Format support can differ between synchronous and asynchronous scan-out.
+        // Recheck after a mode change instead of advertising a stale feedback tranche.
+        match self {
+            Self::Other(Some(RenderingReason::FormatUnsupported)) => mode == PresentationMode::VSync,
+            Self::Other(Some(RenderingReason::AsyncFormatUnsupported)) => mode == PresentationMode::Async,
+            _ => true,
+        }
+    }
+
+    fn rendering_reason(self, mode: PresentationMode) -> Option<RenderingReason> {
+        match self {
+            Self::Scanout => Some(match mode {
+                PresentationMode::VSync => RenderingReason::ScanoutFailed,
+                PresentationMode::Async => RenderingReason::AsyncScanoutFailed,
+            }),
+            Self::Other(reason) => reason,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct FailedPlanes {
+    primary: Option<PrimaryPlaneFailure>,
+    // Overlay assignment only caches failures of the actual scanout test.
+    overlay_bitmask: u32,
+}
+
 #[derive(Debug)]
 struct ElementInstanceState {
     properties: PlaneProperties,
     active_planes: PlanesSnapshot,
-    failed_planes: PlanesSnapshot,
+    failed_planes: FailedPlanes,
 }
 
 #[derive(Debug)]
@@ -542,7 +588,7 @@ struct ElementPlaneConfig<'a, B: Buffer, F: Framebuffer> {
     geometry: Rectangle<i32, Physical>,
     properties: PlaneProperties,
     buffer: DrmScanoutBuffer<B, F>,
-    failed_planes: &'a mut PlanesSnapshot,
+    failed_planes: &'a mut FailedPlanes,
 }
 
 #[derive(Debug)]
@@ -3281,7 +3327,7 @@ where
 
                 if let Some(primary_plane_element_state) = primary_plane_element_state {
                     for instance in primary_plane_element_state.instances.iter_mut() {
-                        instance.failed_planes.primary = true;
+                        instance.failed_planes.primary = Some(PrimaryPlaneFailure::Scanout);
                     }
                 }
             }
@@ -4080,15 +4126,14 @@ where
             return Err(None);
         }
 
-        if element_config.failed_planes.primary {
-            // Note: This might not be completely correct, but it is easier than remembering
-            // why it failed. But it should not be wrong either, so...
-            let rendering_reason = if presentation_mode == PresentationMode::Async {
-                RenderingReason::AsyncScanoutFailed
-            } else {
-                RenderingReason::ScanoutFailed
-            };
-            return Err(Some(rendering_reason));
+        if let Some(failure) = element_config
+            .failed_planes
+            .primary
+            .filter(|failure| failure.applies_to(presentation_mode))
+        {
+            // A cached rejection must retain its cause. In particular, unsupported color
+            // transforms never reached an atomic test and must not become ScanoutFailed.
+            return Err(failure.rendering_reason(presentation_mode));
         }
 
         let res = self.try_assign_plane(
@@ -4100,8 +4145,8 @@ where
             presentation_mode,
         );
 
-        if res.is_err() {
-            element_config.failed_planes.primary = true;
+        if let Err(reason) = &res {
+            element_config.failed_planes.primary = Some((*reason).into());
         }
 
         res
