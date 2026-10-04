@@ -915,7 +915,11 @@ impl ImportMemWl for GlesRenderer {
                 surface_lock
                     .as_ref()
                     .and_then(|cache| cache.get(&id).cloned())
-                    .filter(|texture| texture.size == (width, height).into())
+                    .filter(|texture| {
+                        texture.size == (width, height).into()
+                            && texture.format == Some(internal_format)
+                            && texture.has_alpha == has_alpha
+                    })
                     .unwrap_or_else(|| {
                         let mut tex = 0;
                         unsafe { self.gl.GenTextures(1, &mut tex) };

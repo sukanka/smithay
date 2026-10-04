@@ -120,7 +120,7 @@ use super::{Renderer, Texture};
 
 mod shaper;
 
-use shaper::DamageShaper;
+pub(crate) use shaper::DamageShaper;
 
 const MAX_AGE: usize = 4;
 

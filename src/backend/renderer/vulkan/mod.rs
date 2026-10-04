@@ -66,6 +66,9 @@ mod texture;
 #[cfg(test)]
 mod descriptor_pool_tests;
 
+#[cfg(test)]
+mod upload_tests;
+
 pub use custom::{
     CustomUniform, CustomUniformDecl, CustomUniformKind, CustomUniformValue, MAX_CUSTOM_PARAMS_SIZE,
     MAX_CUSTOM_TEXTURES, OwnedCustomUniform, VulkanPixelProgram, texture_bindings_glsl, uniform_block_glsl,
@@ -264,6 +267,25 @@ pub(super) const PARAMS_FLOATS: usize = 28;
 pub(super) const PARAMS_RANGE: u32 = 512;
 const PARAMS_RING_SIZE: u32 = 64 * 1024;
 const MAX_CACHED_PARAMS_RINGS: usize = 8;
+const MAX_CACHED_UPLOAD_BUFFERS: usize = 4;
+const MAX_CACHED_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Mapped transfer storage. A cached allocation is reusable only after its submission completes.
+struct UploadBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    ptr: *mut u8,
+    capacity: u64,
+}
+
+impl UploadBuffer {
+    fn defer_destroy(self, device: &Device, point: u64) {
+        device.defer_destroy(
+            point,
+            vec![CleanupItem::Buffer(self.buffer), CleanupItem::Memory(self.memory)],
+        );
+    }
+}
 
 /// Persistently mapped parameter storage, exclusively owned by a frame or the renderer pool.
 struct ParamsRing {
@@ -360,6 +382,7 @@ pub struct VulkanRenderer {
     /// Parameter blocks retained with their last-use timeline point. Only completed blocks
     /// may be acquired; the pool never waits for an in-flight block to become available.
     params_rings: Vec<(u64, ParamsRing)>,
+    upload_buffers: Vec<(u64, UploadBuffer)>,
     /// Pipeline layouts by texture count; index 1 equals `pipeline_layout`.
     pub(super) pipeline_layouts: [vk::PipelineLayout; custom::MAX_CUSTOM_TEXTURES + 1],
     pipeline_layout: vk::PipelineLayout,
@@ -645,6 +668,7 @@ impl VulkanRenderer {
             params_ds_layout,
             params_align,
             params_rings: Vec::new(),
+            upload_buffers: Vec::new(),
             pipeline_layouts,
             pipeline_layout,
             pipelines: HashMap::new(),
@@ -1646,33 +1670,128 @@ impl VulkanRenderer {
         }
     }
 
-    /// Uploads `data` into `region` of the texture image.
+    fn acquire_upload_buffer(&mut self, size: u64) -> Result<UploadBuffer, VulkanError> {
+        if !self.upload_buffers.is_empty() {
+            let completed = self.device.completed_point()?;
+            let best = self
+                .upload_buffers
+                .iter()
+                .enumerate()
+                .filter(|(_, (point, buffer))| *point <= completed && buffer.capacity >= size)
+                .min_by_key(|(_, (_, buffer))| buffer.capacity)
+                .map(|(index, _)| index);
+            if let Some(index) = best {
+                return Ok(self.upload_buffers.swap_remove(index).1);
+            }
+            // Replace an undersized completed allocation when a surface grows. Otherwise
+            // small idle buffers could fill the cache and prevent larger uploads being cached.
+            if let Some(index) = self
+                .upload_buffers
+                .iter()
+                .position(|(point, _)| *point <= completed)
+            {
+                let (point, buffer) = self.upload_buffers.swap_remove(index);
+                buffer.defer_destroy(&self.device, point);
+            }
+        }
+        let (buffer, memory, ptr) = self.create_host_buffer(size, vk::BufferUsageFlags::TRANSFER_SRC)?;
+        Ok(UploadBuffer {
+            buffer,
+            memory,
+            ptr: ptr.cast(),
+            capacity: size,
+        })
+    }
+
+    fn recycle_upload_buffer(&mut self, point: u64, buffer: UploadBuffer) {
+        let cached_bytes: u64 = self.upload_buffers.iter().map(|(_, b)| b.capacity).sum();
+        if self.upload_buffers.len() < MAX_CACHED_UPLOAD_BUFFERS
+            && buffer.capacity <= MAX_CACHED_UPLOAD_BYTES.saturating_sub(cached_bytes)
+        {
+            self.upload_buffers.push((point, buffer));
+        } else {
+            buffer.defer_destroy(&self.device, point);
+        }
+    }
+
+    /// Uploads all damaged regions with one staging allocation and queue submission.
+    #[profiling::function]
     fn upload_memory(
         &mut self,
         texture: &VulkanTexture,
         data: &[u8],
         data_stride_pixels: i32,
-        data_offset: Rectangle<i32, BufferCoord>,
+        damage: &[Rectangle<i32, BufferCoord>],
         first_upload: bool,
     ) -> Result<(), VulkanError> {
         let bpp = format::bytes_per_pixel(texture.0.format)
-            .ok_or(VulkanError::UnsupportedFormat(texture.0.format))? as i32;
-        let region = data_offset;
+            .ok_or(VulkanError::UnsupportedFormat(texture.0.format))?;
+        let full = Rectangle::from_size(texture.0.size);
+        // The shaper operates in physical coordinates; these are the same pixel coordinates
+        // as the source buffer, without a scale or transform. Its disjoint output also avoids
+        // overlapping destination regions in a single Vulkan copy command.
+        let mut regions: Vec<Rectangle<i32, Physical>> = damage
+            .iter()
+            .filter_map(|rect| rect.intersection(full))
+            .map(|rect| Rectangle::new((rect.loc.x, rect.loc.y).into(), (rect.size.w, rect.size.h).into()))
+            .collect();
+        let mut shaper: super::damage::DamageShaper = Default::default();
+        shaper.shape_damage(&mut regions);
+        if regions.is_empty() {
+            return Ok(());
+        }
 
-        let needed = (region.size.w * region.size.h * bpp) as u64;
-        let (buffer, memory, ptr) = self.create_host_buffer(needed, vk::BufferUsageFlags::TRANSFER_SRC)?;
-
-        // Copy the damaged rows into the staging buffer (tightly packed).
-        unsafe {
-            let dst = ptr as *mut u8;
-            let row_bytes = (region.size.w * bpp) as usize;
-            for row in 0..region.size.h {
-                let src_offset = (((region.loc.y + row) * data_stride_pixels + region.loc.x) * bpp) as usize;
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr().add(src_offset),
-                    dst.add(row as usize * row_bytes),
-                    row_bytes,
-                );
+        let stride = usize::try_from(data_stride_pixels).map_err(|_| VulkanError::UnexpectedSize)?;
+        let mut copies = Vec::with_capacity(regions.len());
+        let mut needed = 0usize;
+        for region in &regions {
+            let width = region.size.w as usize;
+            let height = region.size.h as usize;
+            let end = (region.loc.y as usize + height - 1)
+                .checked_mul(stride)
+                .and_then(|offset| offset.checked_add(region.loc.x as usize + width))
+                .and_then(|pixels| pixels.checked_mul(bpp));
+            if end.is_none_or(|end| end > data.len()) || region.loc.x as usize + width > stride {
+                return Err(VulkanError::UnexpectedSize);
+            }
+            copies.push(
+                vk::BufferImageCopy::default()
+                    .buffer_offset(needed as u64)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_offset(vk::Offset3D {
+                        x: region.loc.x,
+                        y: region.loc.y,
+                        z: 0,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width: width as u32,
+                        height: height as u32,
+                        depth: 1,
+                    }),
+            );
+            needed = width
+                .checked_mul(height)
+                .and_then(|pixels| pixels.checked_mul(bpp))
+                .and_then(|bytes| needed.checked_add(bytes))
+                .ok_or(VulkanError::UnexpectedSize)?;
+        }
+        let staging = self.acquire_upload_buffer(needed as u64)?;
+        for (region, copy) in regions.iter().zip(&copies) {
+            let row_bytes = region.size.w as usize * bpp;
+            for row in 0..region.size.h as usize {
+                let src_offset = ((region.loc.y as usize + row) * stride + region.loc.x as usize) * bpp;
+                // The source bounds were checked above, and the allocation fits all packed regions.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr().add(src_offset),
+                        staging.ptr.add(copy.buffer_offset as usize + row * row_bytes),
+                        row_bytes,
+                    );
+                }
             }
         }
 
@@ -1683,7 +1802,7 @@ impl VulkanRenderer {
             *texture.0.layout.lock().unwrap()
         };
 
-        let (point, _) = self.submit_one_shot(
+        let submission = self.submit_one_shot(
             |raw, cb| {
                 unsafe {
                     image_barrier(
@@ -1697,31 +1816,12 @@ impl VulkanRenderer {
                         vk::PipelineStageFlags2::TRANSFER,
                         vk::AccessFlags2::TRANSFER_WRITE,
                     );
-                    let copy = vk::BufferImageCopy::default()
-                        .buffer_offset(0)
-                        .buffer_row_length(0)
-                        .buffer_image_height(0)
-                        .image_subresource(
-                            vk::ImageSubresourceLayers::default()
-                                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                .layer_count(1),
-                        )
-                        .image_offset(vk::Offset3D {
-                            x: region.loc.x,
-                            y: region.loc.y,
-                            z: 0,
-                        })
-                        .image_extent(vk::Extent3D {
-                            width: region.size.w as u32,
-                            height: region.size.h as u32,
-                            depth: 1,
-                        });
                     raw.cmd_copy_buffer_to_image(
                         cb,
-                        buffer,
+                        staging.buffer,
                         image,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        &[copy],
+                        &copies,
                     );
                     image_barrier(
                         raw,
@@ -1737,10 +1837,18 @@ impl VulkanRenderer {
                 }
                 Ok(())
             },
-            vec![CleanupItem::Buffer(buffer), CleanupItem::Memory(memory)],
+            Vec::new(),
             Vec::new(),
             false,
-        )?;
+        );
+        let (point, _) = match submission {
+            Ok(submission) => submission,
+            Err(err) => {
+                staging.defer_destroy(&self.device, self.timeline_point);
+                return Err(err);
+            }
+        };
+        self.recycle_upload_buffer(point, staging);
 
         *texture.0.layout.lock().unwrap() = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         texture.0.mark_used(point);
@@ -1889,6 +1997,9 @@ impl Drop for VulkanRenderer {
             for (point, ring) in self.params_rings.drain(..) {
                 ring.defer_destroy(&self.device, point);
             }
+            for (point, buffer) in self.upload_buffers.drain(..) {
+                buffer.defer_destroy(&self.device, point);
+            }
             self.device.process_cleanup(u64::MAX);
             raw.destroy_command_pool(self.command_pool, None);
         }
@@ -2014,7 +2125,7 @@ impl ImportMem for VulkanRenderer {
             descriptor_sets: Mutex::new(HashMap::new()),
         }));
 
-        self.upload_memory(&texture, data, size.w, Rectangle::from_size(size), true)?;
+        self.upload_memory(&texture, data, size.w, &[Rectangle::from_size(size)], true)?;
         Ok(texture)
     }
 
@@ -2044,7 +2155,7 @@ impl ImportMem for VulkanRenderer {
             return Err(VulkanError::UnexpectedSize);
         }
 
-        self.upload_memory(texture, data, size.w, region, false)
+        self.upload_memory(texture, data, size.w, &[region], false)
     }
 
     fn mem_formats(&self) -> Box<dyn Iterator<Item = Fourcc>> {
@@ -2099,20 +2210,15 @@ impl ImportMemWl for VulkanRenderer {
             let existing = surface_lock
                 .as_ref()
                 .and_then(|cache| cache.get(&id).cloned())
-                .filter(|texture| texture.0.size == (width, height).into());
+                .filter(|texture| texture.0.size == (width, height).into() && texture.0.format == fourcc);
 
             match existing {
                 Some(texture) => {
                     let full = Rectangle::from_size((width, height).into());
                     if damage.is_empty() {
-                        self.upload_memory(&texture, data, stride_pixels, full, false)?;
+                        self.upload_memory(&texture, data, stride_pixels, &[full], false)?;
                     } else {
-                        for rect in damage {
-                            let Some(rect) = rect.intersection(full) else {
-                                continue;
-                            };
-                            self.upload_memory(&texture, data, stride_pixels, rect, false)?;
-                        }
+                        self.upload_memory(&texture, data, stride_pixels, damage, false)?;
                     }
                     Ok(texture)
                 }
@@ -2148,7 +2254,7 @@ impl ImportMemWl for VulkanRenderer {
                         last_use: AtomicU64::new(0),
                         descriptor_sets: Mutex::new(HashMap::new()),
                     }));
-                    self.upload_memory(&texture, data, stride_pixels, Rectangle::from_size(size), true)?;
+                    self.upload_memory(&texture, data, stride_pixels, &[Rectangle::from_size(size)], true)?;
                     if let Some(cache) = surface_lock.as_mut() {
                         cache.insert(id, texture.clone());
                     }
