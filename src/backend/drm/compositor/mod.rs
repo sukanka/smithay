@@ -1206,6 +1206,18 @@ struct PlaneAssignment {
     type_: PlaneType,
 }
 
+fn restore_primary_for_composition<'a, E: Element>(
+    primary: &mut Option<&'a E>,
+    z_index: usize,
+    removed: &mut Vec<(usize, &'a E)>,
+    states: &mut RenderElementStates,
+) {
+    if let Some(element) = primary.take() {
+        removed.push((z_index, element));
+        states.states.remove(element.id());
+    }
+}
+
 impl From<&PlaneInfo> for PlaneAssignment {
     #[inline]
     fn from(value: &PlaneInfo) -> Self {
@@ -2038,6 +2050,83 @@ where
         Ok((swapchain, use_opaque))
     }
 
+    /// Acquires a writable composition target only once a frame needs it.
+    fn acquire_primary_plane_state(
+        &mut self,
+        current_size: Size<i32, Physical>,
+    ) -> FrameResult<PlaneState<A::Buffer, F::Framebuffer>, A, F> {
+        let primary_plane_buffer = self
+            .swapchain
+            .acquire()
+            .map_err(FrameError::Allocator)?
+            .ok_or(FrameError::NoFreeSlotsError)?;
+
+        // It is safe to call export multiple times as the Slot will cache the dmabuf for us
+        let dmabuf = primary_plane_buffer.export().map_err(FrameError::AsDmabufError)?;
+
+        // Let's check if we already have a cached framebuffer for this Slot, if not try to export
+        // it and use the Slot userdata to cache it
+        let maybe_buffer = primary_plane_buffer
+            .userdata()
+            .get::<CachedDrmFramebuffer<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>();
+        if maybe_buffer.is_none() {
+            let fb_buffer = self
+                .framebuffer_exporter
+                .add_framebuffer(
+                    self.surface.device_fd(),
+                    ExportBuffer::Allocator(&primary_plane_buffer),
+                    self.primary_is_opaque,
+                )
+                .map_err(FrameError::FramebufferExport)?
+                .ok_or(FrameError::NoFramebuffer)?;
+            primary_plane_buffer.userdata().insert_if_missing_threadsafe(|| {
+                CachedDrmFramebuffer::new(DrmFramebuffer::Exporter(fb_buffer))
+            });
+        }
+
+        // This unwrap is safe as we error out above if we were unable to export a framebuffer
+        let fb = primary_plane_buffer
+            .userdata()
+            .get::<CachedDrmFramebuffer<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>()
+            .unwrap()
+            .clone();
+
+        // We want to make sure we can actually scan-out the primary plane, so
+        // explicitly set skip to false
+        let plane_claim = self.surface.claim_plane(self.surface.plane()).ok_or_else(|| {
+            error!("failed to claim primary plane");
+            FrameError::PrimaryPlaneClaimFailed
+        })?;
+        let state: PlaneState<
+            <A as Allocator>::Buffer,
+            <F as ExportFramebuffer<<A as Allocator>::Buffer>>::Framebuffer,
+        > = PlaneState {
+            skip: false,
+            needs_test: false,
+            element_state: None,
+            config: Some(PlaneConfig {
+                properties: PlaneProperties {
+                    src: Rectangle::from_size(dmabuf.size()).to_f64(),
+                    dst: Rectangle::from_size(current_size),
+                    // NOTE: We do not apply the transform to the primary plane as this is handled by the dtr/renderer
+                    transform: Transform::Normal,
+                    alpha: 1.0,
+                    format: primary_plane_buffer.format(),
+                },
+                buffer: DrmScanoutBuffer {
+                    buffer: ScanoutBuffer::Swapchain(Arc::new(primary_plane_buffer)),
+                    fb,
+                },
+                damage_clips: None,
+                plane_claim,
+                sync: None,
+                color_pipeline: self.with_post_blend_reset(None),
+            }),
+        };
+
+        Ok(state)
+    }
+
     /// Render the next frame
     ///
     /// - `elements` for this frame in front-to-back order
@@ -2089,46 +2178,6 @@ where
         let output_geometry: Rectangle<_, Physical> =
             Rectangle::from_size(output_transform.transform_size(current_size));
 
-        // We always acquire a buffer from the swapchain even
-        // if we could end up doing direct scan-out on the primary plane.
-        // The reason is that we can't know upfront and we need a framebuffer
-        // on the primary plane to test overlay/cursor planes
-        let primary_plane_buffer = self
-            .swapchain
-            .acquire()
-            .map_err(FrameError::Allocator)?
-            .ok_or(FrameError::NoFreeSlotsError)?;
-
-        // It is safe to call export multiple times as the Slot will cache the dmabuf for us
-        let dmabuf = primary_plane_buffer.export().map_err(FrameError::AsDmabufError)?;
-
-        // Let's check if we already have a cached framebuffer for this Slot, if not try to export
-        // it and use the Slot userdata to cache it
-        let maybe_buffer = primary_plane_buffer
-            .userdata()
-            .get::<CachedDrmFramebuffer<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>();
-        if maybe_buffer.is_none() {
-            let fb_buffer = self
-                .framebuffer_exporter
-                .add_framebuffer(
-                    self.surface.device_fd(),
-                    ExportBuffer::Allocator(&primary_plane_buffer),
-                    self.primary_is_opaque,
-                )
-                .map_err(FrameError::FramebufferExport)?
-                .ok_or(FrameError::NoFramebuffer)?;
-            primary_plane_buffer.userdata().insert_if_missing_threadsafe(|| {
-                CachedDrmFramebuffer::new(DrmFramebuffer::Exporter(fb_buffer))
-            });
-        }
-
-        // This unwrap is safe as we error out above if we were unable to export a framebuffer
-        let fb = primary_plane_buffer
-            .userdata()
-            .get::<CachedDrmFramebuffer<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>()
-            .unwrap()
-            .clone();
-
         let mut opaque_regions: Vec<Rectangle<i32, Physical>> = std::mem::take(&mut self.opaque_regions);
         std::mem::swap(&mut self.previous_element_states, &mut self.element_states);
         let mut element_states = std::mem::take(&mut self.element_states);
@@ -2168,42 +2217,38 @@ where
             next_frame_state
         };
 
-        // We want to make sure we can actually scan-out the primary plane, so
-        // explicitly set skip to false
-        let plane_claim = self.surface.claim_plane(self.surface.plane()).ok_or_else(|| {
-            error!("failed to claim primary plane");
-            FrameError::PrimaryPlaneClaimFailed
-        })?;
-        let primary_plane_state: PlaneState<
-            <A as Allocator>::Buffer,
-            <F as ExportFramebuffer<<A as Allocator>::Buffer>>::Framebuffer,
-        > = PlaneState {
-            skip: false,
-            needs_test: false,
-            element_state: None,
-            config: Some(PlaneConfig {
-                properties: PlaneProperties {
-                    src: Rectangle::from_size(dmabuf.size()).to_f64(),
-                    dst: Rectangle::from_size(current_size),
-                    // NOTE: We do not apply the transform to the primary plane as this is handled by the dtr/renderer
-                    transform: Transform::Normal,
-                    alpha: 1.0,
-                    format: primary_plane_buffer.format(),
-                },
-                buffer: DrmScanoutBuffer {
-                    buffer: ScanoutBuffer::Swapchain(Arc::new(primary_plane_buffer)),
-                    fb,
-                },
-                damage_clips: None,
-                plane_claim,
-                sync: None,
-                color_pipeline: self.with_post_blend_reset(None),
-            }),
+        // A previous direct-scanout buffer is a valid TEST_ONLY placeholder while
+        // assigning planes. It is never rendered into or submitted for the new frame:
+        // either assignment replaces it, or a writable swapchain slot is acquired below.
+        let previous_primary = self
+            .pending_frame
+            .as_ref()
+            .map(|pending| &pending.frame)
+            .unwrap_or(&self.current_frame)
+            .plane_state(self.surface.plane());
+        let placeholder = previous_primary
+            .filter(|state| {
+                allow_partial_update
+                    && frame_flags.intersects(
+                        FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY,
+                    )
+                    && state
+                        .buffer()
+                        .is_some_and(|buffer| !matches!(buffer.buffer, ScanoutBuffer::Swapchain(_)))
+            })
+            .cloned();
+        let mut primary_plane_state = None;
+        let initial_primary = if let Some(mut placeholder) = placeholder {
+            placeholder.skip = false;
+            placeholder.needs_test = false;
+            placeholder.element_state = None;
+            placeholder
+        } else {
+            let state = self.acquire_primary_plane_state(current_size)?;
+            primary_plane_state = Some(state.clone());
+            state
         };
-
-        // unconditionally set the primary plane state
-        // if this would fail the test we are screwed anyway
-        next_frame_state.set_state(self.surface.plane(), primary_plane_state.clone());
+        next_frame_state.set_state(self.surface.plane(), initial_primary);
 
         // This holds all elements that are visible on the output
         // A element is considered visible if it intersects with the output geometry
@@ -2458,6 +2503,14 @@ where
             }
         }
 
+        // Assignment did not produce a new primary scanout candidate. Replace any
+        // placeholder before testing the complete state or starting rendering.
+        if primary_plane_scanout_element.is_none() && primary_plane_state.is_none() {
+            let state = self.acquire_primary_plane_state(current_size)?;
+            next_frame_state.set_state(self.surface.plane(), state.clone());
+            primary_plane_state = Some(state);
+        }
+
         // Cleanup old state (e.g. old dmabuffers)
         for element_state in element_states.values_mut() {
             element_state.fb_cache.cleanup();
@@ -2533,7 +2586,25 @@ where
             // to make sure we actually have a slot on the primary
             // plane we can render into
             if !removed_overlay_elements.is_empty() {
-                next_frame_state.set_state(self.surface.plane(), primary_plane_state);
+                // A failed overlay can force composition even when the primary
+                // candidate itself passed. Its buffer will be replaced too, so
+                // preserve that element in the rendered stack and revoke ZeroCopy.
+                let z_index = next_frame_state
+                    .plane_state(self.surface.plane())
+                    .and_then(|state| state.element_state.as_ref())
+                    .map(|state| state.z_index)
+                    .unwrap_or(output_elements_len);
+                restore_primary_for_composition(
+                    &mut primary_plane_scanout_element,
+                    z_index,
+                    &mut removed_overlay_elements,
+                    &mut render_element_states,
+                );
+                let state = match primary_plane_state.take() {
+                    Some(state) => state,
+                    None => self.acquire_primary_plane_state(current_size)?,
+                };
+                next_frame_state.set_state(self.surface.plane(), state);
             }
 
             removed_overlay_elements.sort_by_key(|(z_index, _)| *z_index);
@@ -2543,6 +2614,12 @@ where
                 .chain(primary_plane_elements.into_iter())
                 .collect();
         }
+
+        let previous_state = self
+            .pending_frame
+            .as_ref()
+            .map(|pending| &pending.frame)
+            .unwrap_or(&self.current_frame);
 
         // If a plane has been moved or no longer has a buffer we need to report that as damage
         for (handle, previous_plane_state) in previous_state.planes.iter() {

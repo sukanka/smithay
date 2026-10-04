@@ -1,5 +1,31 @@
 use super::*;
 
+#[test]
+fn overlay_failure_preserves_primary_content_when_restoring_composition() {
+    use crate::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
+    let primary_buffer = SolidColorBuffer::new((800, 600), [0., 1., 0., 1.]);
+    let overlay_buffer = SolidColorBuffer::new((100, 100), [1., 0., 0., 1.]);
+    let primary = SolidColorRenderElement::from_buffer(&primary_buffer, (0, 0), 1., 1., Kind::Unspecified);
+    let overlay = SolidColorRenderElement::from_buffer(&overlay_buffer, (0, 0), 1., 1., Kind::Unspecified);
+    let mut candidate = Some(&primary);
+    let mut removed = vec![(0, &overlay)];
+    let mut states = RenderElementStates::default();
+    states
+        .states
+        .insert(primary.id().clone(), RenderElementState::zero_copy(800 * 600));
+    restore_primary_for_composition(&mut candidate, 1, &mut removed, &mut states);
+    assert!(candidate.is_none());
+    assert!(!states.states.contains_key(primary.id()));
+    removed.sort_by_key(|(z, _)| *z);
+    assert_eq!(
+        removed.iter().map(|(_, e)| e.id()).collect::<Vec<_>>(),
+        [overlay.id(), primary.id()]
+    );
+    // If the failed-plane loop already removed primary, do not draw it twice.
+    restore_primary_for_composition(&mut candidate, 1, &mut removed, &mut states);
+    assert_eq!(removed.len(), 2);
+}
+
 type TestFrame = CompositorFrameState<
     GbmAllocator<crate::backend::drm::DrmDeviceFd>,
     GbmFramebufferExporter<crate::backend::drm::DrmDeviceFd>,
