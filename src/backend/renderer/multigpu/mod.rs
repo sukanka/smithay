@@ -2590,6 +2590,10 @@ fn wait_for_sync(sync: &SyncPoint) {
     while sync.wait().is_err() {}
 }
 
+fn shadow_source_is_opaque(format: Option<Fourcc>) -> bool {
+    format.is_some_and(|format| get_bpp(format).is_some() && !has_alpha(format))
+}
+
 fn dma_shadow_copy<S, T>(
     src_texture: &<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,
     damage: Option<&[Rectangle<i32, BufferCoords>]>,
@@ -2741,9 +2745,13 @@ where
     .filter(|_| !is_new_buffer)
     .unwrap_or(&damage_slice);
 
-    frame
-        .clear(Color32F::TRANSPARENT, damage)
-        .map_err(Error::Render)?;
+    // The draw uses alpha=1 and covers every damaged pixel. Only an explicitly
+    // known opaque format can overwrite without blending destination contents.
+    if !shadow_source_is_opaque(src_texture.format()) {
+        frame
+            .clear(Color32F::TRANSPARENT, damage)
+            .map_err(Error::Render)?;
+    }
     frame
         .render_texture_from_to(
             src_texture,
@@ -4139,6 +4147,18 @@ mod tests {
     use super::*;
     use crate::backend::allocator::dmabuf::DmabufFlags;
     use crate::backend::renderer::sync::{Fence, Interrupted};
+
+    #[test]
+    fn shadow_clear_is_only_elided_for_known_opaque_formats() {
+        assert!(shadow_source_is_opaque(Some(Fourcc::Xrgb8888)));
+        assert!(shadow_source_is_opaque(Some(Fourcc::Xbgr2101010)));
+        assert!(!shadow_source_is_opaque(Some(Fourcc::Argb8888)));
+        assert!(!shadow_source_is_opaque(Some(Fourcc::Abgr2101010)));
+        assert!(!shadow_source_is_opaque(None));
+        // The format helper returns false for alpha on unknown formats; that
+        // alone cannot establish that skipping destination initialization is safe.
+        assert!(!shadow_source_is_opaque(Some(Fourcc::C8)));
+    }
 
     fn layout_key() -> LayoutKey {
         LayoutKey {
