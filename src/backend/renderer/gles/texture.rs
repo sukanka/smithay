@@ -32,6 +32,7 @@ impl GlesTexture {
         size: Size<i32, BufferCoord>,
     ) -> GlesTexture {
         GlesTexture(Arc::new(GlesTextureInternal {
+            identity: Arc::new(()),
             texture: tex,
             sync: RwLock::default(),
             format: internal_format,
@@ -150,6 +151,8 @@ impl TextureSync {
 
 #[derive(Debug)]
 pub(super) struct GlesTextureInternal {
+    // Separate from the texture Arc so weak cache entries do not change is_unique_reference().
+    pub(super) identity: Arc<()>,
     pub(super) texture: ffi::types::GLuint,
     pub(super) sync: RwLock<TextureSync>,
     pub(super) format: Option<ffi::types::GLenum>,
