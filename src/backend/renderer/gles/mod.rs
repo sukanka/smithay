@@ -778,7 +778,7 @@ impl GlesRenderer {
             let mut sync_lock = texture.0.sync.write().unwrap();
             let mut fbo = 0;
             unsafe {
-                sync_lock.wait_for_all(&self.gl);
+                sync_lock.wait_for_all(&self.gl, self.egl.command_stream_id());
                 self.gl.GenFramebuffers(1, &mut fbo as *mut _);
                 self.gl.BindFramebuffer(ffi::FRAMEBUFFER, fbo);
 
@@ -969,7 +969,7 @@ impl ImportMemWl for GlesRenderer {
 
             let mut sync_lock = texture.0.sync.write().unwrap();
             unsafe {
-                sync_lock.wait_for_all(&self.gl);
+                sync_lock.wait_for_all(&self.gl, self.egl.command_stream_id());
                 self.gl.BindTexture(ffi::TEXTURE_2D, texture.0.texture);
                 self.gl
                     .TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
@@ -1017,7 +1017,7 @@ impl ImportMemWl for GlesRenderer {
                 self.gl.BindTexture(ffi::TEXTURE_2D, 0);
 
                 if self.capabilities.contains(&Capability::Fencing) {
-                    sync_lock.update_write(&self.gl);
+                    sync_lock.update_write(&self.gl, self.egl.command_stream_id());
                 } else if self.egl.is_shared() {
                     self.gl.Finish();
                 }
@@ -1111,7 +1111,9 @@ impl ImportMem for GlesRenderer {
 
             let mut sync = RwLock::<TextureSync>::default();
             if self.capabilities.contains(&Capability::Fencing) {
-                sync.get_mut().unwrap().update_write(&self.gl);
+                sync.get_mut()
+                    .unwrap()
+                    .update_write(&self.gl, self.egl.command_stream_id());
             } else if self.egl.is_shared() {
                 unsafe {
                     self.gl.Finish();
@@ -1162,7 +1164,7 @@ impl ImportMem for GlesRenderer {
         let mut sync_lock = texture.0.sync.write().unwrap();
         unsafe {
             self.egl.make_current()?;
-            sync_lock.wait_for_all(&self.gl);
+            sync_lock.wait_for_all(&self.gl, self.egl.command_stream_id());
             self.gl.BindTexture(ffi::TEXTURE_2D, texture.0.texture);
             self.gl
                 .TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
@@ -1188,7 +1190,7 @@ impl ImportMem for GlesRenderer {
             self.gl.BindTexture(ffi::TEXTURE_2D, 0);
 
             if self.capabilities.contains(&Capability::Fencing) {
-                sync_lock.update_write(&self.gl);
+                sync_lock.update_write(&self.gl, self.egl.command_stream_id());
             } else if self.egl.is_shared() {
                 self.gl.Finish();
             }
@@ -2595,7 +2597,7 @@ impl GlesFrame<'_, '_> {
         }
 
         if let GlesTargetInternal::Texture { sync_lock, .. } = &mut self.target.0 {
-            sync_lock.update_write(&self.renderer.gl);
+            sync_lock.update_write(&self.renderer.gl, self.renderer.egl.command_stream_id());
         }
 
         // delayed destruction until the next frame rendering.
@@ -3028,7 +3030,7 @@ impl GlesFrame<'_, '_> {
         let gl = &self.renderer.gl;
         let sync_lock = tex.0.sync.read().unwrap();
         unsafe {
-            sync_lock.wait_for_upload(gl);
+            sync_lock.wait_for_upload(gl, self.renderer.egl.command_stream_id());
             let scope = self
                 .renderer
                 .profiler
@@ -3145,7 +3147,7 @@ impl GlesFrame<'_, '_> {
             drop(scope);
 
             if self.renderer.capabilities.contains(&Capability::Fencing) {
-                sync_lock.update_read(gl);
+                sync_lock.update_read(gl, self.renderer.egl.command_stream_id());
             } else if self.renderer.egl.is_shared() {
                 gl.Finish();
             };

@@ -28,6 +28,10 @@ pub struct EGLContext {
     config_id: ffi::egl::types::EGLConfig,
     pixel_format: Option<PixelFormat>,
     user_data: Arc<UserDataMap>,
+    // Unlike user_data, this identifies one command stream, not its share group. Fences
+    // retain a clone so a destroyed context's identity cannot be reused with its raw handle.
+    #[cfg(feature = "renderer_gl")]
+    command_stream: Arc<()>,
     externally_managed: bool,
     pub(crate) span: tracing::Span,
 }
@@ -110,6 +114,8 @@ impl EGLContext {
             config_id,
             pixel_format: Some(pixel_format),
             user_data: Arc::new(UserDataMap::default()),
+            #[cfg(feature = "renderer_gl")]
+            command_stream: Arc::new(()),
             externally_managed: true,
             span,
         })
@@ -347,6 +353,8 @@ impl EGLContext {
             } else {
                 Arc::new(UserDataMap::default())
             },
+            #[cfg(feature = "renderer_gl")]
+            command_stream: Arc::new(()),
             externally_managed: false,
             span,
         })
@@ -416,6 +424,15 @@ impl EGLContext {
     /// Returns true if the OpenGL context is the current one in the thread.
     pub fn is_current(&self) -> bool {
         unsafe { std::ptr::eq(ffi::egl::GetCurrentContext(), self.context as *const _) }
+    }
+
+    /// Identity of this context's ordered GL command stream. Compare with `Arc::ptr_eq`.
+    ///
+    /// Each wrapper from `from_raw` gets a separate identity too: if a caller wraps the same
+    /// external context twice, treating them as distinct is conservative and only adds waits.
+    #[cfg(feature = "renderer_gl")]
+    pub(crate) fn command_stream_id(&self) -> &Arc<()> {
+        &self.command_stream
     }
 
     /// Returns true if the OpenGL context is (possibly) shared with another.
