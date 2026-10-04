@@ -189,6 +189,8 @@ use super::{
 
 mod elements;
 mod frame_result;
+#[cfg(test)]
+mod tests;
 
 use elements::*;
 pub use frame_result::*;
@@ -592,9 +594,26 @@ impl<B: Buffer, F: Framebuffer> Clone for PlaneState<B, F> {
 struct FrameState<B: Buffer, F: Framebuffer> {
     planes: SmallVec<[(plane::Handle, PlaneState<B, F>); 10]>,
     async_flip_failed: bool,
+    /// Presentation state actually accepted by DRM, not the prepared frame's requested mode.
+    presentation_state: Option<FramePresentationState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FramePresentationState {
+    mode: PresentationMode,
+    vrr: bool,
 }
 
 impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
+    fn can_skip_plane_test(
+        &self,
+        is_compatible: bool,
+        allow_partial_update: bool,
+        presentation_state: FramePresentationState,
+    ) -> bool {
+        is_compatible && allow_partial_update && self.presentation_state == Some(presentation_state)
+    }
+
     #[inline]
     fn is_assigned(&self, handle: plane::Handle) -> bool {
         self.planes
@@ -671,6 +690,7 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         FrameState {
             planes: tmp,
             async_flip_failed: false,
+            presentation_state: None,
         }
     }
 }
@@ -2930,6 +2950,10 @@ where
         if res.is_ok() {
             self.queued_frame = None;
             self.pending_frame = None;
+            prepared_frame.frame.presentation_state = Some(FramePresentationState {
+                mode: PresentationMode::VSync,
+                vrr: self.surface.vrr_enabled(),
+            });
             self.current_frame = prepared_frame.frame;
             self.update_post_blend_draining();
         }
@@ -2947,9 +2971,14 @@ where
     /// the state of the crtc is modified elsewhere, you may call this function
     /// to reset it's internal state.
     pub fn reset_state(&mut self) -> Result<(), DrmError> {
-        self.surface.reset_state()?;
+        // Re-reading hardware state can fail partway through (for example after a VT switch).
+        // In that case the old frame must still not authorize skipping the next plane test.
         self.reset_pending = true;
-        Ok(())
+        self.current_frame.presentation_state = None;
+        if let Some(pending) = &mut self.pending_frame {
+            pending.frame.presentation_state = None;
+        }
+        self.surface.reset_state()
     }
 
     #[profiling::function]
@@ -3031,6 +3060,10 @@ where
         let res = self.handle_flip(&prepared_frame, flip);
 
         if let Ok(presentation_mode) = res {
+            prepared_frame.frame.presentation_state = Some(FramePresentationState {
+                mode: presentation_mode,
+                vrr: self.surface.vrr_enabled(),
+            });
             self.pending_frame = Some(PendingFrame {
                 frame: prepared_frame.frame,
                 user_data,
@@ -5066,14 +5099,19 @@ where
             config: Some(config),
         };
 
-        // In case we try to change the presentation mode we have to re-test
-        let presentation_mode_unchanged = self
-            .pending_frame
-            .as_ref()
-            .map(|frame| frame.presentation_mode == presentation_mode)
-            .unwrap_or(false);
+        // The previous state may already have moved from pending_frame to current_frame after
+        // vblank. Keep its accepted mode with the frame so that this common case can reuse the
+        // test too. VRR changes can require re-testing even without a pending modeset.
+        let can_skip_test = previous_state.can_skip_plane_test(
+            is_compatible,
+            !self.reset_pending && !self.surface.commit_pending(),
+            FramePresentationState {
+                mode: presentation_mode,
+                vrr: self.surface.vrr_enabled(),
+            },
+        );
 
-        let res = if is_compatible && presentation_mode_unchanged {
+        let res = if can_skip_test {
             trace!(
                 "skipping atomic test for compatible element {:?} on {:?} with zpos {:?}",
                 element_id, plane.handle, plane.zpos,
@@ -5145,6 +5183,7 @@ where
             .planes
             .iter_mut()
             .for_each(|(_, state)| *state = Default::default());
+        self.current_frame.presentation_state = None;
         self.pending_frame = None;
         self.queued_frame = None;
         self.next_frame = None;
