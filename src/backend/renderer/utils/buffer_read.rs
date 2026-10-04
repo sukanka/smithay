@@ -32,7 +32,10 @@ impl Drop for SourceGuard {
 }
 
 pub(super) fn with_source<R>(buffer: &Buffer, f: impl FnOnce() -> R) -> R {
-    let _guard = SourceGuard(SOURCE.with(|source| source.replace(Some(buffer.clone()))));
+    // Do not inherit an outer shared-buffer source when an inner draw samples an uploaded
+    // SHM texture. The client bytes have already been copied by ImportMemWl at that point.
+    let tracked = buffer.reads_client_memory().then(|| buffer.clone());
+    let _guard = SourceGuard(SOURCE.with(|source| source.replace(tracked)));
     f()
 }
 
@@ -83,26 +86,32 @@ impl BufferReadSet {
                 .push(self.buffers.keys().copied().collect())
         });
         if !sync.is_reached() {
-            let published = sync.export().is_some_and(|fence| {
-                let mut imported = HashSet::new();
-                let mut success = true;
-                for buffer in self.buffers.values() {
-                    // A failed merge leaves the earlier fence intact; waiting for this new
-                    // submission below then preserves both contexts' read dependencies.
-                    success &= buffer.add_release_fence(fence.as_fd()).is_ok();
-                    if success {
-                        if let Ok(dmabuf) = crate::wayland::dmabuf::get_dmabuf(buffer) {
-                            if imported.insert(dmabuf.clone()) {
-                                for plane in dmabuf.handles() {
-                                    success &=
-                                        import_sync_file(plane, SyncFileFlags::READ, fence.as_fd()).is_ok();
+            // Exporting a fence is only useful when every read has somewhere to publish it.
+            // Legacy EGL and unknown implicit buffers have no reservation/release recipient;
+            // keep their references until the original submission completes instead.
+            let can_publish = self.buffers.values().all(Buffer::accepts_read_fence);
+            let published = can_publish
+                && sync.export().is_some_and(|fence| {
+                    let mut imported = HashSet::new();
+                    let mut success = true;
+                    for buffer in self.buffers.values() {
+                        // A failed merge leaves the earlier fence intact; waiting for this new
+                        // submission below then preserves both contexts' read dependencies.
+                        success &= buffer.add_release_fence(fence.as_fd()).is_ok();
+                        if success {
+                            if let Ok(dmabuf) = crate::wayland::dmabuf::get_dmabuf(buffer) {
+                                if imported.insert(dmabuf.clone()) {
+                                    for plane in dmabuf.handles() {
+                                        success &=
+                                            import_sync_file(plane, SyncFileFlags::READ, fence.as_fd())
+                                                .is_ok();
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                success
-            });
+                    success
+                });
             if !published {
                 while sync.wait().is_err() {}
             }
@@ -152,7 +161,7 @@ pub(crate) mod tests {
         buffer_with_data(())
     }
 
-    fn buffer_with_data<D: Send + Sync + 'static>(
+    pub(crate) fn buffer_with_data<D: Send + Sync + 'static>(
         data: D,
     ) -> (
         wayland_server::Display<State>,
@@ -172,6 +181,7 @@ pub(crate) mod tests {
     struct PendingFence {
         waits: Arc<AtomicUsize>,
         exportable: bool,
+        exports: AtomicUsize,
     }
 
     impl Fence for PendingFence {
@@ -189,6 +199,7 @@ pub(crate) mod tests {
             self.exportable
         }
         fn export(&self) -> Option<OwnedFd> {
+            self.exports.fetch_add(1, Ordering::Relaxed);
             self.exportable
                 .then(|| std::fs::File::open("/dev/null").unwrap().into())
         }
@@ -247,6 +258,7 @@ pub(crate) mod tests {
         let sync = SyncPoint::from(PendingFence {
             waits: waits.clone(),
             exportable: false,
+            exports: AtomicUsize::new(0),
         });
         reads.publish(&sync);
         assert_eq!(waits.load(Ordering::Relaxed), 3);
@@ -261,6 +273,7 @@ pub(crate) mod tests {
         let sync = SyncPoint::from(PendingFence {
             waits: waits.clone(),
             exportable: false,
+            exports: AtomicUsize::new(0),
         });
         reads.publish(&sync);
         assert_eq!(waits.load(Ordering::Relaxed), 0);
@@ -283,12 +296,40 @@ pub(crate) mod tests {
         let sync = SyncPoint::from(PendingFence {
             waits: waits.clone(),
             exportable: true,
+            exports: AtomicUsize::new(0),
         });
         reads.publish(&sync);
         assert_eq!(
             waits.load(Ordering::Relaxed),
             3,
             "ENOTTY must take the completion fallback"
+        );
+        assert!(reads.is_empty());
+    }
+
+    #[test]
+    fn unknown_implicit_reads_wait_without_exporting_to_a_missing_recipient() {
+        let (_display, _socket, buffer) = buffer();
+        let mut reads = BufferReadSet::default();
+        buffer.with_read_source(|| reads.capture());
+        let waits = Arc::new(AtomicUsize::new(0));
+        let sync = SyncPoint::from(PendingFence {
+            waits: waits.clone(),
+            exportable: true,
+            exports: AtomicUsize::new(0),
+        });
+        reads.publish(&sync);
+        assert_eq!(
+            waits.load(Ordering::Relaxed),
+            3,
+            "an exported fd alone would not protect this buffer"
+        );
+        assert_eq!(
+            sync.get::<PendingFence>()
+                .unwrap()
+                .exports
+                .load(Ordering::Relaxed),
+            0
         );
         assert!(reads.is_empty());
     }

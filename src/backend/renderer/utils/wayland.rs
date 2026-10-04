@@ -149,6 +149,24 @@ impl Buffer {
         super::buffer_read::with_source(self, f)
     }
 
+    // GLES/Vulkan copy wl_shm bytes into renderer-owned storage during import. Subsequent
+    // sampling does not read client memory, so it needs no client GPU release dependency.
+    #[cfg(feature = "backend_drm")]
+    pub(super) fn reads_client_memory(&self) -> bool {
+        use wayland_server::Resource as _;
+        self.inner.release_point.is_some()
+            || self
+                .inner
+                .buffer
+                .data::<crate::wayland::shm::ShmBufferUserData>()
+                .is_none()
+    }
+
+    #[cfg(feature = "backend_drm")]
+    pub(super) fn accepts_read_fence(&self) -> bool {
+        self.inner.release_point.is_some() || crate::wayland::dmabuf::get_dmabuf(self).is_ok()
+    }
+
     #[cfg(feature = "backend_drm")]
     pub(super) fn read_identity(&self) -> usize {
         Arc::as_ptr(&self.inner) as usize

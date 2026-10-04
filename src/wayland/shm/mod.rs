@@ -499,3 +499,41 @@ impl ShmBufferUserData {
         }
     }
 }
+
+#[cfg(all(test, feature = "backend_drm"))]
+mod read_dependency_tests {
+    use super::*;
+    use crate::backend::renderer::utils::buffer_read::{
+        BufferReadSet,
+        tests::{buffer, buffer_with_data},
+    };
+
+    #[test]
+    fn uploaded_shm_texture_does_not_inherit_an_outer_client_read_dependency() {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(4).unwrap();
+        let pool = Pool::new(file.into(), std::num::NonZeroUsize::new(4).unwrap()).unwrap();
+        let (_display, _socket, shm) = buffer_with_data(ShmBufferUserData {
+            pool: Arc::new(pool),
+            data: BufferData {
+                offset: 0,
+                width: 1,
+                height: 1,
+                stride: 4,
+                format: wl_shm::Format::Argb8888,
+            },
+            destruction_hooks: Mutex::new(Vec::new()),
+        });
+        let (_other_display, _other_socket, shared) = buffer();
+        let mut reads = BufferReadSet::default();
+        shared.with_read_source(|| {
+            shm.with_read_source(|| reads.capture());
+            assert!(
+                reads.is_empty(),
+                "GPU sampling reads the private upload, not wl_shm memory"
+            );
+            reads.capture();
+        });
+        assert_eq!(reads.len(), 1, "the outer shared-buffer scope must be restored");
+    }
+}

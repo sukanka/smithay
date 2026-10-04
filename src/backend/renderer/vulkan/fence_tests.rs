@@ -6,7 +6,7 @@ use std::{
     cell::RefCell,
     collections::VecDeque,
     ffi::{CStr, c_char, c_int},
-    os::fd::IntoRawFd,
+    os::fd::{AsRawFd, IntoRawFd},
     time::Instant,
 };
 
@@ -111,9 +111,9 @@ unsafe extern "system" fn export_semaphore(
         faults.export
     });
     if result == vk::Result::SUCCESS {
-        // Publication below uses a non-DMA, implicitly released test buffer, so
-        // no kernel sync-file ioctl consumes this fd. It only checks the real
-        // VulkanFence export/cache and BufferReadSet publication control flow.
+        // Successful exports only exercise VulkanFence's fd ownership/cache in
+        // isolation. Publication tests either must not export (no recipient) or
+        // inject an export error, so no kernel sync-file ioctl consumes this fd.
         let Ok(file) = std::fs::File::open("/dev/null") else {
             return vk::Result::ERROR_OUT_OF_HOST_MEMORY;
         };
@@ -194,11 +194,8 @@ fn fence(renderer: &VulkanRenderer) -> VulkanFence {
     }
 }
 
-#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
-fn failed_query_still_publishes_and_caches_exported_read_fence() {
-    use crate::backend::renderer::utils::buffer_read::{BufferReadSet, tests::buffer};
-
+fn failed_query_still_exports_and_caches_binary_payload() {
     let Some(mut renderer) = renderer() else { return };
     inject(
         &mut renderer,
@@ -208,18 +205,59 @@ fn failed_query_still_publishes_and_caches_exported_read_fence() {
     );
     let sync = SyncPoint::from(fence(&renderer));
     assert!(!sync.is_reached(), "a failed query is not completion");
-    let (_display, _socket, buffer) = buffer();
-    let mut reads = BufferReadSet::default();
-    buffer.with_read_source(|| reads.capture());
-    reads.publish(&sync);
-    assert!(reads.is_empty());
+    let first = sync.export().expect("query errors must not suppress exports");
     // A later consumer duplicates the existing export, rather than exporting
     // the binary payload a second time.
-    assert!(sync.export().is_some());
+    let second = sync.export().expect("the exported payload must remain available");
+    assert_ne!(
+        first.as_raw_fd(),
+        second.as_raw_fd(),
+        "exports own distinct fd duplicates"
+    );
     FAULTS.with(|faults| {
         assert_eq!(
             faults.borrow().as_ref().unwrap().calls,
-            [Call::Query, Call::Query, Call::Export]
+            [Call::Query, Call::Export]
+        );
+    });
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn failed_query_without_release_recipient_waits_for_real_completion() {
+    use crate::backend::renderer::utils::buffer_read::{BufferReadSet, tests::buffer};
+
+    let Some(mut renderer) = renderer() else { return };
+    inject(
+        &mut renderer,
+        Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY),
+        vk::Result::SUCCESS,
+        [
+            WaitAction::Fail(vk::Result::ERROR_OUT_OF_HOST_MEMORY),
+            WaitAction::SignalThenWait,
+        ],
+    );
+    let sync = SyncPoint::from(fence(&renderer));
+    let (_display, _socket, buffer) = buffer();
+    let mut reads = BufferReadSet::default();
+    buffer.with_read_source(|| reads.capture());
+    assert_eq!(reads.len(), 1, "unknown implicit buffers retain their reads");
+    let before = Instant::now();
+    reads.publish(&sync);
+    assert!(before.elapsed() >= FAILED_WAIT_RETRY_DELAY);
+    assert!(reads.is_empty());
+    FAULTS.with(|faults| {
+        let faults = faults.borrow();
+        let faults = faults.as_ref().unwrap();
+        assert_eq!(
+            faults.calls,
+            [Call::Query, Call::Wait, Call::Wait],
+            "an export with no recipient would not protect the buffer"
+        );
+        assert_eq!(
+            unsafe { faults.raw.get_semaphore_counter_value(renderer.device.timeline) }.unwrap(),
+            1,
+            "the original timeline, not an unconsumed exported fd, completes the read"
         );
     });
 }
@@ -227,7 +265,13 @@ fn failed_query_still_publishes_and_caches_exported_read_fence() {
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
 fn failed_query_and_export_wait_for_real_completion_before_releasing_reads() {
-    use crate::backend::renderer::utils::buffer_read::{BufferReadSet, tests::buffer};
+    use crate::backend::{
+        allocator::{
+            Fourcc, Modifier,
+            dmabuf::{Dmabuf, DmabufFlags},
+        },
+        renderer::utils::buffer_read::{BufferReadSet, tests::buffer_with_data},
+    };
 
     let Some(mut renderer) = renderer() else { return };
     inject(
@@ -240,7 +284,13 @@ fn failed_query_and_export_wait_for_real_completion_before_releasing_reads() {
         ],
     );
     let sync = SyncPoint::from(fence(&renderer));
-    let (_display, _socket, buffer) = buffer();
+    // A DMA-BUF provides a real publication destination kind, so this exercises
+    // the export-failure fallback rather than the no-recipient wait above. The
+    // placeholder fd never reaches a kernel import: export is forced to fail.
+    let mut dma = Dmabuf::builder((1, 1), Fourcc::Abgr8888, Modifier::Linear, DmabufFlags::empty());
+    let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+    assert!(dma.add_plane(fd, 0, 4));
+    let (_display, _socket, buffer) = buffer_with_data(dma.build().unwrap());
     let mut reads = BufferReadSet::default();
     buffer.with_read_source(|| reads.capture());
     let before = Instant::now();
