@@ -33,7 +33,7 @@ fn renderers(shared: bool) -> Option<Vec<GlesRenderer>> {
             if std::env::var_os("SMITHAY_TEST_REQUIRE_GLES").is_some_and(|v| !v.is_empty() && v != "0") {
                 panic!("GLES framebuffer tests require a renderer: {err}");
             }
-            eprintln!("skipping GLES framebuffer test: {err}");
+            tracing::warn!("skipping GLES framebuffer test: {err}");
             None
         }
     }

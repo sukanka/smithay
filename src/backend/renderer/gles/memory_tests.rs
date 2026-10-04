@@ -13,7 +13,7 @@ fn renderer() -> Option<GlesRenderer> {
             if std::env::var_os("SMITHAY_TEST_REQUIRE_GLES").is_some_and(|v| !v.is_empty() && v != "0") {
                 panic!("GLES memory test requires a renderer: {err}");
             }
-            eprintln!("skipping GLES memory test: {err}");
+            tracing::warn!("skipping GLES memory test: {err}");
             None
         }
     }
