@@ -3,12 +3,18 @@
 use std::{
     os::unix::io::{FromRawFd, OwnedFd},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use ash::vk;
 
 use super::{CleanupItem, Device};
 use crate::backend::renderer::sync::{Fence, Interrupted};
+
+// Fence::wait cannot distinguish a persistent device error from an interruption.
+// Callers preserving read dependencies retry Interrupted, so an immediately
+// failing Vulkan wait must not turn those retries into a busy loop.
+const FAILED_WAIT_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 /// A fence tracking a point on the internal timeline semaphore of a
 /// [`VulkanRenderer`](super::VulkanRenderer) submission.
@@ -57,8 +63,9 @@ impl Drop for VulkanFence {
 impl Fence for VulkanFence {
     fn is_signaled(&self) -> bool {
         unsafe { self.device.raw.get_semaphore_counter_value(self.device.timeline) }
-            .map(|value| value >= self.point)
-            .unwrap_or(true)
+            // A failed query provides no completion guarantee. In particular, read
+            // dependencies must still be exported or waited for on this path.
+            .is_ok_and(|value| value >= self.point)
     }
 
     fn wait(&self) -> Result<(), Interrupted> {
@@ -69,6 +76,10 @@ impl Fence for VulkanFence {
             .values(&points);
         unsafe { self.device.raw.wait_semaphores(&wait_info, u64::MAX) }.map_err(|err| {
             tracing::warn!(?err, "Waiting for vulkan fence failed");
+            // Keep the dependency unresolved even on device loss. This only bounds
+            // retry frequency; recovery of a permanently lost device belongs to the
+            // renderer and cannot be expressed by the current Fence error type.
+            std::thread::sleep(FAILED_WAIT_RETRY_DELAY);
             Interrupted
         })
     }
@@ -107,3 +118,7 @@ impl Fence for VulkanFence {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "fence_tests.rs"]
+mod tests;
