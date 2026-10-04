@@ -26,6 +26,8 @@ pub mod element;
 mod error;
 pub mod format;
 mod framebuffer;
+#[cfg(test)]
+mod memory_tests;
 pub mod profiler;
 mod shaders;
 mod texture;
@@ -993,6 +995,17 @@ const SUPPORTED_MEM_FORMATS_3: &[Fourcc] = &[
     Fourcc::Xbgr16161616f,
 ];
 
+fn packed_buffer_len(size: Size<i32, BufferCoord>, bytes_per_pixel: usize) -> Result<usize, GlesError> {
+    if size.w <= 0 || size.h <= 0 {
+        return Err(GlesError::UnexpectedSize);
+    }
+    (size.w as usize)
+        .checked_mul(size.h as usize)
+        .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
+        .filter(|len| *len <= isize::MAX as usize)
+        .ok_or(GlesError::UnexpectedSize)
+}
+
 impl ImportMem for GlesRenderer {
     #[instrument(level = "trace", parent = &self.span, skip(self))]
     #[profiling::function]
@@ -1003,10 +1016,8 @@ impl ImportMem for GlesRenderer {
         size: Size<i32, BufferCoord>,
         flipped: bool,
     ) -> Result<GlesTexture, GlesError> {
-        if data.len()
-            < (size.w * size.h) as usize
-                * (get_bpp(format).ok_or(GlesError::UnsupportedPixelFormat(format))? / 8)
-        {
+        let bpp = get_bpp(format).ok_or(GlesError::UnsupportedPixelFormat(format))? / 8;
+        if data.len() < packed_buffer_len(size, bpp)? {
             return Err(GlesError::UnexpectedSize);
         }
 
@@ -1101,11 +1112,29 @@ impl ImportMem for GlesRenderer {
         let (read_format, type_) = gl_read_for_internal(texture.0.format.expect("We check that before"))
             .ok_or(GlesError::UnknownPixelFormat)?;
 
-        if data.len()
-            < (region.size.w * region.size.h) as usize
-                * (gl_bpp(read_format, type_).ok_or(GlesError::UnknownPixelFormat)? / 8)
+        let bpp = gl_bpp(read_format, type_).ok_or(GlesError::UnknownPixelFormat)? / 8;
+        // update_memory reads a rectangle from a full-size image using UNPACK_ROW_LENGTH
+        // and UNPACK_SKIP_*. A tightly packed region does not satisfy that contract.
+        if data.len() < packed_buffer_len(texture.size(), bpp)?
+            || region.loc.x < 0
+            || region.loc.y < 0
+            || region.size.w < 0
+            || region.size.h < 0
+            || region
+                .loc
+                .x
+                .checked_add(region.size.w)
+                .is_none_or(|end| end > texture.size().w)
+            || region
+                .loc
+                .y
+                .checked_add(region.size.h)
+                .is_none_or(|end| end > texture.size().h)
         {
             return Err(GlesError::UnexpectedSize);
+        }
+        if region.size.is_empty() {
+            return Ok(());
         }
 
         let mut sync_lock = texture.0.sync.write().unwrap();
@@ -1117,6 +1146,7 @@ impl ImportMem for GlesRenderer {
                 .TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
             self.gl
                 .TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+            self.gl.PixelStorei(ffi::UNPACK_ALIGNMENT, 1);
             self.gl.PixelStorei(ffi::UNPACK_ROW_LENGTH, texture.0.size.w);
             self.gl.PixelStorei(ffi::UNPACK_SKIP_PIXELS, region.loc.x);
             self.gl.PixelStorei(ffi::UNPACK_SKIP_ROWS, region.loc.y);
@@ -1134,6 +1164,7 @@ impl ImportMem for GlesRenderer {
             self.gl.PixelStorei(ffi::UNPACK_ROW_LENGTH, 0);
             self.gl.PixelStorei(ffi::UNPACK_SKIP_PIXELS, 0);
             self.gl.PixelStorei(ffi::UNPACK_SKIP_ROWS, 0);
+            self.gl.PixelStorei(ffi::UNPACK_ALIGNMENT, 4);
             self.gl.BindTexture(ffi::TEXTURE_2D, 0);
 
             if self.capabilities.contains(&Capability::Fencing) {
@@ -1358,20 +1389,25 @@ impl ExportMem for GlesRenderer {
         let (_, format, layout) = fourcc_to_gl_formats(fourcc).ok_or(GlesError::UnknownPixelFormat)?;
         let bpp = gl_bpp(format, layout).ok_or(GlesError::UnsupportedPixelLayout)? / 8;
 
+        let len = packed_buffer_len(region.size, bpp)?;
         let mut pbo = 0;
         let err = unsafe {
             self.gl.GetError(); // clear errors
             self.gl.GenBuffers(1, &mut pbo);
             self.gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, pbo);
-            let size = (region.size.w * region.size.h * bpp as i32) as isize;
-            self.gl
-                .BufferData(ffi::PIXEL_PACK_BUFFER, size, ptr::null(), ffi::STREAM_DRAW);
+            self.gl.BufferData(
+                ffi::PIXEL_PACK_BUFFER,
+                len as isize,
+                ptr::null(),
+                ffi::STREAM_DRAW,
+            );
             self.gl
                 .ReadBuffer(if matches!(target.0, GlesTargetInternal::Surface { .. }) {
                     ffi::BACK
                 } else {
                     ffi::COLOR_ATTACHMENT0
                 });
+            self.gl.PixelStorei(ffi::PACK_ALIGNMENT, 1);
             self.gl.ReadPixels(
                 region.loc.x,
                 region.loc.y,
@@ -1381,6 +1417,7 @@ impl ExportMem for GlesRenderer {
                 layout,
                 ptr::null_mut(),
             );
+            self.gl.PixelStorei(ffi::PACK_ALIGNMENT, 4);
             self.gl.ReadBuffer(ffi::NONE);
             self.gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, 0);
             self.gl.GetError()
@@ -1426,6 +1463,7 @@ impl ExportMem for GlesRenderer {
 
         let (_, format, layout) = fourcc_to_gl_formats(fourcc).ok_or(GlesError::UnknownPixelFormat)?;
         let bpp = gl_bpp(format, layout).expect("We check the format before") / 8;
+        let len = packed_buffer_len(region.size, bpp)?;
 
         let err = unsafe {
             self.gl.GetError(); // clear errors
@@ -1433,11 +1471,12 @@ impl ExportMem for GlesRenderer {
             self.gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, pbo);
             self.gl.BufferData(
                 ffi::PIXEL_PACK_BUFFER,
-                (region.size.w * region.size.h * bpp as i32) as isize,
+                len as isize,
                 ptr::null(),
                 ffi::STREAM_DRAW,
             );
             self.gl.ReadBuffer(ffi::COLOR_ATTACHMENT0);
+            self.gl.PixelStorei(ffi::PACK_ALIGNMENT, 1);
             self.gl.ReadPixels(
                 region.loc.x,
                 region.loc.y,
@@ -1447,6 +1486,7 @@ impl ExportMem for GlesRenderer {
                 layout,
                 ptr::null_mut(),
             );
+            self.gl.PixelStorei(ffi::PACK_ALIGNMENT, 4);
             self.gl.ReadBuffer(ffi::NONE);
             self.gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, 0);
             self.gl.GetError()
@@ -1483,8 +1523,10 @@ impl ExportMem for GlesRenderer {
             self.egl.make_current()?;
         }
 
-        let size = texture_mapping.size();
-        let len = size.w * size.h * 4;
+        let bpp = gl_bpp(texture_mapping.format, texture_mapping.layout)
+            .ok_or(GlesError::UnsupportedPixelLayout)?
+            / 8;
+        let len = packed_buffer_len(texture_mapping.size(), bpp)?;
 
         let mapping_ptr = texture_mapping.mapping.load(Ordering::SeqCst);
         let ptr = if mapping_ptr.is_null() {
@@ -1506,7 +1548,7 @@ impl ExportMem for GlesRenderer {
             mapping_ptr
         };
 
-        unsafe { Ok(slice::from_raw_parts(ptr as *const u8, len as usize)) }
+        unsafe { Ok(slice::from_raw_parts(ptr as *const u8, len)) }
     }
 }
 
