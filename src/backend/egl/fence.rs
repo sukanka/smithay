@@ -91,11 +91,25 @@ impl EGLFence {
     /// fences. For OpenglES the `GL_OES_EGL_sync` extension indicates support for fences.
     #[profiling::function]
     pub fn create(display: &EGLDisplay) -> Result<Self, Error> {
+        Self::create_internal(display, true)
+    }
+
+    /// Create a fence without exposing native-fd export.
+    ///
+    /// Software renderers can advertise native fences even when exporting them during
+    /// concurrent rendering is not reliable. Ordinary EGL fences retain GPU/server waits;
+    /// callers needing an fd must use their normal completion-wait fallback.
+    #[cfg(feature = "renderer_gl")]
+    pub(crate) fn create_non_native(display: &EGLDisplay) -> Result<Self, Error> {
+        Self::create_internal(display, false)
+    }
+
+    fn create_internal(display: &EGLDisplay, allow_native: bool) -> Result<Self, Error> {
         if !display.extensions.has_fences {
             return Err(Error::EglExtensionNotSupported(&["EGL_KHR_fence_sync"]));
         }
 
-        let (type_, native) = if display.extensions.has_native_fences {
+        let (type_, native) = if allow_native && display.extensions.has_native_fences {
             (ffi::egl::SYNC_NATIVE_FENCE_ANDROID, true)
         } else {
             (ffi::egl::SYNC_FENCE, false)

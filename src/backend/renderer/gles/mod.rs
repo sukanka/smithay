@@ -826,7 +826,16 @@ impl GlesRenderer {
 
     fn export_sync_point(&self) -> Option<SyncPoint> {
         if self.capabilities.contains(&Capability::ExportFence) {
-            if let Ok(fence) = EGLFence::create(self.egl.display()) {
+            // llvmpipe can advertise EGL_ANDROID_native_fence_sync, yet exporting its
+            // pending native fences can crash while other contexts draw. Keep
+            // ordinary EGL synchronization on software renderers; fd consumers already
+            // fall back to waiting when export is unavailable. Hardware stays asynchronous.
+            let fence = if self.is_software {
+                EGLFence::create_non_native(self.egl.display())
+            } else {
+                EGLFence::create(self.egl.display())
+            };
+            if let Ok(fence) = fence {
                 unsafe {
                     self.gl.Flush();
                 }

@@ -446,3 +446,90 @@ fn context_cleanup_completes_retained_failed_frame_reads() {
         "failed reads require context activation and completion"
     );
 }
+
+#[test]
+fn software_frames_keep_completion_fences_without_native_export() {
+    let Some(mut renderers) = renderers(false) else {
+        return;
+    };
+    let renderer = &mut renderers[0];
+    if !renderer.is_software() {
+        assert!(
+            !std::env::var_os("SMITHAY_TEST_REQUIRE_SOFTWARE_GLES")
+                .is_some_and(|value| !value.is_empty() && value != "0"),
+            "a software EGL renderer is required for the fence regression"
+        );
+        tracing::warn!("software EGL device unavailable; skipping software fence test");
+        return;
+    }
+    let mut target_texture: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, (32, 32).into()).unwrap();
+    let mut target = renderer.bind(&mut target_texture).unwrap();
+    let mut frame = renderer
+        .render(&mut target, (32, 32).into(), Transform::Normal)
+        .unwrap();
+    frame
+        .clear([1., 0., 1., 1.].into(), &[Rectangle::from_size((32, 32).into())])
+        .unwrap();
+    let sync = frame.finish().unwrap();
+    assert!(
+        !sync.is_exportable(),
+        "software fence export must select the consumer's wait fallback"
+    );
+    assert!(sync.export().is_none());
+    if renderer.capabilities.contains(&Capability::ExportFence) {
+        assert!(
+            sync.contains_fence(),
+            "software rendering still retains an ordinary EGL fence"
+        );
+    }
+    sync.wait().unwrap();
+    assert!(sync.is_reached());
+    drop(target);
+    check_pixel(renderer, &target_texture, [255, 0, 255, 255]);
+}
+
+#[test]
+fn hardware_frames_preserve_native_fence_export_when_supported() {
+    let devices = EGLDevice::enumerate().unwrap();
+    for device in devices.filter(|device| !device.is_software()) {
+        let Ok(display) = (unsafe { EGLDisplay::new(device) }) else {
+            continue;
+        };
+        if !EGLFence::supports_importing(&display) {
+            continue;
+        }
+        let Ok(context) = EGLContext::new(&display) else {
+            continue;
+        };
+        let Ok(mut renderer) = (unsafe { GlesRenderer::new(context) }) else {
+            continue;
+        };
+        if renderer.is_software() || !renderer.capabilities.contains(&Capability::ExportFence) {
+            continue;
+        }
+        let mut texture: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, (32, 32).into()).unwrap();
+        let mut target = renderer.bind(&mut texture).unwrap();
+        let mut frame = renderer
+            .render(&mut target, (32, 32).into(), Transform::Normal)
+            .unwrap();
+        frame
+            .clear([0., 1., 0., 1.].into(), &[Rectangle::from_size((32, 32).into())])
+            .unwrap();
+        let sync = frame.finish().unwrap();
+        assert!(sync.is_exportable());
+        assert!(
+            sync.export().is_some(),
+            "hardware native-fence consumers must stay supported"
+        );
+        sync.wait().unwrap();
+        drop(target);
+        check_pixel(&mut renderer, &texture, [0, 255, 0, 255]);
+        return;
+    }
+    assert!(
+        !std::env::var_os("SMITHAY_TEST_REQUIRE_HARDWARE_GLES")
+            .is_some_and(|value| !value.is_empty() && value != "0"),
+        "a hardware EGL renderer with native-fence export is required"
+    );
+    tracing::warn!("hardware EGL device with native fences unavailable; skipping hardware fence test");
+}
