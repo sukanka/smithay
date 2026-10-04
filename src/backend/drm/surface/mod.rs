@@ -78,51 +78,103 @@ impl PlaneDamageClips {
         damage_transform: Transform,
         damage: impl IntoIterator<Item = Rectangle<i32, Physical>>,
     ) -> io::Result<Option<Self>> {
-        let scale = src.size / dst.size.to_logical(1).to_buffer(1, dst_transform).to_f64();
-
-        let mut rects = damage
-            .into_iter()
-            .map(|rect| {
-                let mut rect = rect
-                    .to_f64()
-                    .to_logical(1f64)
-                    .to_buffer(
-                        1f64,
-                        damage_transform,
-                        &src.size.to_logical(scale, damage_transform),
-                    )
-                    .upscale(scale);
-                rect.loc += src.loc;
-                let rect = rect.to_i32_up();
-
-                drm_ffi::drm_mode_rect {
-                    x1: rect.loc.x,
-                    y1: rect.loc.y,
-                    x2: rect.loc.x.saturating_add(rect.size.w),
-                    y2: rect.loc.y.saturating_add(rect.size.h),
-                }
-            })
-            .collect::<Vec<_>>();
-
+        let mut rects = damage_clip_rects(src, dst, dst_transform, damage_transform, damage);
         if rects.is_empty() {
             return Ok(None);
         }
+        Self::from_rects(device, &mut rects).map(Some)
+    }
 
+    pub(super) fn from_rects(device: &DrmDeviceFd, rects: &mut [[i32; 4]]) -> io::Result<Self> {
+        // drm_mode_rect consists of these four i32 endpoints, in this order. Arrays have no
+        // padding, and the ioctl only reads their bytes when creating the property blob.
+        const _: () =
+            assert!(std::mem::size_of::<[i32; 4]>() == std::mem::size_of::<drm_ffi::drm_mode_rect>());
         let data = unsafe {
-            std::slice::from_raw_parts_mut(
-                rects.as_mut_ptr() as *mut u8,
-                std::mem::size_of::<drm_ffi::drm_mode_rect>() * rects.len(),
-            )
+            std::slice::from_raw_parts_mut(rects.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(rects))
         };
 
         let blob = drm_ffi::mode::create_property_blob(device.as_fd(), data)?;
 
-        Ok(Some(PlaneDamageClips {
+        Ok(PlaneDamageClips {
             inner: Arc::new(PlaneDamageInner {
                 drm: device.clone(),
                 blob: Some(drm::control::property::Value::Blob(blob.blob_id as u64)),
             }),
-        }))
+        })
+    }
+}
+
+/// The exact buffer-space rectangles passed to FB_DAMAGE_CLIPS, including rounding.
+pub(super) fn damage_clip_rects(
+    src: Rectangle<f64, Buffer>,
+    dst: Rectangle<i32, Physical>,
+    dst_transform: Transform,
+    damage_transform: Transform,
+    damage: impl IntoIterator<Item = Rectangle<i32, Physical>>,
+) -> Vec<[i32; 4]> {
+    let scale = src.size / dst.size.to_logical(1).to_buffer(1, dst_transform).to_f64();
+    damage
+        .into_iter()
+        .map(|rect| {
+            let mut rect = rect
+                .to_f64()
+                .to_logical(1f64)
+                .to_buffer(
+                    1f64,
+                    damage_transform,
+                    &src.size.to_logical(scale, damage_transform),
+                )
+                .upscale(scale);
+            rect.loc += src.loc;
+            let rect = rect.to_i32_up::<i32>();
+            [
+                rect.loc.x,
+                rect.loc.y,
+                rect.loc.x.saturating_add(rect.size.w),
+                rect.loc.y.saturating_add(rect.size.h),
+            ]
+        })
+        .collect()
+}
+
+/// A small per-plane cache. Bounding both entries and rectangles avoids retaining arbitrary
+/// client damage indefinitely. The value owns its blob independently of any in-flight frame.
+#[derive(Debug)]
+pub(super) struct DamageClipsCache<T> {
+    entries: Vec<(Vec<[i32; 4]>, T)>,
+}
+
+impl<T> Default for DamageClipsCache<T> {
+    fn default() -> Self {
+        Self { entries: Vec::new() }
+    }
+}
+
+impl<T: Clone> DamageClipsCache<T> {
+    pub(super) fn get_or_create(
+        &mut self,
+        mut rects: Vec<[i32; 4]>,
+        create: impl FnOnce(&mut [[i32; 4]]) -> io::Result<T>,
+    ) -> io::Result<Option<T>> {
+        if rects.is_empty() {
+            return Ok(None);
+        }
+        if let Some(index) = self.entries.iter().position(|(cached, _)| *cached == rects) {
+            let entry = self.entries.remove(index);
+            let value = entry.1.clone();
+            self.entries.push(entry);
+            return Ok(Some(value));
+        }
+
+        let value = create(&mut rects)?;
+        if rects.len() <= 64 {
+            if self.entries.len() == 4 {
+                self.entries.remove(0);
+            }
+            self.entries.push((rects, value.clone()));
+        }
+        Ok(Some(value))
     }
 }
 

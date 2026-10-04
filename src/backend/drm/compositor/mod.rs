@@ -185,6 +185,7 @@ use super::{
     error::AccessError,
     exporter::{ExportBuffer, ExportFramebuffer, gbm::GbmFramebufferExporter, gbm::NodeFilter},
     surface::VrrSupport,
+    surface::{DamageClipsCache, damage_clip_rects},
 };
 
 mod elements;
@@ -1298,6 +1299,9 @@ where
     primary_is_opaque: bool,
     primary_plane_element_id: Id,
     primary_plane_damage_bag: DamageBag<i32, BufferCoords>,
+    /// None means the plane has no FB_DAMAGE_CLIPS property. Property-query failures retain
+    /// damage submission until reset, rather than disabling potentially supported damage.
+    plane_damage_cache: RefCell<HashMap<plane::Handle, Option<DamageClipsCache<PlaneDamageClips>>>>,
     supports_fencing: bool,
     reset_pending: bool,
     signaled_fence: Option<Arc<OwnedFd>>,
@@ -1513,6 +1517,7 @@ where
                     let drm_renderer = DrmCompositor {
                         primary_plane_element_id: Id::new(),
                         primary_plane_damage_bag: DamageBag::new(4),
+                        plane_damage_cache: RefCell::new(HashMap::new()),
                         primary_is_opaque: is_opaque,
                         reset_pending: true,
                         signaled_fence,
@@ -1709,6 +1714,7 @@ where
         let drm_renderer = DrmCompositor {
             primary_plane_element_id: Id::new(),
             primary_plane_damage_bag: DamageBag::new(4),
+            plane_damage_cache: RefCell::new(HashMap::new()),
             primary_is_opaque: is_opaque,
             reset_pending: true,
             signaled_fence,
@@ -2693,8 +2699,10 @@ where
                             // Here we need to apply the output_transform to the damage since we
                             // haven't rotated our framebuffer. dst is already in the same
                             // coordinate space src is, so no transform needed.
-                            config.damage_clips = PlaneDamageClips::from_damage(
-                                self.surface.device_fd(),
+                            config.damage_clips = cached_damage_clips(
+                                &self.surface,
+                                &self.plane_damage_cache,
+                                self.surface.plane(),
                                 config.properties.src,
                                 config.properties.dst,
                                 Transform::Normal,
@@ -2971,6 +2979,7 @@ where
     /// the state of the crtc is modified elsewhere, you may call this function
     /// to reset it's internal state.
     pub fn reset_state(&mut self) -> Result<(), DrmError> {
+        self.plane_damage_cache.get_mut().clear();
         // Re-reading hardware state can fail partway through (for example after a VT switch).
         // In that case the old frame must still not authorize skipping the next plane test.
         self.reset_pending = true;
@@ -5033,8 +5042,10 @@ where
         // scale computation as it's already in physical space.
         let transform = element.transform().invert();
         let damage_clips = if has_element_damage {
-            PlaneDamageClips::from_damage(
-                self.surface.device_fd(),
+            cached_damage_clips(
+                &self.surface,
+                &self.plane_damage_cache,
+                plane.handle,
                 element_config.properties.src,
                 element_config.geometry,
                 transform,
@@ -5178,6 +5189,7 @@ where
     /// Calling [`queue_frame`][Self::queue_frame] will re-enable.
     pub fn clear(&mut self) -> Result<(), DrmError> {
         self.surface.clear()?;
+        self.plane_damage_cache.get_mut().clear();
 
         self.current_frame
             .planes
@@ -5190,6 +5202,32 @@ where
 
         Ok(())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cached_damage_clips(
+    surface: &DrmSurface,
+    caches: &RefCell<HashMap<plane::Handle, Option<DamageClipsCache<PlaneDamageClips>>>>,
+    plane: plane::Handle,
+    src: Rectangle<f64, BufferCoords>,
+    dst: Rectangle<i32, Physical>,
+    dst_transform: Transform,
+    damage_transform: Transform,
+    damage: impl IntoIterator<Item = Rectangle<i32, Physical>>,
+) -> std::io::Result<Option<PlaneDamageClips>> {
+    let mut caches = caches.borrow_mut();
+    let cache = caches.entry(plane).or_insert_with(|| {
+        let supported =
+            !surface.is_legacy() && plane_has_property(surface, plane, "FB_DAMAGE_CLIPS").unwrap_or(true);
+        supported.then(DamageClipsCache::default)
+    });
+    let Some(cache) = cache else {
+        return Ok(None);
+    };
+    let rects = damage_clip_rects(src, dst, dst_transform, damage_transform, damage);
+    cache.get_or_create(rects, |rects| {
+        PlaneDamageClips::from_rects(surface.device_fd(), rects)
+    })
 }
 
 /// Upper bound for the resolved-color-pipeline cache; entries are keyed by (plane, transform)
