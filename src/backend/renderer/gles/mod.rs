@@ -389,6 +389,8 @@ pub struct GlesRenderer {
     // caches
     buffers: Vec<GlesBuffer>,
     texture_framebuffers: GlesFramebufferCache,
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    failed_read_buffers: super::utils::buffer_read::BufferReadSet,
     dmabuf_cache: HashMap<WeakDmabuf, GlesTexture>,
     vbos: [ffi::types::GLuint; 2],
     vertices: Vec<f32>,
@@ -421,6 +423,8 @@ pub struct GlesFrame<'frame, 'buffer> {
     size: Size<i32, Physical>,
     tex_program_override: Option<(GlesTexProgram, Vec<Uniform<'static>>)>,
     finished: AtomicBool,
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    read_buffers: super::utils::buffer_read::BufferReadSet,
 
     span: EnteredSpan,
 
@@ -733,6 +737,8 @@ impl GlesRenderer {
 
             buffers: Vec::new(),
             texture_framebuffers: GlesFramebufferCache::default(),
+            #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+            failed_read_buffers: Default::default(),
             dmabuf_cache: std::collections::HashMap::new(),
             vertices: Vec::with_capacity(6 * 16),
             non_opaque_damage: Vec::with_capacity(16),
@@ -791,6 +797,16 @@ impl GlesRenderer {
 
     #[profiling::function]
     fn cleanup(&mut self) -> Result<(), GlesError> {
+        #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+        if !self.failed_read_buffers.is_empty() {
+            // A temporarily unavailable context may have prevented an earlier frame from
+            // publishing completion. Recover those retained references on the next cleanup.
+            unsafe {
+                self.egl.make_current()?;
+                self.gl.Finish();
+            }
+            self.failed_read_buffers.clear_completed();
+        }
         self.dmabuf_cache.retain(|entry, _tex| !entry.is_gone());
         self.buffers.retain(|buffer| !buffer.0.dmabuf.is_gone());
         self.texture_framebuffers.cleanup(&self.egl, &self.gl)?;
@@ -1423,6 +1439,20 @@ impl ExportMem for GlesRenderer {
             self.gl.GetError()
         };
 
+        #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+        {
+            let mut reads = super::utils::buffer_read::BufferReadSet::default();
+            reads.capture();
+            if !reads.is_empty() {
+                if let Some(sync) = self.export_sync_point() {
+                    reads.publish(&sync);
+                } else {
+                    unsafe { self.gl.Finish() };
+                    reads.clear_completed();
+                }
+            }
+        }
+
         match err {
             ffi::NO_ERROR => Ok(GlesMapping {
                 pbo,
@@ -1491,6 +1521,20 @@ impl ExportMem for GlesRenderer {
             self.gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, 0);
             self.gl.GetError()
         };
+
+        #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+        {
+            let mut reads = super::utils::buffer_read::BufferReadSet::default();
+            reads.capture();
+            if !reads.is_empty() {
+                if let Some(sync) = self.export_sync_point() {
+                    reads.publish(&sync);
+                } else {
+                    unsafe { self.gl.Finish() };
+                    reads.clear_completed();
+                }
+            }
+        }
 
         match err {
             ffi::NO_ERROR => Ok(GlesMapping {
@@ -1920,6 +1964,12 @@ impl Blit for GlesRenderer {
             Err(GlesError::BlitError)
         } else {
             if let Some(sync_point) = self.export_sync_point() {
+                #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+                {
+                    let mut reads = super::utils::buffer_read::BufferReadSet::default();
+                    reads.capture();
+                    reads.publish(&sync_point);
+                }
                 // Sync after glFlush in export_sync_point() and right before returning.
                 self.profiler.sync_gpu(&self.gl);
                 return Ok(sync_point);
@@ -1939,6 +1989,11 @@ impl Drop for GlesRenderer {
         let _guard = self.span.enter();
         unsafe {
             if self.egl.make_current().is_ok() {
+                #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+                if !self.failed_read_buffers.is_empty() {
+                    self.gl.Finish();
+                    self.failed_read_buffers.clear_completed();
+                }
                 self.gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
                 self.buffers.clear();
                 self.texture_framebuffers.clear(&self.gl);
@@ -1957,6 +2012,12 @@ impl Drop for GlesRenderer {
                 let _ = self.egl.unbind();
             } else {
                 self.profiler.cleanup(None);
+                #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+                if !self.failed_read_buffers.is_empty() {
+                    // A permanently lost context cannot prove that GPU reads completed.
+                    // Keep their release points unsignalled instead of releasing too early.
+                    std::mem::forget(std::mem::take(&mut self.failed_read_buffers));
+                }
             }
 
             if let Some(gl_debug_ptr) = self.gl_debug_span.take() {
@@ -2380,6 +2441,8 @@ impl Renderer for GlesRenderer {
             size: output_size,
             tex_program_override,
             finished: AtomicBool::new(false),
+            #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+            read_buffers: Default::default(),
 
             span,
 
@@ -2608,12 +2671,34 @@ impl Frame for GlesFrame<'_, '_> {
 impl GlesFrame<'_, '_> {
     #[profiling::function]
     fn finish_internal(&mut self) -> Result<SyncPoint, GlesError> {
-        let _guard = self.span.enter();
+        let _guard = self.span.clone().entered();
 
         if self.finished.swap(true, Ordering::SeqCst) {
             return Ok(SyncPoint::signaled());
         }
 
+        let result = self.finish_rendering();
+        #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+        if !self.read_buffers.is_empty() {
+            match &result {
+                Ok(sync) => self.read_buffers.publish(sync),
+                Err(_) => unsafe {
+                    // Commands may already have been queued when cleanup/finish fails.
+                    // Complete this context's reads before releasing any captured buffer.
+                    if self.renderer.egl.make_current().is_ok() {
+                        self.renderer.gl.Finish();
+                        self.read_buffers.clear_completed();
+                    } else {
+                        // Retry on the next renderer cleanup if context activation recovers.
+                        self.renderer.failed_read_buffers.append(&mut self.read_buffers);
+                    }
+                },
+            }
+        }
+        result
+    }
+
+    fn finish_rendering(&mut self) -> Result<SyncPoint, GlesError> {
         let finish_gpu_span = self
             .renderer
             .profiler
@@ -3031,6 +3116,9 @@ impl GlesFrame<'_, '_> {
             return Ok(());
         }
 
+        #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+        self.read_buffers.capture();
+
         //apply output transformation
         matrix = self.current_projection * matrix;
 
@@ -3249,6 +3337,9 @@ impl GlesFrame<'_, '_> {
 
         // dest position and scale
         matrix *= Mat3::from_translation(Vec2::new(dest.loc.x as f32, dest.loc.y as f32));
+
+        #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+        self.read_buffers.capture();
 
         //apply output transformation
         matrix = self.current_projection * matrix;

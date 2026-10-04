@@ -9,6 +9,9 @@ mod wayland;
 #[cfg(feature = "wayland_frontend")]
 pub use self::wayland::*;
 
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+pub(crate) mod buffer_read;
+
 /// A simple wrapper for counting commits
 ///
 /// The purpose of the counter is to keep track

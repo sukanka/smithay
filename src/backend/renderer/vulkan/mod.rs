@@ -2709,6 +2709,15 @@ impl VulkanRenderer {
             }
         }
 
+        #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+        {
+            let mut reads = super::utils::buffer_read::BufferReadSet::default();
+            reads.capture();
+            if !reads.is_empty() {
+                reads.publish(&SyncPoint::from(fence));
+            }
+        }
+
         Ok(VulkanTextureMapping {
             device: self.device.clone(),
             buffer,
@@ -2853,7 +2862,14 @@ impl Blit for VulkanRenderer {
                 *layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
             }
         }
-        Ok(SyncPoint::from(fence))
+        let sync = SyncPoint::from(fence);
+        #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+        {
+            let mut reads = super::utils::buffer_read::BufferReadSet::default();
+            reads.capture();
+            reads.publish(&sync);
+        }
+        Ok(sync)
     }
 }
 

@@ -61,6 +61,8 @@ pub struct VulkanFrame<'frame, 'buffer> {
     /// Transient descriptor sets of this frame, freed once the submission completes.
     transient_descriptor_sets: Vec<(vk::DescriptorPool, vk::DescriptorSet)>,
     finished: AtomicBool,
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    read_buffers: crate::backend::renderer::utils::buffer_read::BufferReadSet,
 }
 
 impl std::fmt::Debug for VulkanFrame<'_, '_> {
@@ -151,6 +153,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             params_bound_layout: None,
             transient_descriptor_sets: Vec::new(),
             finished: AtomicBool::new(false),
+            #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+            read_buffers: Default::default(),
         })
     }
 
@@ -258,6 +262,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     0,
                     pc.as_bytes(),
                 );
+                #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+                self.read_buffers.capture();
                 raw.cmd_draw(self.cb, 4, 1, 0, 0);
             }
         }
@@ -395,6 +401,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     0,
                     pc.as_bytes(),
                 );
+                #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+                self.read_buffers.capture();
                 raw.cmd_draw(self.cb, 4, 1, 0, 0);
             }
         }
@@ -487,6 +495,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     0,
                     pc.as_bytes(),
                 );
+                #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+                self.read_buffers.capture();
                 raw.cmd_draw(self.cb, 4, 1, 0, 0);
             }
         }
@@ -834,7 +844,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             self.renderer.recycle_params_ring(point, ring);
         }
 
-        Ok(SyncPoint::from(fence))
+        let sync = SyncPoint::from(fence);
+        #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+        self.read_buffers.publish(&sync);
+        Ok(sync)
     }
 }
 
@@ -1079,6 +1092,8 @@ impl VulkanFrame<'_, '_> {
                         z: 1,
                     },
                 ]);
+            #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+            self.read_buffers.capture();
             raw.cmd_blit_image(
                 self.cb,
                 src_image,
@@ -1395,6 +1410,8 @@ impl VulkanFrame<'_, '_> {
                     0,
                     pc.as_bytes(),
                 );
+                #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+                self.read_buffers.capture();
                 raw.cmd_draw(self.cb, 4, 1, 0, 0);
 
                 raw.cmd_end_rendering(self.cb);

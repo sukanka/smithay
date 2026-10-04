@@ -84,6 +84,77 @@ fn parameter_rings_reuse_only_completed_timeline_points() {
     renderer.recycle_params_ring(1, completed);
 }
 
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn actual_vulkan_draws_and_readback_publish_their_own_wayland_reads() {
+    use crate::backend::renderer::{
+        ImportMem,
+        utils::buffer_read::{take_published, tests::buffer},
+    };
+    let Some(mut renderer) = renderer() else { return };
+    let (_display, _socket, buffer) = buffer();
+    let source = renderer
+        .import_memory(&[255, 0, 0, 255], Fourcc::Abgr8888, (1, 1).into(), false)
+        .unwrap();
+    let mut destination: VulkanTexture = renderer.create_buffer(Fourcc::Abgr8888, (1, 1).into()).unwrap();
+    take_published();
+    {
+        let mut target = renderer.bind(&mut destination).unwrap();
+        let mut frame = renderer
+            .render(&mut target, (1, 1).into(), Transform::Normal)
+            .unwrap();
+        let rect = Rectangle::from_size((1, 1).into());
+        buffer
+            .with_read_source(|| {
+                frame.render_texture_from_to(
+                    &source,
+                    Rectangle::from_size((1., 1.).into()),
+                    rect,
+                    &[],
+                    &[],
+                    Transform::Normal,
+                    1.,
+                )
+            })
+            .unwrap();
+        assert_eq!(frame.read_buffers.len(), 0);
+        for _ in 0..4 {
+            buffer
+                .with_read_source(|| {
+                    frame.render_texture_from_to(
+                        &source,
+                        Rectangle::from_size((1., 1.).into()),
+                        rect,
+                        &[rect],
+                        &[],
+                        Transform::Normal,
+                        1.,
+                    )
+                })
+                .unwrap();
+        }
+        assert_eq!(frame.read_buffers.len(), 1);
+        drop(frame);
+    }
+    assert_eq!(pixels(&mut renderer, &destination, (1, 1)), [255, 0, 0, 255]);
+    assert_eq!(
+        take_published().len(),
+        1,
+        "offscreen/drop publishes without an output submission"
+    );
+    let mapping = buffer
+        .with_read_source(|| {
+            renderer.copy_texture(&source, Rectangle::from_size((1, 1).into()), Fourcc::Abgr8888)
+        })
+        .unwrap();
+    assert_eq!(
+        take_published().len(),
+        1,
+        "readback publishes before exposing mapped bytes"
+    );
+    assert_eq!(renderer.map_texture(&mapping).unwrap(), [255, 0, 0, 255]);
+}
+
 #[test]
 fn parameter_ring_cache_is_bounded_and_released_with_renderer() {
     let Some(mut renderer) = renderer() else {

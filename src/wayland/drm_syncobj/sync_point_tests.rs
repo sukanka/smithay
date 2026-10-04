@@ -396,6 +396,52 @@ fn scratch_reuse_preserves_incomplete_sync_files_and_timeline_points() {
 }
 
 #[test]
+fn merged_read_fences_keep_the_earlier_dependency_when_the_new_read_finishes_first() {
+    let Some((_, _device, mut files)) = setup() else {
+        return;
+    };
+    let (first, first_file) = files.pending();
+    let (second, second_file) = files.pending();
+    // Publish the later-to-complete read first, then add a new dependency which completes
+    // earlier. Replacing the previous release fence would incorrectly lose second_file.
+    let merged =
+        crate::backend::renderer::sync::sync_file::merge(second_file.as_fd(), first_file.as_fd()).unwrap();
+    assert!(!poll(&merged, 0));
+    files.signal(first);
+    assert!(poll(&first_file, 5000));
+    assert!(
+        !poll(&merged, 0),
+        "release must still wait for the other context's read"
+    );
+    files.signal(second);
+    assert!(poll(&merged, 5000));
+}
+
+#[test]
+fn explicit_buffer_release_joins_each_read_submission() {
+    let Some((_, device, mut files)) = setup() else {
+        return;
+    };
+    let (_display, _socket, implicit) = crate::backend::renderer::utils::buffer_read::tests::buffer();
+    let timeline = timeline(&device);
+    let release = point(&timeline, 1);
+    let acquire = point(&timeline, 0);
+    let buffer =
+        crate::backend::renderer::utils::Buffer::with_explicit((*implicit).clone(), acquire, release.clone());
+    let (first, first_file) = files.pending();
+    let (second, second_file) = files.pending();
+    buffer.set_release_fence(second_file.as_fd());
+    buffer.set_release_fence(first_file.as_fd());
+    drop(buffer);
+    let exported = release.export_sync_file().unwrap();
+    files.signal(first);
+    assert!(poll(&first_file, 5000));
+    assert!(!poll(&exported, 0));
+    files.signal(second);
+    assert!(poll(&exported, 5000));
+}
+
+#[test]
 fn scratch_errors_discard_old_payload_and_allow_recovery() {
     let Some((_, device, mut files)) = setup() else {
         return;

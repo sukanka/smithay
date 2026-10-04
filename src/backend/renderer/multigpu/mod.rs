@@ -552,8 +552,10 @@ impl<A: GraphicsApi> GpuManager<A> {
                                 },
                             );
 
-                            if let Err(err) = self.early_import_buffer(target, buffer, states, &buffer_damage)
-                            {
+                            let imported = buffer.with_read_source(|| {
+                                self.early_import_buffer(target, buffer, states, &buffer_damage)
+                            });
+                            if let Err(err) = imported {
                                 result = Err(err);
                             }
                         }

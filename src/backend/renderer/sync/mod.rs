@@ -6,6 +6,9 @@ use downcast_rs::{Downcast, impl_downcast};
 #[cfg(feature = "backend_egl")]
 mod egl;
 
+#[cfg(feature = "backend_drm")]
+pub(crate) mod sync_file;
+
 /// Waiting for the fence was interrupted for an unknown reason.
 ///
 /// This does not mean that the fence is signalled or not, neither that

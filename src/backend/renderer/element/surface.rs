@@ -341,6 +341,10 @@ impl<R: Renderer + ImportAll> WaylandSurfaceRenderElement<R> {
     }
 
     /// Get the buffer texture
+    ///
+    /// When sampling this texture outside [`RenderElement::draw`], keep the accompanying
+    /// [`Buffer`] alive and wrap the renderer calls in `Buffer::with_read_source` (available
+    /// with the `backend_drm` feature) to retain and publish the read dependencies.
     pub fn texture(&self) -> &WaylandSurfaceTexture<R> {
         &self.texture
     }
@@ -465,15 +469,28 @@ where
         _cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
         match self.texture {
-            WaylandSurfaceTexture::Texture(ref texture) => frame.render_texture_from_to(
-                texture,
-                src,
-                dst,
-                damage,
-                opaque_regions,
-                self.buffer_transform,
-                self.alpha,
-            ),
+            WaylandSurfaceTexture::Texture(ref texture) => {
+                let draw = || {
+                    frame.render_texture_from_to(
+                        texture,
+                        src,
+                        dst,
+                        damage,
+                        opaque_regions,
+                        self.buffer_transform,
+                        self.alpha,
+                    )
+                };
+                #[cfg(feature = "backend_drm")]
+                {
+                    self.buffer.with_read_source(draw)
+                }
+                #[cfg(not(feature = "backend_drm"))]
+                {
+                    let mut draw = draw;
+                    draw()
+                }
+            }
             WaylandSurfaceTexture::SolidColor(color) => frame.draw_solid(dst, damage, color * self.alpha),
         }
     }

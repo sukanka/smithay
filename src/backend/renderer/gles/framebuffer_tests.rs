@@ -334,3 +334,115 @@ fn scratch_framebuffer_reuses_one_object_and_detaches_textures_even_on_error() {
     renderer.cleanup().unwrap();
     assert_eq!(unsafe { renderer.gl.IsTexture(texture_id) }, ffi::FALSE);
 }
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn actual_gles_draws_track_only_their_wayland_read_sources() {
+    use crate::backend::renderer::utils::buffer_read::take_published;
+    let Some(mut renderers) = renderers(false) else {
+        return;
+    };
+    let renderer = &mut renderers[0];
+    let (_display, _socket, buffer) = crate::backend::renderer::utils::buffer_read::tests::buffer();
+    take_published();
+    let source = renderer
+        .import_memory(&[255, 0, 0, 255], Fourcc::Abgr8888, (1, 1).into(), false)
+        .unwrap();
+    let mut destination: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, (1, 1).into()).unwrap();
+    {
+        let mut target = renderer.bind(&mut destination).unwrap();
+        let mut frame = renderer
+            .render(&mut target, (1, 1).into(), Transform::Normal)
+            .unwrap();
+        let rect = Rectangle::from_size((1, 1).into());
+        buffer
+            .with_read_source(|| {
+                Frame::render_texture_from_to(
+                    &mut frame,
+                    &source,
+                    Rectangle::from_size((1., 1.).into()),
+                    rect,
+                    &[],
+                    &[],
+                    Transform::Normal,
+                    1.,
+                )
+            })
+            .unwrap();
+        assert_eq!(frame.read_buffers.len(), 0);
+        for _ in 0..4 {
+            buffer
+                .with_read_source(|| {
+                    Frame::render_texture_from_to(
+                        &mut frame,
+                        &source,
+                        Rectangle::from_size((1., 1.).into()),
+                        rect,
+                        &[rect],
+                        &[],
+                        Transform::Normal,
+                        1.,
+                    )
+                })
+                .unwrap();
+        }
+        assert_eq!(frame.read_buffers.len(), 1);
+        // An error in a later draw still leaves the earlier read dependency on the frame.
+        let invalid = GlesTexProgram::clone(&frame.renderer.tex_program);
+        let error = buffer.with_read_source(|| {
+            frame.render_texture_from_to(
+                &source,
+                Rectangle::from_size((1., 1.).into()),
+                rect,
+                &[rect],
+                &[],
+                Transform::Normal,
+                1.,
+                Some(&invalid),
+                &[Uniform::new("not_a_uniform", 1.0f32)],
+            )
+        });
+        assert!(error.is_err());
+        assert_eq!(frame.read_buffers.len(), 1);
+        // Dropping a partially drawn frame must also publish/complete its reads.
+        drop(frame);
+    }
+    check_pixel(renderer, &destination, [255, 0, 0, 255]);
+    assert_eq!(
+        take_published().len(),
+        1,
+        "offscreen/drop publishes before a later output frame"
+    );
+    let mapping = buffer
+        .with_read_source(|| {
+            renderer.copy_texture(&source, Rectangle::from_size((1, 1).into()), Fourcc::Abgr8888)
+        })
+        .unwrap();
+    assert_eq!(
+        take_published().len(),
+        1,
+        "PBO readback publishes its own completion before map_texture"
+    );
+    assert_eq!(renderer.map_texture(&mapping).unwrap(), [255, 0, 0, 255]);
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn context_cleanup_completes_retained_failed_frame_reads() {
+    let Some(mut renderers) = renderers(false) else {
+        return;
+    };
+    let renderer = &mut renderers[0];
+    let (_display, _socket, buffer) = crate::backend::renderer::utils::buffer_read::tests::buffer();
+    let mut reads = crate::backend::renderer::utils::buffer_read::BufferReadSet::default();
+    buffer.with_read_source(|| reads.capture());
+    renderer.failed_read_buffers.append(&mut reads);
+    assert_eq!(renderer.failed_read_buffers.len(), 1);
+    renderer.egl.unbind().unwrap();
+    renderer.cleanup().unwrap();
+    assert!(renderer.failed_read_buffers.is_empty());
+    assert!(
+        renderer.egl.is_current(),
+        "failed reads require context activation and completion"
+    );
+}

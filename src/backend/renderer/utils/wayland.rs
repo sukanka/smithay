@@ -74,18 +74,21 @@ impl Drop for InnerBuffer {
         #[cfg(feature = "backend_drm")]
         if let Some(release_point) = &self.release_point {
             // Materialize the release point from the fence of the last frame that read the
-            // buffer, so it signals on GPU completion; fall back to signalling directly (the
-            // buffer never reached a renderer, or the fence could not be imported).
+            // buffer, so it signals on GPU completion. A failed import must wait for that
+            // fence first; a buffer never read by a renderer can be signalled directly.
             let fence = self.release_fence.get_mut().unwrap().take();
-            let imported = fence.is_some_and(|fence| {
+            let imported = fence.as_ref().is_some_and(|fence| {
                 release_point
-                    .import_sync_file(std::os::unix::io::AsFd::as_fd(&fence))
+                    .import_sync_file(std::os::unix::io::AsFd::as_fd(fence))
                     .map_err(|err| {
                         tracing::warn!("Failed to import syncobj release fence: {}", err);
                     })
                     .is_ok()
             });
             if !imported {
+                if let Some(fence) = fence.as_ref() {
+                    crate::backend::renderer::sync::sync_file::wait(std::os::fd::AsFd::as_fd(fence));
+                }
                 if let Err(err) = release_point.signal() {
                     tracing::error!("Failed to signal syncobj release point: {}", err);
                 }
@@ -135,21 +138,50 @@ impl Buffer {
         self.inner.acquire_point.as_ref()
     }
 
-    /// Set the fence the explicit release sync point will be materialized from.
+    /// Associate synchronous renderer calls with the Wayland buffer they may sample.
     ///
-    /// Call after submitting rendering that reads the buffer, with a sync file fence for that
-    /// rendering. When the last reference to the buffer is dropped, the release point signals
-    /// through the most recently set fence — i.e. on actual GPU completion — instead of
-    /// immediately. Replacing an earlier fence is sound as long as both frames were submitted
-    /// to the same context (later submissions complete no earlier).
+    /// Standard surface elements and surface imports do this automatically. Custom code
+    /// sampling a surface texture directly should wrap its renderer calls in this scope.
+    /// GLES and Vulkan keep read dependencies with the actual submissions, including
+    /// offscreen rendering and DMA shadow copies, rather than a later output frame.
+    #[cfg(feature = "backend_drm")]
+    pub fn with_read_source<R>(&self, f: impl FnOnce() -> R) -> R {
+        super::buffer_read::with_source(self, f)
+    }
+
+    #[cfg(feature = "backend_drm")]
+    pub(super) fn read_identity(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
+    #[cfg(feature = "backend_drm")]
+    pub(super) fn add_release_fence(&self, fence: std::os::fd::BorrowedFd<'_>) -> std::io::Result<()> {
+        use crate::backend::renderer::sync::sync_file;
+        use std::os::fd::AsFd;
+        if self.inner.release_point.is_none() {
+            return Ok(());
+        }
+        let mut previous = self.inner.release_fence.lock().unwrap();
+        let next = match previous
+            .as_ref()
+            .filter(|previous| !sync_file::is_signaled(previous.as_fd()))
+        {
+            Some(previous) => sync_file::merge(previous.as_fd(), fence)?,
+            None => fence.try_clone_to_owned()?,
+        };
+        *previous = Some(next);
+        Ok(())
+    }
+
+    /// Add a completion fence to this buffer's explicit release dependency.
     ///
-    /// No-op for buffers without an explicit release point.
+    /// Independent submissions are merged, so reads from another output or shared context
+    /// cannot be lost. If merging fails, this new read is completed before returning, while
+    /// the earlier dependency is retained. No-op without an explicit release point.
     #[cfg(feature = "backend_drm")]
     pub fn set_release_fence(&self, fence: std::os::unix::io::BorrowedFd<'_>) {
-        if self.inner.release_point.is_some() {
-            if let Ok(fence) = fence.try_clone_to_owned() {
-                *self.inner.release_fence.lock().unwrap() = Some(fence);
-            }
+        if self.add_release_fence(fence).is_err() {
+            crate::backend::renderer::sync::sync_file::wait(fence);
         }
     }
 }
@@ -357,6 +389,10 @@ impl RendererSurfaceState {
     }
 
     /// Gets a reference to the texture for the specified renderer context
+    ///
+    /// Direct texture consumers must retain [`Self::buffer`] and wrap their renderer calls
+    /// in `Buffer::with_read_source` when `backend_drm` is enabled. Cloning a texture alone
+    /// does not keep the client's commit/release point alive or freeze its pixels.
     pub fn texture<T>(&self, id: ContextId<T>) -> Option<&T>
     where
         T: Texture + 'static,
@@ -553,7 +589,12 @@ where
                     return Ok(());
                 }
 
-                match renderer.import_buffer(buffer, Some(states), &buffer_damage) {
+                #[cfg(feature = "backend_drm")]
+                let imported =
+                    buffer.with_read_source(|| renderer.import_buffer(buffer, Some(states), &buffer_damage));
+                #[cfg(not(feature = "backend_drm"))]
+                let imported = renderer.import_buffer(buffer, Some(states), &buffer_damage);
+                match imported {
                     Some(Ok(m)) => {
                         e.insert(Box::new(m));
                         data.renderer_seen.insert(context_id, data.current_commit());
