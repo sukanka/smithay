@@ -89,6 +89,24 @@ impl PartialEq for State {
     }
 }
 
+fn read_crtc_flags(
+    properties: impl IntoIterator<Item = (property::Handle, property::RawValue)>,
+    active_prop: Option<property::Handle>,
+    vrr_prop: Option<property::Handle>,
+) -> (Option<bool>, Option<bool>) {
+    let mut active = None;
+    let mut vrr = None;
+    for (id, value) in properties {
+        if Some(id) == active_prop {
+            active = property::ValueType::Boolean.convert_value(value).as_boolean();
+        }
+        if Some(id) == vrr_prop {
+            vrr = property::ValueType::Boolean.convert_value(value).as_boolean();
+        }
+    }
+    (active, vrr)
+}
+
 impl State {
     fn current_state<A: DevPath + ControlDevice>(
         fd: &A,
@@ -162,16 +180,14 @@ impl State {
             let active_prop = prop_mapping.crtcs.get(&crtc).and_then(|m| m.get("ACTIVE"));
             let vrr_prop = prop_mapping.crtcs.get(&crtc).and_then(|m| m.get("VRR_ENABLED"));
             let (ids, vals) = props.as_props_and_values();
-            for (&id, &val) in ids.iter().zip(vals.iter()) {
-                if Some(&id) == active_prop {
-                    active = property::ValueType::Boolean.convert_value(val).as_boolean();
-                    break;
-                }
-                if Some(&id) == vrr_prop {
-                    vrr = property::ValueType::Boolean.convert_value(val).as_boolean();
-                    break;
-                }
-            }
+            // Both flags belong to the hardware snapshot. Stopping at the first
+            // one reports an enabled VRR output as disabled (or an active CRTC
+            // as inactive), forcing an unnecessary modeset on the next frame.
+            (active, vrr) = read_crtc_flags(
+                ids.iter().copied().zip(vals.iter().copied()),
+                active_prop.copied(),
+                vrr_prop.copied(),
+            );
         }
 
         // Read back the current color state of the connectors, so that e.g. HDR signalling
@@ -1619,7 +1635,50 @@ mod test {
         utils::{Physical, Rectangle},
     };
 
-    use super::AtomicDrmSurface;
+    use super::{AtomicDrmSurface, read_crtc_flags};
+
+    #[test]
+    fn crtc_snapshot_reads_active_and_vrr_in_either_property_order() {
+        use std::num::NonZeroU32;
+
+        use drm::control::property;
+
+        let active = property::Handle::from(NonZeroU32::new(23).unwrap());
+        let mode = property::Handle::from(NonZeroU32::new(24).unwrap());
+        let vrr = property::Handle::from(NonZeroU32::new(25).unwrap());
+        for active_value in [0, 1] {
+            for vrr_value in [0, 1] {
+                // Real drivers can enumerate MODE_ID between the two flags.
+                let properties = [(active, active_value), (mode, 853), (vrr, vrr_value)];
+                let expected = (Some(active_value != 0), Some(vrr_value != 0));
+                assert_eq!(read_crtc_flags(properties, Some(active), Some(vrr)), expected);
+                assert_eq!(
+                    read_crtc_flags(properties.into_iter().rev(), Some(active), Some(vrr)),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn crtc_snapshot_leaves_missing_flags_unknown() {
+        use std::num::NonZeroU32;
+
+        use drm::control::property;
+
+        let active = property::Handle::from(NonZeroU32::new(23).unwrap());
+        let vrr = property::Handle::from(NonZeroU32::new(25).unwrap());
+        assert_eq!(
+            read_crtc_flags([(active, 1)], Some(active), Some(vrr)),
+            (Some(true), None)
+        );
+        assert_eq!(
+            read_crtc_flags([(vrr, 1)], Some(active), Some(vrr)),
+            (None, Some(true))
+        );
+        assert_eq!(read_crtc_flags([(active, 1), (vrr, 1)], None, None), (None, None));
+        assert_eq!(read_crtc_flags([], Some(active), Some(vrr)), (None, None));
+    }
 
     fn is_send<S: Send>() {}
 
