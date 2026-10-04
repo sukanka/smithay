@@ -1453,7 +1453,9 @@ where
     /// manually updating modes using [`DrmCompositor::set_output_mode_source`].
     ///
     /// - `output_mode_source` is used to determine the current mode, scale and transform
-    /// - `surface` for the compositor to use
+    /// - `surface` for the compositor to use. A shared surface can be kept alive across
+    ///   construction failures and format probes; dropping the last owner disables its CRTC.
+    ///   Only one compositor should submit frames to a shared surface at a time.
     /// - `planes` defines which planes the compositor is allowed to use for direct scan-out.
     ///           `None` will result in the compositor to use all planes as specified by [`DrmSurface::planes`]
     /// - `allocator` used for the primary plane swapchain
@@ -1468,7 +1470,7 @@ where
     #[instrument(skip_all)]
     pub fn new(
         output_mode_source: impl Into<OutputModeSource> + Debug,
-        surface: DrmSurface,
+        surface: impl Into<Arc<DrmSurface>>,
         planes: Option<Planes>,
         mut allocator: A,
         framebuffer_exporter: F,
@@ -1477,6 +1479,7 @@ where
         cursor_size: Size<u32, BufferCoords>,
         gbm: Option<GbmDevice<G>>,
     ) -> FrameResult<Self, A, F> {
+        let surface = surface.into();
         let signaled_fence = match surface.create_syncobj(true) {
             Ok(signaled_syncobj) => match surface.syncobj_to_fd(signaled_syncobj, true) {
                 Ok(signaled_fence) => {
@@ -1506,7 +1509,6 @@ where
         let renderer_formats = renderer_formats.into_iter().collect::<Vec<_>>();
 
         let mut error = None;
-        let surface = Arc::new(surface);
         let mut planes = match planes {
             Some(planes) => planes,
             None => surface.planes().clone(),
