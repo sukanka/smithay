@@ -7,9 +7,9 @@ use glam::{Mat3, Vec2};
 use tracing::warn;
 
 use super::{
-    CleanupItem, ColorBlendParams, PARAMS_FLOATS, PushConstants, VulkanError, VulkanRenderer, VulkanTexture,
-    color_subresource_range, foreign_barrier, image_barrier, target_dmabuf_fds, target_transfer_state,
-    texture::TargetInner, transfer_prepare, transfer_restore,
+    CleanupItem, ColorBlendParams, PARAMS_FLOATS, ParamsRing, PushConstants, VulkanError, VulkanRenderer,
+    VulkanTexture, color_subresource_range, foreign_barrier, image_barrier, target_dmabuf_fds,
+    target_transfer_state, texture::TargetInner, transfer_prepare, transfer_restore,
 };
 use crate::utils::user_data::UserDataMap;
 use crate::{
@@ -21,6 +21,10 @@ use crate::{
 };
 
 use super::VulkanTarget;
+
+#[cfg(test)]
+#[path = "params_ring_tests.rs"]
+mod params_ring_tests;
 
 /// A rendering frame of the [`VulkanRenderer`].
 pub struct VulkanFrame<'frame, 'buffer> {
@@ -57,19 +61,6 @@ pub struct VulkanFrame<'frame, 'buffer> {
     /// Transient descriptor sets of this frame, freed once the submission completes.
     transient_descriptor_sets: Vec<(vk::DescriptorPool, vk::DescriptorSet)>,
     finished: AtomicBool,
-}
-
-/// Host-visible uniform buffer suballocated into per-draw parameter slots.
-struct ParamsRing {
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
-    ptr: *mut u8,
-    ds_pool: vk::DescriptorPool,
-    ds: vk::DescriptorSet,
-    /// Ring capacity in bytes.
-    capacity: u32,
-    /// Bytes used (next write starts at the aligned offset after this).
-    used: u32,
 }
 
 impl std::fmt::Debug for VulkanFrame<'_, '_> {
@@ -414,7 +405,6 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// Writes a parameter block into the ring and binds it at set 1 of the given pipeline
     /// layout for subsequent draws.
     fn bind_params_raw(&mut self, raw: &[u8], layout: vk::PipelineLayout) -> Result<(), VulkanError> {
-        const RING_SIZE: u32 = 64 * 1024;
         assert!(raw.len() as u32 <= super::PARAMS_RANGE);
 
         let align = self.renderer.params_align;
@@ -426,43 +416,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             if let Some(old) = self.params_ring.take() {
                 self.retired_params_rings.push(old);
             }
-            let (buffer, memory, ptr) = self
-                .renderer
-                .create_host_buffer(u64::from(RING_SIZE), vk::BufferUsageFlags::UNIFORM_BUFFER)?;
-            let (ds_pool, ds) = match self
-                .renderer
-                .allocate_descriptor_set(self.renderer.params_ds_layout)
-            {
-                Ok(res) => res,
-                Err(err) => {
-                    let raw_device = &self.renderer.device().raw;
-                    unsafe {
-                        raw_device.free_memory(memory, None);
-                        raw_device.destroy_buffer(buffer, None);
-                    }
-                    return Err(err);
-                }
-            };
-            let buffer_info = [vk::DescriptorBufferInfo::default()
-                .buffer(buffer)
-                .offset(0)
-                .range(u64::from(super::PARAMS_RANGE))];
-            let write = vk::WriteDescriptorSet::default()
-                .dst_set(ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
-                .buffer_info(&buffer_info);
-            unsafe { self.renderer.device().raw.update_descriptor_sets(&[write], &[]) };
-
-            self.params_ring = Some(ParamsRing {
-                buffer,
-                memory,
-                ptr: ptr as *mut u8,
-                ds_pool,
-                ds,
-                capacity: RING_SIZE,
-                used: 0,
-            });
+            self.params_ring = Some(self.renderer.acquire_params_ring()?);
         }
 
         let ring = self.params_ring.as_mut().unwrap();
@@ -874,16 +828,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 .device()
                 .defer_destroy(point, vec![CleanupItem::DescriptorSet(pool, ds)]);
         }
-        // Retire the parameter rings once the submission completes.
+        // Keep a bounded pool of mapped rings. They cannot be written again until this
+        // submission completes, including rings filled earlier in the same frame.
         for ring in self.retired_params_rings.drain(..).chain(self.params_ring.take()) {
-            self.renderer.device().defer_destroy(
-                point,
-                vec![
-                    CleanupItem::Buffer(ring.buffer),
-                    CleanupItem::Memory(ring.memory),
-                    CleanupItem::DescriptorSet(ring.ds_pool, ring.ds),
-                ],
-            );
+            self.renderer.recycle_params_ring(point, ring);
         }
 
         Ok(SyncPoint::from(fence))
@@ -958,6 +906,20 @@ impl Drop for VulkanFrame<'_, '_> {
             if let Err(err) = self.finish_internal() {
                 warn!(?err, "Error dropping unfinished vulkan frame");
             }
+        }
+
+        // finish_internal marks the frame finished before recording/submitting can fail.
+        // Successful submissions have drained these resources already. Retire leftovers
+        // conservatively after the last successful submission instead of leaking them or
+        // returning failed-frame storage to the reuse pool.
+        let point = self.renderer.timeline_point;
+        for ring in self.retired_params_rings.drain(..).chain(self.params_ring.take()) {
+            ring.defer_destroy(self.renderer.device(), point);
+        }
+        for (pool, ds) in self.transient_descriptor_sets.drain(..) {
+            self.renderer
+                .device()
+                .defer_destroy(point, vec![CleanupItem::DescriptorSet(pool, ds)]);
         }
     }
 }

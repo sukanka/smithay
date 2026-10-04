@@ -63,6 +63,9 @@ mod frame;
 mod shaders;
 mod texture;
 
+#[cfg(test)]
+mod descriptor_pool_tests;
+
 pub use custom::{
     CustomUniform, CustomUniformDecl, CustomUniformKind, CustomUniformValue, MAX_CUSTOM_PARAMS_SIZE,
     MAX_CUSTOM_TEXTURES, OwnedCustomUniform, VulkanPixelProgram, texture_bindings_glsl, uniform_block_glsl,
@@ -99,6 +102,9 @@ pub(super) struct Device {
     pub(super) external_semaphore_fd: Option<khr::external_semaphore_fd::Device>,
     pub(super) memory_props: vk::PhysicalDeviceMemoryProperties,
     cleanup: Mutex<Vec<(u64, CleanupItem)>>,
+    /// Pools outlive the renderer when textures still own descriptor sets. The mutex also
+    /// provides Vulkan's external synchronization for allocating and freeing pool contents.
+    descriptor_pools: Mutex<Vec<(vk::DescriptorPool, u32)>>,
 }
 
 impl fmt::Debug for Device {
@@ -117,8 +123,8 @@ impl Device {
         guard.extend(items.into_iter().map(|item| (point, item)));
     }
 
-    fn completed_point(&self) -> u64 {
-        unsafe { self.raw.get_semaphore_counter_value(self.timeline) }.unwrap_or(u64::MAX)
+    fn completed_point(&self) -> Result<u64, vk::Result> {
+        unsafe { self.raw.get_semaphore_counter_value(self.timeline) }
     }
 
     unsafe fn destroy_item(&self, item: CleanupItem) {
@@ -130,7 +136,18 @@ impl Device {
                 CleanupItem::Buffer(buffer) => self.raw.destroy_buffer(buffer, None),
                 CleanupItem::Semaphore(semaphore) => self.raw.destroy_semaphore(semaphore, None),
                 CleanupItem::DescriptorSet(pool, set) => {
-                    let _ = self.raw.free_descriptor_sets(pool, &[set]);
+                    let mut pools = self.descriptor_pools.lock().unwrap();
+                    match self.raw.free_descriptor_sets(pool, &[set]) {
+                        Ok(()) => {
+                            let (_, free) = pools
+                                .iter_mut()
+                                .find(|(handle, _)| *handle == pool)
+                                .expect("descriptor pool must outlive its sets");
+                            debug_assert!(*free < DESCRIPTOR_POOL_SIZE);
+                            *free += 1;
+                        }
+                        Err(err) => warn!(?err, "Failed to free Vulkan descriptor set"),
+                    }
                 }
                 CleanupItem::ShaderModule(module) => self.raw.destroy_shader_module(module, None),
             }
@@ -174,6 +191,9 @@ impl Drop for Device {
         unsafe {
             let _ = self.raw.device_wait_idle();
             self.process_cleanup(u64::MAX);
+            for (pool, _) in self.descriptor_pools.get_mut().unwrap().drain(..) {
+                self.raw.destroy_descriptor_pool(pool, None);
+            }
             self.raw.destroy_semaphore(self.timeline, None);
             self.raw.destroy_device(None);
         }
@@ -242,6 +262,32 @@ impl ColorBlendParams {
 pub(super) const PARAMS_FLOATS: usize = 28;
 /// Fixed range of the ring buffer descriptor; parameter blocks must fit inside.
 pub(super) const PARAMS_RANGE: u32 = 512;
+const PARAMS_RING_SIZE: u32 = 64 * 1024;
+const MAX_CACHED_PARAMS_RINGS: usize = 8;
+
+/// Persistently mapped parameter storage, exclusively owned by a frame or the renderer pool.
+struct ParamsRing {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    ptr: *mut u8,
+    ds_pool: vk::DescriptorPool,
+    ds: vk::DescriptorSet,
+    capacity: u32,
+    used: u32,
+}
+
+impl ParamsRing {
+    fn defer_destroy(self, device: &Device, point: u64) {
+        device.defer_destroy(
+            point,
+            vec![
+                CleanupItem::DescriptorSet(self.ds_pool, self.ds),
+                CleanupItem::Buffer(self.buffer),
+                CleanupItem::Memory(self.memory),
+            ],
+        );
+    }
+}
 
 /// Key identifying a cached graphics pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -311,6 +357,9 @@ pub struct VulkanRenderer {
     params_ds_layout: vk::DescriptorSetLayout,
     /// Minimum alignment for parameter ring offsets.
     pub(super) params_align: u32,
+    /// Parameter blocks retained with their last-use timeline point. Only completed blocks
+    /// may be acquired; the pool never waits for an in-flight block to become available.
+    params_rings: Vec<(u64, ParamsRing)>,
     /// Pipeline layouts by texture count; index 1 equals `pipeline_layout`.
     pub(super) pipeline_layouts: [vk::PipelineLayout; custom::MAX_CUSTOM_TEXTURES + 1],
     pipeline_layout: vk::PipelineLayout,
@@ -321,7 +370,6 @@ pub struct VulkanRenderer {
     shaderc: Option<shaderc::Compiler>,
     /// Samplers per (downscale, upscale) filter combination.
     samplers: HashMap<(TextureFilter, TextureFilter), vk::Sampler>,
-    descriptor_pools: Vec<(vk::DescriptorPool, u32)>,
 
     /// Timeline points to wait for on the next submission.
     pending_timeline_waits: Vec<u64>,
@@ -458,6 +506,7 @@ impl VulkanRenderer {
             external_semaphore_fd,
             memory_props,
             cleanup: Mutex::new(Vec::new()),
+            descriptor_pools: Mutex::new(Vec::new()),
         });
 
         // Query supported formats.
@@ -595,6 +644,7 @@ impl VulkanRenderer {
             texture_ds_layouts,
             params_ds_layout,
             params_align,
+            params_rings: Vec::new(),
             pipeline_layouts,
             pipeline_layout,
             pipelines: HashMap::new(),
@@ -602,7 +652,6 @@ impl VulkanRenderer {
             custom_sampler,
             shaderc: None,
             samplers,
-            descriptor_pools: Vec::new(),
             pending_timeline_waits: Vec::new(),
             pending_binary_waits: Vec::new(),
             dmabuf_textures: Vec::new(),
@@ -789,9 +838,76 @@ impl VulkanRenderer {
         &self.device
     }
 
+    fn acquire_params_ring(&mut self) -> Result<ParamsRing, VulkanError> {
+        if !self.params_rings.is_empty() {
+            // Reusing a mapping requires positive proof of completion. A failed timeline query
+            // must never authorize overwriting it.
+            let completed = self.device.completed_point()?;
+            if let Some(index) = self
+                .params_rings
+                .iter()
+                .position(|(point, _)| *point <= completed)
+            {
+                let (_, mut ring) = self.params_rings.swap_remove(index);
+                ring.used = 0;
+                return Ok(ring);
+            }
+        }
+
+        let (buffer, memory, ptr) =
+            self.create_host_buffer(u64::from(PARAMS_RING_SIZE), vk::BufferUsageFlags::UNIFORM_BUFFER)?;
+        let (ds_pool, ds) = match self.allocate_descriptor_set(self.params_ds_layout) {
+            Ok(allocation) => allocation,
+            Err(err) => {
+                unsafe {
+                    self.device.raw.destroy_buffer(buffer, None);
+                    self.device.raw.free_memory(memory, None);
+                }
+                return Err(err);
+            }
+        };
+        let buffer_info = [vk::DescriptorBufferInfo::default()
+            .buffer(buffer)
+            .offset(0)
+            .range(u64::from(PARAMS_RANGE))];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(ds)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+            .buffer_info(&buffer_info);
+        unsafe { self.device.raw.update_descriptor_sets(&[write], &[]) };
+
+        Ok(ParamsRing {
+            buffer,
+            memory,
+            ptr: ptr.cast(),
+            ds_pool,
+            ds,
+            capacity: PARAMS_RING_SIZE,
+            used: 0,
+        })
+    }
+
+    fn recycle_params_ring(&mut self, point: u64, ring: ParamsRing) {
+        if self.params_rings.len() < MAX_CACHED_PARAMS_RINGS {
+            self.params_rings.push((point, ring));
+        } else {
+            // Bound retained memory without blocking a frame that needs more storage.
+            ring.defer_destroy(&self.device, point);
+        }
+    }
+
     /// Processes deferred cleanup and recycles completed command buffers.
     fn cleanup(&mut self) {
-        let completed = self.device.completed_point();
+        let completed = match self.device.completed_point() {
+            Ok(completed) => completed,
+            Err(err) => {
+                // Failed queries (including OOM) do not prove GPU completion. Retain both
+                // command buffers and deferred resources until completion can be confirmed.
+                warn!(?err, "Unable to query Vulkan completion for resource cleanup");
+                return;
+            }
+        };
         let mut i = 0;
         while i < self.in_flight.len() {
             if self.in_flight[i].point <= completed {
@@ -1204,15 +1320,24 @@ impl VulkanRenderer {
         &mut self,
         layout: vk::DescriptorSetLayout,
     ) -> Result<(vk::DescriptorPool, vk::DescriptorSet), VulkanError> {
-        for (pool, free) in self.descriptor_pools.iter_mut() {
+        // Cached texture sets do not enter this path. Serialize actual pool allocations with
+        // timeline-completed frees, and only return capacity after vkFreeDescriptorSets succeeds.
+        let mut pools = self.device.descriptor_pools.lock().unwrap();
+        for (pool, free) in pools.iter_mut() {
             if *free > 0 {
                 let layouts = [layout];
                 let allocate_info = vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(*pool)
                     .set_layouts(&layouts);
-                if let Ok(sets) = unsafe { self.device.raw.allocate_descriptor_sets(&allocate_info) } {
-                    *free -= 1;
-                    return Ok((*pool, sets[0]));
+                match unsafe { self.device.raw.allocate_descriptor_sets(&allocate_info) } {
+                    Ok(sets) => {
+                        *free -= 1;
+                        return Ok((*pool, sets[0]));
+                    }
+                    // Pools contain both sampled-image and uniform-buffer sets, so one type
+                    // can be exhausted before max_sets is reached. A later free may restore it.
+                    Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL) => (),
+                    Err(err) => return Err(err.into()),
                 }
             }
         }
@@ -1236,8 +1361,14 @@ impl VulkanRenderer {
         let allocate_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool)
             .set_layouts(&layouts);
-        let sets = unsafe { self.device.raw.allocate_descriptor_sets(&allocate_info) }?;
-        self.descriptor_pools.push((pool, DESCRIPTOR_POOL_SIZE - 1));
+        let sets = match unsafe { self.device.raw.allocate_descriptor_sets(&allocate_info) } {
+            Ok(sets) => sets,
+            Err(err) => {
+                unsafe { self.device.raw.destroy_descriptor_pool(pool, None) };
+                return Err(err.into());
+            }
+        };
+        pools.push((pool, DESCRIPTOR_POOL_SIZE - 1));
         Ok((pool, sets[0]))
     }
 
@@ -1751,14 +1882,14 @@ impl Drop for VulkanRenderer {
             for (_, sampler) in self.samplers.drain() {
                 raw.destroy_sampler(sampler, None);
             }
-            // Drop cached textures and buffers first so their cleanup lands in the queue,
-            // then destroy the descriptor pools they reference.
+            // Drop cached textures and buffers so their cleanup lands in the queue. Pools belong
+            // to Device: external textures can outlive this renderer and release their sets later.
             self.dmabuf_textures.clear();
             self.render_buffers.clear();
-            self.device.process_cleanup(u64::MAX);
-            for (pool, _) in self.descriptor_pools.drain(..) {
-                raw.destroy_descriptor_pool(pool, None);
+            for (point, ring) in self.params_rings.drain(..) {
+                ring.defer_destroy(&self.device, point);
             }
+            self.device.process_cleanup(u64::MAX);
             raw.destroy_command_pool(self.command_pool, None);
         }
     }
