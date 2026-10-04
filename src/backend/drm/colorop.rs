@@ -517,6 +517,10 @@ impl ScanoutColorTransform {
     /// into a matrix, and is folded into a decode LUT when that keeps the LUT's output within
     /// \[0, 1\]. Among all working assignments the one using the fewest LUTs is picked, as
     /// named curves are exact and cheap.
+    /// For already-linear input, equal-cost assignments prefer a later matrix and keep the
+    /// gain with it where possible, avoiding an earlier format-conversion matrix or a
+    /// separate multiplier. Mandatory 1D LUTs disable this preference because their bounded
+    /// input may require an earlier normalization. Placement still requires hardware validation.
     ///
     /// Unused operations are bypassed; operations without a `BYPASS` property are programmed
     /// to an identity where possible (matrix, multiplier, 1D LUT). Pipelines with other
@@ -563,7 +567,21 @@ impl ScanoutColorTransform {
         };
         let mut best = None;
         let mut current = Vec::with_capacity(pipeline.ops.len());
-        plan_ops(&pipeline.ops, stages, 0, &mut current, &mut best);
+        // A mandatory identity LUT clamps values outside [0, 1]. Keep the existing early
+        // normalization in that case, rather than moving it past the LUT for linear HDR.
+        let prefer_late_linear = self.decode.is_none()
+            && !pipeline
+                .ops
+                .iter()
+                .any(|op| !op.bypassable && matches!(op.kind, ColorOpKind::Lut1D { .. }));
+        plan_ops(
+            &pipeline.ops,
+            stages,
+            prefer_late_linear,
+            0,
+            &mut current,
+            &mut best,
+        );
         best.map(|(_, plan)| plan)
     }
 }
@@ -610,6 +628,7 @@ impl PendingStages {
 fn plan_ops(
     ops: &[ColorOp],
     stages: PendingStages,
+    prefer_late_linear: bool,
     cost: u32,
     current: &mut Vec<OpPlan>,
     best: &mut Option<(u32, Vec<OpPlan>)>,
@@ -623,17 +642,22 @@ fn plan_ops(
         }
         return;
     };
-    for (plan, next, op_cost) in op_options(op, stages) {
+    for (plan, next, op_cost) in op_options(op, stages, prefer_late_linear) {
         current.push(plan);
-        plan_ops(rest, next, cost + op_cost, current, best);
+        plan_ops(rest, next, prefer_late_linear, cost + op_cost, current, best);
         current.pop();
     }
 }
 
 /// The ways a single op can be programmed given the pending stages, as (plan, remaining
-/// stages, cost), placing stages before bypassing so that equal-cost plans use the earliest
-/// ops.
-fn op_options(op: &ColorOp, stages: PendingStages) -> Vec<(OpPlan, PendingStages, u32)> {
+/// stages, cost). Stages normally precede bypassing, except linear-input matrices and gains
+/// prefer later placement. Backtracking still finds an earlier placement if required by the
+/// remaining stages, and LUT cost takes precedence over this traversal order.
+fn op_options(
+    op: &ColorOp,
+    stages: PendingStages,
+    prefer_late_linear: bool,
+) -> Vec<(OpPlan, PendingStages, u32)> {
     let mut options = Vec::with_capacity(2);
     match &op.kind {
         ColorOpKind::Curve1D { supported } => {
@@ -738,6 +762,12 @@ fn op_options(op: &ColorOp, stages: PendingStages) -> Vec<(OpPlan, PendingStages
                 options.push((OpPlan::Bypass, stages, 0));
             }
         }
+    }
+    if prefer_late_linear && matches!(op.kind, ColorOpKind::Ctm3x4 | ColorOpKind::Multiplier) {
+        // Try leaving the stages pending before consuming them. Delaying multipliers too
+        // lets a later matrix fold in the gain, rather than enabling a separate gain block
+        // (which may be implemented using an input LUT, incompatible with FP16 buffers).
+        options.reverse();
     }
     options
 }
@@ -1333,6 +1363,137 @@ mod tests {
         // The Full pipeline still rejects it: its trailing non-bypassable PQ pair is not
         // recognized as an identity.
         assert!(!resolve_any(&decode_and_gain, &[nvidia_full()]));
+    }
+
+    /// scRGB is already linear. Keep its normalization and gamut conversion together at
+    /// the final matrix, leaving the input-format matrix and input LUT blocks bypassed.
+    /// These assertions cover planning only; they do not establish hardware color accuracy.
+    #[test]
+    fn nvidia_linear_input_prefers_combined_final_matrix() {
+        let gain = 80. * 200. / 203. / 554.;
+        let scrgb = ScanoutColorTransform {
+            multiplier: gain,
+            ctm: Some(BT709_TO_BT2020),
+            ..Default::default()
+        };
+        let normalized_matrix = BT709_TO_BT2020.map(|value| value * gain);
+        assert_eq!(
+            scrgb.plan(&nvidia_lite()).unwrap(),
+            [
+                OpPlan::Bypass,
+                OpPlan::Bypass,
+                OpPlan::Bypass,
+                OpPlan::Bypass,
+                OpPlan::Ctm(normalized_matrix),
+            ]
+        );
+        assert_eq!(
+            scrgb.plan(&nvidia_fp_lite()).unwrap(),
+            [OpPlan::Bypass, OpPlan::Ctm(normalized_matrix)]
+        );
+
+        // A required earlier matrix must still be programmed to identity.
+        let mut pipeline = nvidia_fp_lite();
+        pipeline.ops[0].bypassable = false;
+        assert_eq!(
+            scrgb.plan(&pipeline).unwrap(),
+            [OpPlan::Ctm(CTM_3X4_IDENTITY), OpPlan::Ctm(normalized_matrix)]
+        );
+
+        // Normalization alone also belongs in the final matrix, not the input LUT's gain.
+        let scale = ScanoutColorTransform {
+            multiplier: gain,
+            ..Default::default()
+        };
+        assert_eq!(
+            scale.plan(&nvidia_lite()).unwrap(),
+            [
+                OpPlan::Bypass,
+                OpPlan::Bypass,
+                OpPlan::Bypass,
+                OpPlan::Bypass,
+                OpPlan::Ctm(CTM_3X4_IDENTITY.map(|value| value * gain)),
+            ]
+        );
+    }
+
+    #[test]
+    fn late_linear_matrix_stays_before_encode_and_after_decode() {
+        // Extend the Lite fixture with an encode and another matrix. That last matrix
+        // cannot take the gamut conversion: the encode would run before the conversion.
+        let mut pipeline = nvidia_lite();
+        pipeline.ops.push(curve(200, &[Curve1DType::Pq125InvEotf], false));
+        pipeline.ops.push(op(210, ColorOpKind::Ctm3x4, true));
+        let linear = ScanoutColorTransform {
+            multiplier: 0.5,
+            ctm: Some(BT709_TO_BT2020),
+            encode: Some(Curve1DType::Pq125InvEotf),
+            ..Default::default()
+        };
+        assert_eq!(
+            linear.plan(&pipeline).unwrap(),
+            [
+                OpPlan::Bypass,
+                OpPlan::Bypass,
+                OpPlan::Bypass,
+                OpPlan::Bypass,
+                OpPlan::Ctm(BT709_TO_BT2020.map(|value| value * 0.5)),
+                OpPlan::Curve(Curve1DType::Pq125InvEotf as u64),
+                OpPlan::Bypass,
+            ]
+        );
+
+        // Decoded input retains the existing named-curve, multiplier, matrix ordering;
+        // using the decode LUT is also possible, but has a higher cost.
+        let encoded = ScanoutColorTransform {
+            decode: Some(Curve1DType::Pq125Eotf),
+            ..linear
+        };
+        assert_eq!(
+            encoded.plan(&pipeline).unwrap(),
+            [
+                OpPlan::Bypass,
+                OpPlan::Curve(Curve1DType::Pq125Eotf as u64),
+                OpPlan::Bypass,
+                OpPlan::Multiplier(0.5),
+                OpPlan::Ctm(BT709_TO_BT2020),
+                OpPlan::Curve(Curve1DType::Pq125InvEotf as u64),
+                OpPlan::Bypass,
+            ]
+        );
+    }
+
+    #[test]
+    fn linear_hdr_normalization_stays_before_mandatory_lut() {
+        let pipeline = ColorPipeline {
+            id: 300,
+            ops: vec![
+                op(300, ColorOpKind::Ctm3x4, true),
+                op(
+                    310,
+                    ColorOpKind::Lut1D {
+                        size: 1024,
+                        interpolation: Lut1DInterpolation::Linear,
+                    },
+                    false,
+                ),
+                op(320, ColorOpKind::Ctm3x4, true),
+            ],
+        };
+        let normalize = ScanoutColorTransform {
+            multiplier: 0.1,
+            ..Default::default()
+        };
+        // A linear HDR pixel of 5.0 must become 0.5 before the bounded identity LUT.
+        // Delaying the matrix would instead clamp it to 1.0 and then scale it to 0.1.
+        assert_eq!(
+            normalize.plan(&pipeline).unwrap(),
+            [
+                OpPlan::Ctm(CTM_3X4_IDENTITY.map(|value| value * 0.1)),
+                OpPlan::LutIdentity,
+                OpPlan::Bypass,
+            ]
+        );
     }
 
     /// SDR content retargeted at a normalized linear intermediate (the plane half of a
