@@ -183,3 +183,180 @@ fn failed_damage_blob_creation_is_retried() {
     let value = cache.get_or_create(rects, |_| Ok(7)).unwrap();
     assert_eq!(value, Some(7));
 }
+
+struct BufferTestState;
+
+impl wayland_server::Dispatch<WlBuffer, ()> for BufferTestState {
+    fn request(
+        _: &mut Self,
+        _: &wayland_server::Client,
+        _: &WlBuffer,
+        _: <WlBuffer as Resource>::Request,
+        _: &(),
+        _: &wayland_server::DisplayHandle,
+        _: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+    }
+}
+
+fn buffer_client() -> (
+    wayland_server::Display<BufferTestState>,
+    std::os::unix::net::UnixStream,
+    wayland_server::Client,
+) {
+    let display = wayland_server::Display::new().unwrap();
+    let (client_socket, server_socket) = std::os::unix::net::UnixStream::pair().unwrap();
+    let client = display
+        .handle()
+        .insert_client(server_socket, Arc::new(()))
+        .unwrap();
+    (display, client_socket, client)
+}
+
+fn buffer_key(buffer: &WlBuffer, allow_opaque_fallback: bool) -> ElementFramebufferCacheKey {
+    ElementFramebufferCacheKey {
+        buffer: ElementFramebufferCacheBuffer::Wayland(buffer.downgrade()),
+        allow_opaque_fallback,
+    }
+}
+
+#[derive(Debug)]
+struct TestFramebuffer {
+    handle: framebuffer::Handle,
+    drops: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl AsRef<framebuffer::Handle> for TestFramebuffer {
+    fn as_ref(&self) -> &framebuffer::Handle {
+        &self.handle
+    }
+}
+
+impl Framebuffer for TestFramebuffer {
+    fn format(&self) -> DrmFormat {
+        DrmFormat {
+            code: DrmFourcc::Xrgb8888,
+            modifier: DrmModifier::Linear,
+        }
+    }
+}
+
+impl Drop for TestFramebuffer {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn cached_framebuffer(
+    id: u32,
+    drops: &Arc<std::sync::atomic::AtomicUsize>,
+) -> CachedDrmFramebuffer<TestFramebuffer> {
+    CachedDrmFramebuffer::new(DrmFramebuffer::Exporter(TestFramebuffer {
+        handle: drm::control::from_u32(id).unwrap(),
+        drops: drops.clone(),
+    }))
+}
+
+#[test]
+fn retained_framebuffer_survives_composited_frames_without_reusing_plane_failures() {
+    let (display, _socket, client) = buffer_client();
+    let handle = display.handle();
+    let buffer = client
+        .create_resource::<WlBuffer, (), BufferTestState>(&handle, 1, ())
+        .unwrap();
+    let key = buffer_key(&buffer, false);
+    let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fb = cached_framebuffer(1, &drops);
+    let mut previous = ElementState {
+        instances: SmallVec::new(),
+        fb_cache: ElementFramebufferCache::default(),
+    };
+    previous.fb_cache.insert(key.clone(), Ok(fb.clone()));
+    let mut retained = RetainedFramebufferCache::default();
+    retained.insert(key.clone(), fb.clone());
+    drop(fb);
+    // Notification/animation frames do not visit element_config(), so the element state
+    // (including all its failed-plane decisions) is dropped, while the import survives.
+    drop(previous);
+    for _ in 0..1000 {
+        retained.cleanup();
+    }
+    let recovered = retained
+        .get(&key)
+        .expect("the same live buffer must not require another import");
+    assert_eq!(u32::from(*recovered.as_ref()), 1);
+    assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+    assert!(
+        retained.get(&buffer_key(&buffer, true)).is_none(),
+        "opaque fallback is part of the key"
+    );
+    let other = client
+        .create_resource::<WlBuffer, (), BufferTestState>(&handle, 1, ())
+        .unwrap();
+    assert!(
+        retained.get(&buffer_key(&other, false)).is_none(),
+        "same-format resources are distinct"
+    );
+    let mut other_device = RetainedFramebufferCache::<TestFramebuffer>::default();
+    assert!(
+        other_device.get(&key).is_none(),
+        "imports are local to one compositor/device"
+    );
+}
+
+#[test]
+fn retained_framebuffer_is_removed_when_weak_wayland_resource_dies() {
+    let (display, _socket, client) = buffer_client();
+    let handle = display.handle();
+    let buffer = client
+        .create_resource::<WlBuffer, (), BufferTestState>(&handle, 1, ())
+        .unwrap();
+    let key = buffer_key(&buffer, false);
+    let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut retained = RetainedFramebufferCache::default();
+    retained.insert(key.clone(), cached_framebuffer(1, &drops));
+    handle
+        .backend_handle()
+        .destroy_object::<BufferTestState>(&buffer.id())
+        .unwrap();
+    assert!(!key.is_alive());
+    assert!(retained.get(&key).is_none());
+    retained.cleanup();
+    assert!(retained.entries.is_empty());
+    assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn retained_framebuffer_cache_is_bounded_and_keeps_in_flight_handles_alive() {
+    let (display, _socket, client) = buffer_client();
+    let handle = display.handle();
+    let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let first = cached_framebuffer(1, &drops);
+    let mut retained = RetainedFramebufferCache::default();
+    let buffer = client
+        .create_resource::<WlBuffer, (), BufferTestState>(&handle, 1, ())
+        .unwrap();
+    let first_key = buffer_key(&buffer, false);
+    retained.insert(first_key.clone(), first.clone());
+    for id in 2..=MAX_RETAINED_FRAMEBUFFERS as u32 + 1 {
+        let buffer = client
+            .create_resource::<WlBuffer, (), BufferTestState>(&handle, 1, ())
+            .unwrap();
+        retained.insert(buffer_key(&buffer, false), cached_framebuffer(id, &drops));
+    }
+    assert_eq!(retained.entries.len(), MAX_RETAINED_FRAMEBUFFERS);
+    assert!(retained.get(&first_key).is_none());
+    assert_eq!(
+        drops.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "an in-flight frame still owns the evicted FB"
+    );
+    drop(first);
+    assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 1);
+    retained.entries.clear();
+    assert_eq!(
+        drops.load(std::sync::atomic::Ordering::Relaxed),
+        MAX_RETAINED_FRAMEBUFFERS + 1
+    );
+}

@@ -469,6 +469,51 @@ where
     }
 }
 
+/// Successful imports survive brief composition/occlusion even when their element is not
+/// considered for a plane. Keep this separate from frame-specific failed-plane decisions.
+/// Keys are weak Wayland identities; the bounded cache belongs to just one DRM compositor.
+#[derive(Debug)]
+struct RetainedFramebufferCache<B: Framebuffer> {
+    entries: Vec<(ElementFramebufferCacheKey, CachedDrmFramebuffer<B>)>,
+}
+
+const MAX_RETAINED_FRAMEBUFFERS: usize = 8;
+
+impl<B: Framebuffer> Default for RetainedFramebufferCache<B> {
+    fn default() -> Self {
+        Self { entries: Vec::new() }
+    }
+}
+
+impl<B: Framebuffer> RetainedFramebufferCache<B> {
+    fn get(&mut self, key: &ElementFramebufferCacheKey) -> Option<CachedDrmFramebuffer<B>> {
+        if !key.is_alive() {
+            return None;
+        }
+        let index = self.entries.iter().position(|(cached, _)| cached == key)?;
+        let entry = self.entries.remove(index);
+        let framebuffer = entry.1.clone();
+        self.entries.push(entry);
+        Some(framebuffer)
+    }
+
+    fn insert(&mut self, key: ElementFramebufferCacheKey, framebuffer: CachedDrmFramebuffer<B>) {
+        if !key.is_alive() {
+            return;
+        }
+        if let Some(index) = self.entries.iter().position(|(cached, _)| *cached == key) {
+            self.entries.remove(index);
+        } else if self.entries.len() == MAX_RETAINED_FRAMEBUFFERS {
+            self.entries.remove(0);
+        }
+        self.entries.push((key, framebuffer));
+    }
+
+    fn cleanup(&mut self) {
+        self.entries.retain(|(key, _)| key.is_alive());
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct PlaneProperties {
     pub src: Rectangle<f64, BufferCoords>,
@@ -1307,6 +1352,7 @@ where
     signaled_fence: Option<Arc<OwnedFd>>,
 
     framebuffer_exporter: F,
+    retained_framebuffers: RetainedFramebufferCache<F::Framebuffer>,
 
     current_frame: CompositorFrameState<A, F>,
     pending_frame: Option<PendingFrame<A, F, U>>,
@@ -1527,6 +1573,7 @@ where
                         next_frame: None,
                         swapchain,
                         framebuffer_exporter,
+                        retained_framebuffers: RetainedFramebufferCache::default(),
                         cursor_size,
                         cursor_state,
                         surface,
@@ -1724,6 +1771,7 @@ where
             next_frame: None,
             swapchain,
             framebuffer_exporter,
+            retained_framebuffers: RetainedFramebufferCache::default(),
             cursor_size,
             cursor_state,
             surface,
@@ -2408,6 +2456,7 @@ where
         for element_state in element_states.values_mut() {
             element_state.fb_cache.cleanup();
         }
+        self.retained_framebuffers.cleanup();
         self.element_states = element_states;
         self.previous_element_states.clear();
         opaque_regions.clear();
@@ -2980,6 +3029,7 @@ where
     /// to reset it's internal state.
     pub fn reset_state(&mut self) -> Result<(), DrmError> {
         self.plane_damage_cache.get_mut().clear();
+        self.retained_framebuffers.entries.clear();
         // Re-reading hardware state can fail partway through (for example after a VT switch).
         // In that case the old frame must still not authorize skipping the next plane test.
         self.reset_pending = true;
@@ -4521,21 +4571,26 @@ where
 
         if cached_fb.is_none() {
             trace!(
-                "no cached fb, exporting new fb for element {:?} underlying storage {:?}",
+                "no per-element cached fb for element {:?} underlying storage {:?}",
                 element_id, &underlying_storage
             );
 
-            let fb = self
-                .framebuffer_exporter
-                .add_framebuffer(self.surface.device_fd(), export_buffer, allow_opaque_fallback)
-                .map_err(|err| {
-                    debug!("failed to add framebuffer: {:?}", err);
-                    ExportBufferError::ExportFailed
-                })
-                .and_then(|fb| {
-                    fb.map(|fb| CachedDrmFramebuffer::new(DrmFramebuffer::Exporter(fb)))
-                        .ok_or(ExportBufferError::Unsupported)
-                });
+            // can_add_framebuffer() was checked above, including any current device/node
+            // policy. Reusing an import must not bypass that decision.
+            let fb = if let Some(fb) = self.retained_framebuffers.get(&element_cache_key) {
+                Ok(fb)
+            } else {
+                self.framebuffer_exporter
+                    .add_framebuffer(self.surface.device_fd(), export_buffer, allow_opaque_fallback)
+                    .map_err(|err| {
+                        debug!("failed to add framebuffer: {:?}", err);
+                        ExportBufferError::ExportFailed
+                    })
+                    .and_then(|fb| {
+                        fb.map(|fb| CachedDrmFramebuffer::new(DrmFramebuffer::Exporter(fb)))
+                            .ok_or(ExportBufferError::Unsupported)
+                    })
+            };
 
             if fb.is_err() {
                 debug!(
@@ -4554,6 +4609,7 @@ where
 
         let fb: &CachedDrmFramebuffer<<F as ExportFramebuffer<<A as Allocator>::Buffer>>::Framebuffer> =
             element_fb_cache.get(&element_cache_key).unwrap()?;
+        self.retained_framebuffers.insert(element_cache_key, fb.clone());
 
         let src = element.src();
         let dst = output_transform.transform_rect_in(element_geometry, &output_geometry.size);
@@ -5190,6 +5246,7 @@ where
     pub fn clear(&mut self) -> Result<(), DrmError> {
         self.surface.clear()?;
         self.plane_damage_cache.get_mut().clear();
+        self.retained_framebuffers.entries.clear();
 
         self.current_frame
             .planes
