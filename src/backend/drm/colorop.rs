@@ -853,6 +853,71 @@ pub struct ResolvedColorPipeline {
     post_blend: Option<bool>,
 }
 
+/// Retains immutable base + CRTC gamma combinations across frames. Strong identities
+/// prevent blob or allocation address reuse from aliasing an earlier combination; the
+/// small bound also limits how many obsolete pipelines and LUTs can remain alive.
+#[derive(Debug, Default)]
+pub(super) struct GammaPipelineCache {
+    entries: Vec<GammaPipelineEntry>,
+}
+
+#[derive(Debug)]
+struct GammaPipelineEntry {
+    base: Option<Arc<ResolvedColorPipeline>>,
+    crtc: RawResourceHandle,
+    property: property::Handle,
+    lut: Option<Arc<OwnedBlob>>,
+    resolved: Arc<ResolvedColorPipeline>,
+}
+
+impl GammaPipelineCache {
+    const CAPACITY: usize = 8;
+
+    pub(super) fn resolve(
+        &mut self,
+        base: Option<&Arc<ResolvedColorPipeline>>,
+        crtc: RawResourceHandle,
+        property: property::Handle,
+        lut: Option<&Arc<OwnedBlob>>,
+    ) -> Arc<ResolvedColorPipeline> {
+        fn same<T>(a: Option<&Arc<T>>, b: Option<&Arc<T>>) -> bool {
+            match (a, b) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+        }
+        if let Some(index) = self.entries.iter().position(|entry| {
+            entry.crtc == crtc
+                && entry.property == property
+                && same(entry.base.as_ref(), base)
+                && same(entry.lut.as_ref(), lut)
+        }) {
+            let entry = self.entries.remove(index);
+            let resolved = entry.resolved.clone();
+            self.entries.push(entry);
+            return resolved;
+        }
+        let resolved = Arc::new(ResolvedColorPipeline::with_gamma_lut(
+            base.map(AsRef::as_ref),
+            crtc,
+            property,
+            lut,
+        ));
+        if self.entries.len() == Self::CAPACITY {
+            self.entries.remove(0);
+        }
+        self.entries.push(GammaPipelineEntry {
+            base: base.cloned(),
+            crtc,
+            property,
+            lut: lut.cloned(),
+            resolved: resolved.clone(),
+        });
+        resolved
+    }
+}
+
 impl ResolvedColorPipeline {
     /// The value to set the plane's `COLOR_PIPELINE` property to.
     pub(super) fn pipeline_id(&self) -> u64 {
@@ -971,6 +1036,84 @@ impl PartialEq for ResolvedColorPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gamma_pipeline_cache_reuses_combinations_and_separates_targets() {
+        let mut cache = GammaPipelineCache::default();
+        let crtc = NonZeroU32::new(1).unwrap();
+        let prop = from_u32::<property::Handle>(2).unwrap();
+        let base = Arc::new(ResolvedColorPipeline {
+            pipeline_id: 42,
+            props: vec![(crtc, prop, 123)],
+            blobs: Vec::new(),
+            post_blend: None,
+        });
+        let reset = cache.resolve(Some(&base), crtc, prop, None);
+        for _ in 0..1000 {
+            assert!(Arc::ptr_eq(&reset, &cache.resolve(Some(&base), crtc, prop, None)));
+        }
+        assert_eq!(reset.pipeline_id(), 42);
+        assert_eq!(reset.props(), &[(crtc, prop, 123), (crtc, prop, 0)]);
+        assert_eq!(reset.post_blend(), Some(false));
+        let other_crtc = NonZeroU32::new(3).unwrap();
+        let other_prop = from_u32::<property::Handle>(4).unwrap();
+        assert!(!Arc::ptr_eq(
+            &reset,
+            &cache.resolve(Some(&base), other_crtc, prop, None)
+        ));
+        assert!(!Arc::ptr_eq(
+            &reset,
+            &cache.resolve(Some(&base), crtc, other_prop, None)
+        ));
+        assert!(!Arc::ptr_eq(&reset, &cache.resolve(None, crtc, prop, None)));
+        let replacement = Arc::new(ResolvedColorPipeline {
+            pipeline_id: 43,
+            props: Vec::new(),
+            blobs: Vec::new(),
+            post_blend: None,
+        });
+        assert!(!Arc::ptr_eq(
+            &reset,
+            &cache.resolve(Some(&replacement), crtc, prop, None)
+        ));
+    }
+
+    #[test]
+    fn gamma_pipeline_cache_preserves_inflight_lut_and_bounds_retention() {
+        // No DRM device is needed: /dev/null rejects the harmless blob-destroy ioctl.
+        let fd: std::os::fd::OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let device = DrmDeviceFd::new(fd.into());
+        let crtc = NonZeroU32::new(1).unwrap();
+        let prop = from_u32::<property::Handle>(2).unwrap();
+        let mut cache = GammaPipelineCache::default();
+        let lut = Arc::new(OwnedBlob {
+            device: device.clone(),
+            id: 11,
+        });
+        let weak_lut = Arc::downgrade(&lut);
+        let inflight = cache.resolve(None, crtc, prop, Some(&lut));
+        assert_eq!(inflight.post_blend(), Some(true));
+        assert_eq!(inflight.props(), &[(crtc, prop, 11)]);
+        assert!(Arc::ptr_eq(
+            &inflight,
+            &cache.resolve(None, crtc, prop, Some(&lut))
+        ));
+        assert!(!Arc::ptr_eq(&inflight, &cache.resolve(None, crtc, prop, None)));
+        // Even the same numeric kernel blob ID cannot alias a distinct owned LUT.
+        let replacement = Arc::new(OwnedBlob { device, id: 11 });
+        assert!(!Arc::ptr_eq(
+            &inflight,
+            &cache.resolve(None, crtc, prop, Some(&replacement))
+        ));
+        drop(lut);
+        for id in 10..30 {
+            cache.resolve(None, NonZeroU32::new(id).unwrap(), prop, None);
+        }
+        assert_eq!(cache.entries.len(), GammaPipelineCache::CAPACITY);
+        assert!(weak_lut.upgrade().is_some());
+        drop(inflight);
+        assert!(weak_lut.upgrade().is_none());
+    }
 
     fn op(id: u32, kind: ColorOpKind, bypassable: bool) -> ColorOp {
         // resolve() looks up properties by name; hand every op the full set with arbitrary

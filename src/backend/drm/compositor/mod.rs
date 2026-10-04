@@ -181,7 +181,10 @@ use crate::{
 use super::{
     DrmSurface, Framebuffer, PlaneClaim, PlaneInfo, Planes,
     color::{Colorspace, ConnectorColorState},
-    colorop::{ColorPipeline, OwnedBlob, PostBlendEncode, ResolvedColorPipeline, ScanoutColorTransform},
+    colorop::{
+        ColorPipeline, GammaPipelineCache, OwnedBlob, PostBlendEncode, ResolvedColorPipeline,
+        ScanoutColorTransform,
+    },
     error::AccessError,
     exporter::{ExportBuffer, ExportFramebuffer, gbm::GbmFramebufferExporter, gbm::NodeFilter},
     surface::VrrSupport,
@@ -1395,6 +1398,7 @@ where
     post_blend_draining: bool,
     /// A bypassed primary plane pipeline that resets the CRTC gamma LUT.
     post_blend_reset: Option<Arc<ResolvedColorPipeline>>,
+    gamma_pipeline_cache: RefCell<GammaPipelineCache>,
 
     debug_flags: DebugFlags,
     span: tracing::Span,
@@ -1597,6 +1601,7 @@ where
                         post_blend: None,
                         post_blend_draining: false,
                         post_blend_reset: None,
+                        gamma_pipeline_cache: RefCell::default(),
                         supports_fencing,
                         debug_flags: DebugFlags::empty(),
                         span,
@@ -1795,6 +1800,7 @@ where
             post_blend: None,
             post_blend_draining: false,
             post_blend_reset: None,
+            gamma_pipeline_cache: RefCell::default(),
             supports_fencing,
             debug_flags: DebugFlags::empty(),
             span,
@@ -3616,12 +3622,12 @@ where
         };
         match pipeline {
             None => Some(reset.clone()),
-            Some(pipeline) => Some(Arc::new(ResolvedColorPipeline::with_gamma_lut(
+            Some(pipeline) => Some(self.gamma_pipeline_cache.borrow_mut().resolve(
                 Some(&pipeline),
                 self.surface.crtc().into(),
                 gamma_lut_prop,
                 None,
-            ))),
+            )),
         }
     }
 
@@ -3653,12 +3659,12 @@ where
         } else {
             Some(self.resolve_color_transform(primary, transform)?)
         };
-        Some(Arc::new(ResolvedColorPipeline::with_gamma_lut(
-            base.as_deref(),
+        Some(self.gamma_pipeline_cache.borrow_mut().resolve(
+            base.as_ref(),
             self.surface.crtc().into(),
             gamma_lut_prop,
             Some(&state.lut),
-        )))
+        ))
     }
 
     /// Ends draining once a frame resetting the gamma LUT has been committed.
