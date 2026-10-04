@@ -15,6 +15,10 @@ use crate::backend::drm::{DrmDeviceFd, WeakDrmDeviceFd};
 use crate::backend::renderer::sync::{Fence, Interrupted};
 use crate::wayland::compositor::{Blocker, BlockerState};
 
+#[cfg(all(test, feature = "backend_vulkan"))]
+#[path = "sync_point_tests.rs"]
+mod tests;
+
 #[derive(Debug)]
 pub(super) struct DrmTimelineInner {
     timeline_fd: OwnedFd,
@@ -46,6 +50,9 @@ impl DrmTimelineInner {
 struct DrmTimelineDeviceSpecific {
     device: WeakDrmDeviceFd,
     syncobj: drm::control::syncobj::Handle,
+    /// A binary container for converting between timeline points and sync files. Replacing
+    /// its payload does not change fences already exported or transferred to the timeline.
+    scratch: Option<drm::control::syncobj::Handle>,
     event_fds: Vec<(u64, Weak<OwnedFd>)>,
 }
 
@@ -55,19 +62,66 @@ impl DrmTimelineDeviceSpecific {
         Ok(DrmTimelineDeviceSpecific {
             device: device.downgrade(),
             syncobj,
+            scratch: None,
             event_fds: Vec::new(),
         })
     }
 
-    fn invalidate(&mut self) {
+    fn with_scratch<T>(
+        &mut self,
+        operation: impl FnOnce(
+            &DrmDeviceFd,
+            drm::control::syncobj::Handle,
+            drm::control::syncobj::Handle,
+        ) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let device = self
+            .device
+            .upgrade()
+            .ok_or::<io::Error>(io::ErrorKind::InvalidInput.into())?;
+        let scratch = if let Some(scratch) = self.scratch {
+            scratch
+        } else {
+            let scratch = device.create_syncobj(false)?;
+            self.scratch = Some(scratch);
+            scratch
+        };
+
+        // The caller holds dev_ctx throughout the replacement and subsequent export/transfer.
+        // A failed replacement must never expose the previous payload on a later operation.
+        let result = operation(&device, self.syncobj, scratch);
+        if result.is_err() {
+            self.scratch = None;
+            let _ = device.destroy_syncobj(scratch);
+        }
+        result
+    }
+
+    fn destroy_syncobjs(&mut self) {
         if let Some(device) = self.device.upgrade() {
+            if let Some(scratch) = self.scratch.take() {
+                let _ = device.destroy_syncobj(scratch);
+            }
             let _ = device.destroy_syncobj(self.syncobj);
         }
+        self.scratch = None;
         self.device = WeakDrmDeviceFd::new();
+    }
+
+    fn invalidate(&mut self) {
+        self.destroy_syncobjs();
         // trigger event fds
         for eventfd in self.event_fds.drain(..).filter_map(|(_, x)| Weak::upgrade(&x)) {
-            let _ = rustix::io::write(&eventfd, &[1]);
+            let _ = rustix::io::write(&eventfd, &1u64.to_ne_bytes());
         }
+    }
+}
+
+impl Drop for DrmTimelineDeviceSpecific {
+    fn drop(&mut self) {
+        // update_device replaces this context after rearming its eventfds on the new device.
+        // Unlike explicit invalidation, ordinary destruction must not signal those eventfds.
+        self.destroy_syncobjs();
     }
 }
 
@@ -162,35 +216,27 @@ impl DrmSyncPoint {
 
     /// Export DRM sync file for sync point.
     pub fn export_sync_file(&self) -> io::Result<OwnedFd> {
-        let ctx = self.timeline.0.dev_ctx.lock().unwrap();
-        let Some(device) = ctx.device.upgrade() else {
-            return Err(io::ErrorKind::InvalidInput.into());
-        };
-
-        let syncobj = device.create_syncobj(false)?;
-        if let Err(err) = device.syncobj_timeline_transfer(ctx.syncobj, syncobj, self.point, 0) {
-            let _ = device.destroy_syncobj(syncobj);
-            return Err(err);
-        };
-
-        let res = device.syncobj_to_fd(syncobj, true);
-        let _ = device.destroy_syncobj(syncobj);
-        res
+        let mut ctx = self.timeline.0.dev_ctx.lock().unwrap();
+        ctx.with_scratch(|device, timeline, scratch| {
+            device.syncobj_timeline_transfer(timeline, scratch, self.point, 0)?;
+            device.syncobj_to_fd(scratch, true)
+        })
     }
 
     /// Import a DRM sync file fd as the materialized fence at this
     /// timeline point. Symmetric counterpart of
     /// [`DrmSyncPoint::export_sync_file`].
     ///
-    /// Internally creates a fresh binary syncobj, imports the sync
+    /// Internally reuses a binary syncobj container, imports the sync
     /// file fence into it via the `IMPORT_SYNC_FILE` ioctl (raw
     /// because the `drm` crate's public wrapper hardcodes the
     /// destination handle to `0`, which the kernel rejects with
     /// `ENOENT` — only the two-step `drmSyncobjCreate` +
     /// `drmSyncobjImportSyncFile(existing_handle, fd)` pattern is
-    /// supported, mirroring libdrm). Then transfers the temp's
-    /// point 0 into this timeline at `self.point` and destroys the
-    /// temp.
+    /// supported, mirroring libdrm). Then transfers the container's
+    /// point 0 into this timeline at `self.point`. Importing replaces
+    /// the previous payload; already transferred fences keep their
+    /// own references. Failed operations discard the container.
     ///
     /// Mirrors `wlr_drm_syncobj_timeline_import_sync_file`. Used by
     /// compositors that drive Vulkan explicit sync via
@@ -201,40 +247,30 @@ impl DrmSyncPoint {
         use rustix::ioctl::{Updater, ioctl, opcode::read_write};
         use std::os::fd::AsRawFd;
 
-        let ctx = self.timeline.0.dev_ctx.lock().unwrap();
-        let Some(device) = ctx.device.upgrade() else {
-            return Err(io::ErrorKind::InvalidInput.into());
-        };
-
-        let tmp = device.create_syncobj(false)?;
-
         const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: rustix::ioctl::Opcode =
             read_write::<drm_ffi::drm_syncobj_handle>(drm_ffi::DRM_IOCTL_BASE, 0xC2);
 
-        let mut args = drm_ffi::drm_syncobj_handle {
-            handle: tmp.into(),
-            flags: drm_ffi::DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE,
-            fd: fd.as_raw_fd(),
-            pad: 0,
-            point: 0,
-        };
-        // SAFETY: `device.as_fd()` is a valid DRM device fd;
-        // `drm_ffi::drm_syncobj_handle` is the type expected by the
-        // DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE ioctl.
-        let res = unsafe {
-            ioctl(
-                device.as_fd(),
-                Updater::<DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, _>::new(&mut args),
-            )
-        };
-        if let Err(err) = res {
-            let _ = device.destroy_syncobj(tmp);
-            return Err(err.into());
-        }
+        let mut ctx = self.timeline.0.dev_ctx.lock().unwrap();
+        ctx.with_scratch(|device, timeline, scratch| {
+            let mut args = drm_ffi::drm_syncobj_handle {
+                handle: scratch.into(),
+                flags: drm_ffi::DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE,
+                fd: fd.as_raw_fd(),
+                pad: 0,
+                point: 0,
+            };
+            // SAFETY: `device.as_fd()` is a valid DRM device fd;
+            // `drm_ffi::drm_syncobj_handle` is the type expected by the
+            // DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE ioctl.
+            unsafe {
+                ioctl(
+                    device.as_fd(),
+                    Updater::<DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, _>::new(&mut args),
+                )
+            }?;
 
-        let res = device.syncobj_timeline_transfer(tmp, ctx.syncobj, 0, self.point);
-        let _ = device.destroy_syncobj(tmp);
-        res
+            device.syncobj_timeline_transfer(scratch, timeline, 0, self.point)
+        })
     }
 
     /// Create an [`calloop::EventSource`] and [`Blocker`] for this sync point.
