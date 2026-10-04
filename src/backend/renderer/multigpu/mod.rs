@@ -954,7 +954,7 @@ where
     dst_transform: Transform,
     size: Size<i32, Physical>,
     damage: Vec<Rectangle<i32, Physical>>,
-    sampled_dma_textures: Vec<MultiTexture>,
+    sampled_dma_textures: Vec<(MultiTexture, Dmabuf)>,
     span: tracing::span::EnteredSpan,
 }
 
@@ -1671,7 +1671,7 @@ where
                 Err(err) => {
                     // A failed finish gives no completion fence. Do not reuse these
                     // shadows for subsequent copies while earlier reads may be pending.
-                    for texture in self.sampled_dma_textures.drain(..) {
+                    for (texture, _) in self.sampled_dma_textures.drain(..) {
                         texture.discard_shadow(&render_id);
                     }
                     return Err(Error::Render(err));
@@ -1680,8 +1680,8 @@ where
 
             // A surface's DMA shadow is reused across client buffers. The source GPU
             // must wait for this consumer read before copying the next buffer into it.
-            for texture in self.sampled_dma_textures.drain(..) {
-                texture.record_read_sync(&render_id, &sync);
+            for (texture, buffer) in self.sampled_dma_textures.drain(..) {
+                texture.record_shadow_read_sync(&render_id, &buffer, &sync);
             }
 
             // now the frame is gone, lets use our unholy ptr till the end of this call:
@@ -1902,6 +1902,8 @@ enum GpuSingleTexture {
         texture: Box<dyn Any + 'static>,
         dmabuf: Dmabuf,
         sync: Option<SyncPoint>,
+        spare: Option<DmaShadowSlot>,
+        source: ErasedContextId,
     },
     Mem {
         external_shadow: Option<(Dmabuf, Box<dyn Any + 'static>)>,
@@ -2016,11 +2018,34 @@ impl MultiTexture {
         })
     }
 
+    fn shadow_buffer(&self, render_id: &ErasedContextId) -> Option<Dmabuf> {
+        match self.0.lock().unwrap().textures.get(render_id) {
+            Some(GpuSingleTexture::Dma { dmabuf, .. }) => Some(dmabuf.clone()),
+            _ => None,
+        }
+    }
+
+    fn record_shadow_read_sync(&self, render_id: &ErasedContextId, buffer: &Dmabuf, read_sync: &SyncPoint) {
+        if let Some(GpuSingleTexture::Dma {
+            dmabuf, sync, spare, ..
+        }) = self.0.lock().unwrap().textures.get_mut(render_id)
+        {
+            // Track the exact slot sampled, including if a local renderer rotated
+            // the current slot before this frame's submission completed.
+            if dmabuf == buffer {
+                *sync = Some(read_sync.clone());
+            } else if let Some((spare_buffer, _, spare_sync)) = spare {
+                if spare_buffer == buffer {
+                    *spare_sync = Some(read_sync.clone());
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn record_read_sync(&self, render_id: &ErasedContextId, read_sync: &SyncPoint) {
-        if let Some(GpuSingleTexture::Dma { sync, .. }) = self.0.lock().unwrap().textures.get_mut(render_id) {
-            // Reads on this renderer are ordered. The newest submission
-            // therefore protects all of its earlier reads of this shadow buffer.
-            *sync = Some(read_sync.clone());
+        if let Some(buffer) = self.shadow_buffer(render_id) {
+            self.record_shadow_read_sync(render_id, &buffer, read_sync);
         }
     }
 
@@ -2231,17 +2256,14 @@ where
         alpha: f32,
     ) -> Result<(), Error<R, T>> {
         let render_id = self.frame.as_mut().unwrap().context_id();
-        let is_dma_shadow = matches!(
-            texture.0.lock().unwrap().textures.get(&render_id.erased()),
-            Some(GpuSingleTexture::Dma { .. })
-        );
-        if is_dma_shadow
-            && !self
+        if let Some(buffer) = texture.shadow_buffer(&render_id.erased()) {
+            if !self
                 .sampled_dma_textures
                 .iter()
-                .any(|other| Arc::ptr_eq(&other.0, &texture.0))
-        {
-            self.sampled_dma_textures.push(texture.clone());
+                .any(|(_, other)| *other == buffer)
+            {
+                self.sampled_dma_textures.push((texture.clone(), buffer));
+            }
         }
         let sync = texture.needs_synchronization(&render_id.erased());
         if let Some(sync) = sync {
@@ -2590,6 +2612,30 @@ fn wait_for_sync(sync: &SyncPoint) {
     while sync.wait().is_err() {}
 }
 
+// Only full updates rotate slots: a partial update stays in the current slot,
+// which already contains all preceding damage. A stale spare is never sampled.
+type DmaShadowSlot = (Dmabuf, Box<dyn Any + 'static>, Option<SyncPoint>);
+const MAX_SHADOW_POOL_BYTES: usize = 128 * 1024 * 1024;
+
+fn can_rotate_shadow(
+    size: Size<i32, BufferCoords>,
+    format: Fourcc,
+    damage: Option<&[Rectangle<i32, BufferCoords>]>,
+) -> bool {
+    let full = Rectangle::from_size(size);
+    let full_update = damage.is_none_or(|damage| damage.iter().any(|region| region.contains_rect(full)));
+    full_update
+        && get_bpp(format)
+            .and_then(|bits| {
+                usize::try_from(size.w)
+                    .ok()?
+                    .checked_mul(usize::try_from(size.h).ok()?)?
+                    .checked_mul(bits.div_ceil(8))?
+                    .checked_mul(2)
+            })
+            .is_some_and(|bytes| bytes <= MAX_SHADOW_POOL_BYTES)
+}
+
 fn shadow_source_is_opaque(format: Option<Fourcc>) -> bool {
     format.is_some_and(|format| get_bpp(format).is_some() && !has_alpha(format))
 }
@@ -2597,7 +2643,7 @@ fn shadow_source_is_opaque(format: Option<Fourcc>) -> bool {
 fn dma_shadow_copy<S, T>(
     src_texture: &<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,
     damage: Option<&[Rectangle<i32, BufferCoords>]>,
-    slot: &mut Option<(Dmabuf, Box<dyn Any + 'static>, Option<SyncPoint>)>,
+    slot: &mut Option<DmaShadowSlot>,
     src: &mut S::Device,
     mut target: Option<&mut T::Device>,
     transfer_format: Option<Fourcc>,
@@ -2938,6 +2984,12 @@ where
         *target_texture = None;
     }
 
+    if matches!(target_texture, Some(GpuSingleTexture::Dma { source, .. })
+        if *source != src.renderer().context_id().erased())
+    {
+        *target_texture = None;
+    }
+
     match target_texture.take() {
         Some(GpuSingleTexture::Direct(_)) => unreachable!(),
         Some(GpuSingleTexture::Mem {
@@ -2954,6 +3006,8 @@ where
                         texture,
                         dmabuf,
                         sync,
+                        spare: None,
+                        source: src.renderer().context_id().erased(),
                     });
                     return Ok(());
                 }
@@ -3009,13 +3063,43 @@ where
             texture,
             dmabuf,
             sync,
+            mut spare,
+            source,
         }) => {
+            let rotate = can_rotate_shadow(src_texture.size(), dmabuf.format().code, damage);
             let mut slot = Some((dmabuf, texture, sync));
+            if rotate {
+                if spare.is_some() {
+                    std::mem::swap(&mut slot, &mut spare);
+                } else {
+                    // Failure to allocate a second slot is recoverable. Keep the
+                    // original slot and its consumer dependency, then copy there.
+                    let mut second = None;
+                    if dma_shadow_copy::<S, T>(src_texture, None, &mut second, src, Some(target), None)
+                        .is_ok()
+                    {
+                        spare = slot;
+                        slot = second;
+                        *target_texture = slot.map(|(dmabuf, texture, sync)| GpuSingleTexture::Dma {
+                            texture,
+                            dmabuf,
+                            sync,
+                            spare,
+                            source,
+                        });
+                        return Ok(());
+                    }
+                }
+            }
             let res = dma_shadow_copy::<S, T>(src_texture, damage, &mut slot, src, Some(target), None);
+            // The caller drops the entire pool on failure, including any slot
+            // whose last write did not yield a completion fence.
             *target_texture = slot.map(|(dmabuf, texture, sync)| GpuSingleTexture::Dma {
                 texture,
                 dmabuf,
                 sync,
+                spare,
+                source,
             });
             res
         }
@@ -3027,6 +3111,8 @@ where
                         texture: texture as Box<dyn Any + 'static>,
                         dmabuf,
                         sync,
+                        spare: None,
+                        source: src.renderer().context_id().erased(),
                     });
                     Ok(())
                 }
@@ -4299,6 +4385,8 @@ mod tests {
             texture: Box::new(()),
             dmabuf: builder.build().unwrap(),
             sync: Some(sync),
+            spare: None,
+            source: ContextId::<MultiTexture>::new().erased(),
         }
     }
 
@@ -4310,6 +4398,71 @@ mod tests {
                 modifier: Modifier::Linear,
             },
         )
+    }
+
+    #[test]
+    fn shadow_pool_only_rotates_full_updates_within_memory_limit() {
+        let size = (3840, 2160).into();
+        let full = Rectangle::from_size(size);
+        assert!(can_rotate_shadow(size, Fourcc::Xrgb8888, None));
+        assert!(can_rotate_shadow(size, Fourcc::Xrgb8888, Some(&[full])));
+        assert!(!can_rotate_shadow(size, Fourcc::Xrgb8888, Some(&[])));
+        assert!(!can_rotate_shadow(
+            size,
+            Fourcc::Xrgb8888,
+            Some(&[Rectangle::new((100, 100).into(), (200, 100).into())])
+        ));
+        assert!(!can_rotate_shadow(
+            (7680, 4320).into(),
+            Fourcc::Abgr16161616f,
+            None
+        ));
+        assert!(!can_rotate_shadow(size, Fourcc::C8, None));
+    }
+
+    #[test]
+    fn shadow_pool_records_reads_on_the_sampled_slot_after_rotation() {
+        let gpu = ContextId::<MultiTexture>::new().erased();
+        let texture = texture();
+        let mut current = shadow(fence("current producer", 0).0);
+        let old = shadow(fence("spare producer", 0).0);
+        let GpuSingleTexture::Dma {
+            dmabuf: old_buffer,
+            texture: old_texture,
+            sync: old_sync,
+            ..
+        } = old
+        else {
+            unreachable!()
+        };
+        let sampled = old_buffer.clone();
+        let GpuSingleTexture::Dma { spare, .. } = &mut current else {
+            unreachable!()
+        };
+        *spare = Some((old_buffer, old_texture, old_sync));
+        texture.0.lock().unwrap().textures.insert(gpu.clone(), current);
+        let (reader, waits) = fence("spare consumer", 2);
+        texture.record_shadow_read_sync(&gpu, &sampled, &reader);
+        assert_eq!(
+            texture
+                .needs_synchronization(&gpu)
+                .unwrap()
+                .get::<TestFence>()
+                .unwrap()
+                .name,
+            "current producer"
+        );
+        let inner = texture.0.lock().unwrap();
+        let GpuSingleTexture::Dma {
+            spare: Some((_, _, Some(sync))),
+            ..
+        } = &inner.textures[&gpu]
+        else {
+            unreachable!()
+        };
+        assert_eq!(sync.get::<TestFence>().unwrap().name, "spare consumer");
+        wait_for_sync(sync);
+        assert_eq!(waits.load(Ordering::Relaxed), 3);
     }
 
     #[test]
