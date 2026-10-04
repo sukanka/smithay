@@ -1979,6 +1979,8 @@ enum GpuSingleTexture {
         texture: Option<Box<dyn Any + 'static>>,
         mappings: Option<(DrmNode, DamageAnyTextureMappings)>,
         dma_retry: Instant,
+        staging: Option<MemoryStaging>,
+        source: Option<ErasedContextId>,
     },
 }
 
@@ -2191,7 +2193,7 @@ impl MultiTexture {
         let tex = &mut *tex_ref;
 
         let render_id = render_id.erased();
-        let (old_texture, old_mapping, external_shadow, dma_retry) = tex
+        let (old_texture, old_mapping, external_shadow, dma_retry, staging, source_context) = tex
             .textures
             .remove(&render_id)
             .map(|single| match single {
@@ -2200,10 +2202,12 @@ impl MultiTexture {
                     mappings,
                     external_shadow,
                     dma_retry,
-                } => (texture, mappings, external_shadow, dma_retry),
-                _ => (None, None, None, Instant::now()),
+                    staging,
+                    source,
+                } => (texture, mappings, external_shadow, dma_retry, staging, source),
+                _ => (None, None, None, Instant::now(), None, None),
             })
-            .unwrap_or((None, None, None, Instant::now()));
+            .unwrap_or((None, None, None, Instant::now(), None, None));
         let old_texture = old_texture.filter(|tex| {
             <dyn Any>::downcast_ref::<<<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>(tex)
                 .map(|tex| tex.size())
@@ -2244,6 +2248,8 @@ impl MultiTexture {
                 texture: old_texture,
                 external_shadow,
                 dma_retry,
+                staging,
+                source: source_context,
             },
         );
     }
@@ -2892,7 +2898,72 @@ type BoxedTextureMappingAndDamage<S> = (
 type MemTexture<S, T> = (
     Option<Vec<BoxedTextureMappingAndDamage<S>>>,
     Option<Box<<<<T as GraphicsApi>::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>>,
+    Option<MemoryStaging>,
 );
+
+/// Full-image CPU storage required by `ImportMem::update_memory`. Exported
+/// regions are tightly packed; uploading them directly with non-zero x/y would
+/// read beyond the mapping in GLES and fail Vulkan's full-image size check.
+#[derive(Debug)]
+struct MemoryStaging {
+    size: Size<i32, BufferCoords>,
+    format: Fourcc,
+    pixel_bytes: usize,
+    data: Vec<u8>,
+}
+
+impl MemoryStaging {
+    fn new(size: Size<i32, BufferCoords>, format: Fourcc) -> Option<Self> {
+        let bits = get_bpp(format)?;
+        if size.w <= 0 || size.h <= 0 || bits == 0 || bits % 8 != 0 {
+            return None;
+        }
+        let pixel_bytes = bits / 8;
+        let len = (size.w as usize)
+            .checked_mul(size.h as usize)?
+            .checked_mul(pixel_bytes)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(len).ok()?;
+        data.resize(len, 0);
+        Some(Self {
+            size,
+            format,
+            pixel_bytes,
+            data,
+        })
+    }
+
+    fn patch(&mut self, region: Rectangle<i32, BufferCoords>, packed: &[u8]) -> bool {
+        if region.loc.x < 0
+            || region.loc.y < 0
+            || region.size.w <= 0
+            || region.size.h <= 0
+            || region
+                .loc
+                .x
+                .checked_add(region.size.w)
+                .is_none_or(|right| right > self.size.w)
+            || region
+                .loc
+                .y
+                .checked_add(region.size.h)
+                .is_none_or(|bottom| bottom > self.size.h)
+        {
+            return false;
+        }
+        let row_bytes = region.size.w as usize * self.pixel_bytes;
+        if packed.len() < row_bytes * region.size.h as usize {
+            return false;
+        }
+        let stride = self.size.w as usize * self.pixel_bytes;
+        for row in 0..region.size.h as usize {
+            let start = (region.loc.y as usize + row) * stride + region.loc.x as usize * self.pixel_bytes;
+            self.data[start..start + row_bytes]
+                .copy_from_slice(&packed[row * row_bytes..(row + 1) * row_bytes]);
+        }
+        true
+    }
+}
 
 fn mem_copy<S, T>(
     src_texture: &<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,
@@ -2934,95 +3005,115 @@ where
             })
     });
 
-    if slot.is_some() {
-        let (mapping, texture) = slot.as_mut().unwrap();
-        let mappings = match mapping.take() {
-            Some(mut mappings) => {
-                mappings.retain(|(mapping, _)| TextureMapping::format(&**mapping) == format);
-
-                let damage_slice = [texture_rect];
-                let new_damage = damage
-                    .as_deref()
-                    .unwrap_or(&damage_slice)
-                    .iter()
-                    .filter(|rect| !mappings.iter().any(|(_, region)| region.contains_rect(**rect)))
-                    .copied()
-                    .collect::<Vec<_>>();
-
-                if texture.is_none()
-                    && (mappings.len() != 1
-                        || <dyn TextureMapping>::size(&*mappings[0].0) != texture_rect.size
-                        || !new_damage.is_empty())
-                {
-                    let mapping = src
-                        .renderer_mut()
-                        .copy_texture(src_texture, texture_rect, format)
-                        .map_err(Error::Render)?;
-                    trace!("Creating mapping for: {:?}", damage);
-                    mappings = vec![(Box::new(mapping), texture_rect)];
-                } else {
-                    mappings.extend(
-                        new_damage
-                            .into_iter()
-                            .map(|damage| {
-                                let mapping = src
-                                    .renderer_mut()
-                                    .copy_texture(src_texture, damage, format)
-                                    .map_err(Error::Render)?;
-                                trace!("Creating mapping for: {:?}", damage);
-                                Ok((Box::new(mapping), damage))
-                            })
-                            .collect::<Result<Vec<_>, Error<S, T>>>()?,
-                    );
-                }
-
-                mappings
+    let (pending_mappings, texture, staging) = slot.get_or_insert_with(|| (None, None, None));
+    if texture
+        .as_ref()
+        .is_some_and(|texture| texture.size() != texture_rect.size || texture.format() != Some(format))
+    {
+        *texture = None;
+        *staging = None;
+    }
+    // Continuously changing full-frame content should retain the direct mapping
+    // upload path, without an additional full-image memcpy or persistent staging.
+    // A later partial update seeds staging with one complete readback.
+    if damage
+        .as_ref()
+        .is_none_or(|damage| damage.iter().any(|region| region.contains_rect(texture_rect)))
+    {
+        let mapping = match pending_mappings.take() {
+            Some(mut mappings)
+                if mappings.len() == 1
+                    && mappings[0].1 == texture_rect
+                    && TextureMapping::format(&*mappings[0].0) == format =>
+            {
+                mappings.remove(0).0
             }
-            None => {
-                let mapping = src
-                    .renderer_mut()
+            _ => Box::new(
+                src.renderer_mut()
                     .copy_texture(src_texture, texture_rect, format)
-                    .map_err(Error::Render)?;
-                trace!("Creating mapping for: {:?}", damage);
-                vec![(Box::new(mapping), texture_rect)]
-            }
+                    .map_err(Error::Render)?,
+            ),
         };
-
-        for (mapping, damage) in mappings {
-            let data = src.renderer_mut().map_texture(&mapping).map_err(Error::Render)?;
-            if let Some(texture) = texture.as_mut() {
-                trace!(
-                    "Updating texture {:?} with mapping at {:?}",
-                    texture.size(),
-                    damage,
-                );
+        let data = src.renderer_mut().map_texture(&mapping).map_err(Error::Render)?;
+        if let Some(texture) = texture.as_ref() {
+            target
+                .renderer_mut()
+                .update_memory(texture, data, texture_rect)
+                .map_err(Error::Target)?;
+        } else {
+            *texture = Some(Box::new(
                 target
                     .renderer_mut()
-                    .update_memory(texture, data, damage)
-                    .map_err(Error::Target)?;
-            } else {
-                trace!("Importing mapping as full buffer {:?}", mapping.size());
-                let target_texture = target
-                    .renderer_mut()
                     .import_memory(data, format, texture_rect.size, false)
-                    .map_err(Error::Target)?;
-                *texture = Some(Box::new(target_texture));
-            }
+                    .map_err(Error::Target)?,
+            ));
         }
+        *staging = None;
+        return Ok(());
+    }
+    if texture.is_some()
+        && damage.as_ref().is_some_and(Vec::is_empty)
+        && pending_mappings.as_ref().is_none_or(Vec::is_empty)
+    {
+        return Ok(());
+    }
+    let initialized = texture.is_some()
+        && staging
+            .as_ref()
+            .is_some_and(|staging| staging.size == texture_rect.size && staging.format == format);
+    let mut mappings = pending_mappings.take().unwrap_or_default();
+    mappings.retain(|(mapping, region)| {
+        TextureMapping::format(&**mapping) == format
+            && mapping.size() == region.size
+            && texture_rect.contains_rect(*region)
+    });
+
+    let mut regions = if initialized {
+        damage.unwrap_or_else(|| vec![texture_rect])
     } else {
+        *staging = Some(MemoryStaging::new(texture_rect.size, format).ok_or(Error::ImportFailed)?);
+        vec![texture_rect]
+    };
+    // Bound readback/submission overhead for fragmented damage. This also avoids
+    // retaining arbitrarily many early mappings between surface commits.
+    if regions.len() + mappings.len() > MAX_CPU_COPIES {
+        regions = vec![texture_rect];
+        mappings.clear();
+    }
+    for region in regions {
+        if mappings.iter().any(|(_, mapped)| mapped.contains_rect(region)) {
+            continue;
+        }
         let mapping = src
             .renderer_mut()
-            .copy_texture(src_texture, texture_rect, format)
+            .copy_texture(src_texture, region, format)
             .map_err(Error::Render)?;
-        trace!("Importing mapping as full buffer {:?}", mapping.size());
-        let data = src.renderer_mut().map_texture(&mapping).map_err(Error::Render)?;
+        trace!(?region, "Reading CPU copy damage");
+        mappings.push((Box::new(mapping), region));
+    }
 
-        let target_texture = target
-            .renderer_mut()
-            .import_memory(data, format, texture_rect.size, false)
-            .map_err(Error::Target)?;
-        *slot = Some((None, Some(Box::new(target_texture))));
-    };
+    let staging = staging.as_mut().expect("initialized above");
+    for (mapping, region) in &mappings {
+        let data = src.renderer_mut().map_texture(mapping).map_err(Error::Render)?;
+        if !staging.patch(*region, data) {
+            return Err(Error::ImportFailed);
+        }
+    }
+    if let Some(texture) = texture.as_ref() {
+        for (_, region) in mappings {
+            target
+                .renderer_mut()
+                .update_memory(texture, &staging.data, region)
+                .map_err(Error::Target)?;
+        }
+    } else {
+        *texture = Some(Box::new(
+            target
+                .renderer_mut()
+                .import_memory(&staging.data, format, texture_rect.size, false)
+                .map_err(Error::Target)?,
+        ));
+    }
 
     Ok(())
 }
@@ -3055,6 +3146,8 @@ where
 
     if matches!(target_texture, Some(GpuSingleTexture::Dma { source, .. })
         if *source != src.renderer().context_id().erased())
+        || matches!(target_texture, Some(GpuSingleTexture::Mem { source: Some(source), .. })
+            if *source != src.renderer().context_id().erased())
     {
         *target_texture = None;
     }
@@ -3066,6 +3159,8 @@ where
             texture,
             mappings,
             mut dma_retry,
+            staging,
+            ..
         }) => {
             if dma_retry.elapsed() >= DMA_RETRY_INTERVAL {
                 dma_retry = Instant::now();
@@ -3087,10 +3182,9 @@ where
                     .map_err(Error::generalize::<T>)?;
                 external_shadow = slot.map(|(dmabuf, texture, sync_point)| {
                     if let Some(sync) = sync_point {
-                        // ignore interrupt errors
-                        src.renderer_mut().wait(&sync).unwrap_or_else(|_| {
-                            let _ = sync.wait();
-                        });
+                        src.renderer_mut()
+                            .wait(&sync)
+                            .unwrap_or_else(|_| wait_for_sync(&sync));
                     }
                     (dmabuf, texture)
                 });
@@ -3100,7 +3194,8 @@ where
                 mappings.map(|(_, mappings)| mappings.into_iter().map(|(damage, mapping)|
                     (mapping.downcast::<<<S::Device as ApiDevice>::Renderer as ExportMem>::TextureMapping>().unwrap(), damage)
                 ).collect::<Vec<_>>()),
-                texture.map(|texture| texture.downcast::<<<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>().unwrap())
+                texture.map(|texture| texture.downcast::<<<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>().unwrap()),
+                staging,
             ));
 
             let src_texture = external_shadow
@@ -3112,9 +3207,11 @@ where
                 })
                 .unwrap_or(src_texture);
             let res = mem_copy::<S, T>(src_texture, damage, &mut slot, src, target);
-            *target_texture = slot.map(|(mappings, texture)| GpuSingleTexture::Mem {
+            *target_texture = slot.map(|(mappings, texture, staging)| GpuSingleTexture::Mem {
                 external_shadow,
                 dma_retry,
+                staging,
+                source: Some(src.renderer().context_id().erased()),
                 texture: texture.map(|texture| texture as Box<dyn Any + 'static>),
                 mappings: mappings.map(|mappings| {
                     (
@@ -3195,10 +3292,9 @@ where
                             .map_err(Error::generalize::<T>)?;
                         external_shadow = slot.map(|(dmabuf, texture, sync_point)| {
                             if let Some(sync) = sync_point {
-                                // ignore interrupt errors
-                                src.renderer_mut().wait(&sync).unwrap_or_else(|_| {
-                                    let _ = sync.wait();
-                                });
+                                src.renderer_mut()
+                                    .wait(&sync)
+                                    .unwrap_or_else(|_| wait_for_sync(&sync));
                             }
                             (dmabuf, texture as Box<dyn Any + 'static>)
                         });
@@ -3229,10 +3325,9 @@ where
                             .map_err(Error::generalize::<T>)?;
                             external_shadow = dma_slot.map(|(dmabuf, texture, sync_point)| {
                                 if let Some(sync) = sync_point {
-                                    // ignore interrupt errors
-                                    src.renderer_mut().wait(&sync).unwrap_or_else(|_| {
-                                        let _ = sync.wait();
-                                    });
+                                    src.renderer_mut()
+                                        .wait(&sync)
+                                        .unwrap_or_else(|_| wait_for_sync(&sync));
                                 }
                                 (dmabuf, texture as Box<dyn Any + 'static>)
                             });
@@ -3248,7 +3343,7 @@ where
                         }
                     };
 
-                    *target_texture = slot.map(|(mappings, texture)| GpuSingleTexture::Mem {
+                    *target_texture = slot.map(|(mappings, texture, staging)| GpuSingleTexture::Mem {
                         texture: texture.map(|texture| texture as Box<dyn Any + 'static>),
                         mappings: mappings.map(|mappings| {
                             (
@@ -3261,6 +3356,8 @@ where
                         }),
                         external_shadow,
                         dma_retry: Instant::now(),
+                        staging,
+                        source: Some(src.renderer().context_id().erased()),
                     });
                     res
                 }
@@ -4294,6 +4391,9 @@ where
     }
 }
 
+#[cfg(all(test, feature = "renderer_gl", feature = "backend_egl"))]
+mod copy_tests;
+
 #[cfg(test)]
 mod tests {
     use std::os::fd::OwnedFd;
@@ -4321,6 +4421,39 @@ mod tests {
             target: ContextId::<MultiTexture>::new().erased(),
             size: (3840, 2160).into(),
             format: Fourcc::Xrgb2101010,
+        }
+    }
+
+    #[test]
+    fn packed_cpu_regions_preserve_full_image_stride_and_untouched_pixels() {
+        for (format, bytes) in [(Fourcc::Abgr8888, 4), (Fourcc::Abgr16161616f, 8)] {
+            let mut staging = MemoryStaging::new((6, 5).into(), format).unwrap();
+            staging.data.fill(7);
+            let first = Rectangle::new((1, 1).into(), (2, 2).into());
+            let second = Rectangle::new((4, 3).into(), (1, 1).into());
+            assert!(staging.patch(first, &vec![11; 4 * bytes]));
+            assert!(staging.patch(second, &vec![19; bytes]));
+            for y in 0..5 {
+                for x in 0..6 {
+                    let expected = if first.contains((x, y)) {
+                        11
+                    } else if second.contains((x, y)) {
+                        19
+                    } else {
+                        7
+                    };
+                    assert_eq!(
+                        &staging.data[((y * 6 + x) as usize * bytes)..((y * 6 + x + 1) as usize * bytes)],
+                        &vec![expected; bytes]
+                    );
+                }
+            }
+            let snapshot = staging.data.clone();
+            assert!(!staging.patch(first, &[0]));
+            assert!(!staging.patch(Rectangle::new((5, 4).into(), (2, 2).into()), &[0; 128]));
+            assert_eq!(staging.data, snapshot);
+            assert!(staging.patch(Rectangle::new((2, 2).into(), (1, 1).into()), &vec![23; bytes]));
+            assert_eq!(&staging.data[(14 * bytes)..(15 * bytes)], &vec![23; bytes]);
         }
     }
 
