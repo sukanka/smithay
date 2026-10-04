@@ -238,10 +238,17 @@ impl<A: GraphicsApi> GpuManager<A> {
         })
     }
 
+    fn enumerate_devices(&mut self) -> Result<(), A::Error> {
+        let result = self.api.enumerate(&mut self.devices);
+        let nodes: Vec<_> = self.devices.iter().map(|device| *device.node()).collect();
+        retain_live_buffer_pairs(&mut self.dmabuf_cache, &nodes);
+        result
+    }
+
     /// Get all devices enumerated by the API.
     pub fn devices(&mut self) -> Result<impl Iterator<Item = &A::Device>, A::Error> {
         if self.api.needs_enumeration() {
-            self.api.enumerate(&mut self.devices)?;
+            self.enumerate_devices()?;
         }
         Ok(self.devices.iter())
     }
@@ -249,7 +256,7 @@ impl<A: GraphicsApi> GpuManager<A> {
     /// Get all devices enumerated by the API.
     pub fn devices_mut(&mut self) -> Result<impl Iterator<Item = &mut A::Device>, A::Error> {
         if self.api.needs_enumeration() {
-            self.api.enumerate(&mut self.devices)?;
+            self.enumerate_devices()?;
         }
         Ok(self.devices.iter_mut())
     }
@@ -296,9 +303,7 @@ impl<A: GraphicsApi> GpuManager<A> {
         device: &DrmNode,
     ) -> Result<MultiRenderer<'api, 'api, A, A>, Error<A, A>> {
         if !self.devices.iter().any(|dev| dev.node() == device) || self.api.needs_enumeration() {
-            self.api
-                .enumerate(&mut self.devices)
-                .map_err(Error::RenderApiError)?;
+            self.enumerate_devices().map_err(Error::RenderApiError)?;
         }
 
         if !self.devices.iter().any(|dev| dev.node() == device) {
@@ -343,9 +348,7 @@ impl<A: GraphicsApi> GpuManager<A> {
             || !self.devices.iter().any(|device| device.node() == target_device)
             || self.api.needs_enumeration()
         {
-            self.api
-                .enumerate(&mut self.devices)
-                .map_err(Error::RenderApiError)?;
+            self.enumerate_devices().map_err(Error::RenderApiError)?;
         }
 
         if !self.devices.iter().any(|device| device.node() == render_device) {
@@ -371,6 +374,7 @@ impl<A: GraphicsApi> GpuManager<A> {
                     cached_buffer: self
                         .dmabuf_cache
                         .entry((*render_device, *target_device))
+                        .and_modify(|cache| cache.foreign_source = false)
                         .or_default(),
                     format: copy_format,
                 }),
@@ -413,10 +417,15 @@ impl<A: GraphicsApi> GpuManager<A> {
             .any(|device| device.node() == render_device)
             || render_api.api.needs_enumeration()
         {
-            render_api
-                .api
-                .enumerate(&mut render_api.devices)
-                .map_err(Error::RenderApiError)?;
+            // This cache lives on the target manager, so also retire pairs whose
+            // source was removed from the separate render manager.
+            let previous_nodes: Vec<_> = render_api.devices.iter().map(|device| *device.node()).collect();
+            let result = render_api.enumerate_devices();
+            target_api.dmabuf_cache.retain(|(source, _), _| {
+                !previous_nodes.contains(source)
+                    || render_api.devices.iter().any(|device| device.node() == source)
+            });
+            result.map_err(Error::RenderApiError)?;
         }
 
         if !target_api
@@ -425,10 +434,7 @@ impl<A: GraphicsApi> GpuManager<A> {
             .any(|device| device.node() == target_device)
             || target_api.api.needs_enumeration()
         {
-            target_api
-                .api
-                .enumerate(&mut target_api.devices)
-                .map_err(Error::TargetApiError)?;
+            target_api.enumerate_devices().map_err(Error::TargetApiError)?;
         }
 
         if !render_api
@@ -464,7 +470,11 @@ impl<A: GraphicsApi> GpuManager<A> {
                     cached_buffer: target_api
                         .dmabuf_cache
                         .entry((*render_device, *target_device))
-                        .or_default(),
+                        .and_modify(|cache| cache.foreign_source = true)
+                        .or_insert_with(|| SharedBufferCache {
+                            foreign_source: true,
+                            ..Default::default()
+                        }),
                     format: copy_format,
                 }),
                 other_renderers: others,
@@ -1483,7 +1493,18 @@ const MAX_SHARED_BUFFER_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 struct SharedBufferCache {
+    // cross_renderer owns its source in another GpuManager.
+    foreign_source: bool,
     entries: Vec<(LayoutKey, Option<(bool, Dmabuf, Instant)>)>,
+}
+
+fn retain_live_buffer_pairs<N: std::hash::Hash + Eq>(
+    cache: &mut HashMap<(N, N), SharedBufferCache>,
+    nodes: &[N],
+) {
+    cache.retain(|(source, target), buffers| {
+        nodes.contains(target) && (buffers.foreign_source || nodes.contains(source))
+    });
 }
 
 impl SharedBufferCache {
@@ -4455,6 +4476,38 @@ mod tests {
             assert!(staging.patch(Rectangle::new((2, 2).into(), (1, 1).into()), &vec![23; bytes]));
             assert_eq!(&staging.data[(14 * bytes)..(15 * bytes)], &vec![23; bytes]);
         }
+    }
+
+    #[test]
+    fn hotplug_releases_removed_pairs_but_preserves_live_and_foreign_sources() {
+        let mut cache = HashMap::new();
+        for pair in [(1, 2), (2, 1), (1, 3), (3, 1), (9, 1)] {
+            let mut buffers = SharedBufferCache {
+                foreign_source: pair.0 == 9,
+                ..Default::default()
+            };
+            buffers.select(layout_key());
+            let GpuSingleTexture::Dma { dmabuf, .. } = shadow(SyncPoint::signaled()) else {
+                unreachable!()
+            };
+            *buffers.current_mut() = Some((true, dmabuf, Instant::now()));
+            cache.insert(pair, buffers);
+        }
+        let live = cache[&(1, 2)].current().as_ref().unwrap().1.weak();
+        let removed_source = cache[&(3, 1)].current().as_ref().unwrap().1.weak();
+        let removed_target = cache[&(1, 3)].current().as_ref().unwrap().1.weak();
+        retain_live_buffer_pairs(&mut cache, &[1, 2]);
+        assert_eq!(cache.len(), 3);
+        assert!(!live.is_gone());
+        assert!(removed_source.is_gone());
+        assert!(removed_target.is_gone());
+        assert!(
+            cache.contains_key(&(9, 1)),
+            "foreign source is owned by the other API"
+        );
+        retain_live_buffer_pairs(&mut cache, &[2]);
+        assert!(cache.is_empty());
+        assert!(live.is_gone());
     }
 
     #[test]
