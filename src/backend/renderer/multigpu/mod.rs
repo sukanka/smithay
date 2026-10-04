@@ -1561,6 +1561,9 @@ impl SharedBufferCache {
 struct LayoutResult {
     preferred: Option<Modifier>,
     rejected: Vec<Modifier>,
+    // Resume the bounded search by modifier identity, without retaining an
+    // unbounded copy of the capability list between calls.
+    next_modifier: Option<Modifier>,
 }
 
 thread_local! {
@@ -1580,20 +1583,50 @@ fn try_layouts<V, E>(
             .map(|index| cache.remove(index).1)
             .unwrap_or_default()
     });
-    let mut ordered = Vec::new();
-    if let Some(preferred) = previous.preferred.filter(|modifier| modifiers.contains(modifier)) {
-        ordered.push(preferred);
-    }
+    let mut available = Vec::new();
     for modifier in modifiers {
-        if *modifier != Modifier::Invalid
-            && !ordered.contains(modifier)
-            && !previous.rejected.contains(modifier)
-        {
-            ordered.push(*modifier);
+        if *modifier != Modifier::Invalid && !available.contains(modifier) {
+            available.push(*modifier);
+        }
+    }
+    previous.preferred = previous
+        .preferred
+        .filter(|modifier| available.contains(modifier) && !previous.rejected.contains(modifier));
+    // Capability enumeration may reorder the same set on every call. A stable
+    // ring order ensures that advancing the cursor cannot starve its tail even
+    // then. Start the first search at the allocator's first advertised candidate.
+    let resume = previous.next_modifier.or_else(|| available.first().copied());
+    available.sort_unstable_by_key(|modifier| u64::from(*modifier));
+    let start = resume
+        .and_then(|modifier| {
+            available
+                .iter()
+                .position(|candidate| u64::from(*candidate) >= u64::from(modifier))
+        })
+        // If the saved candidate disappears, use its numeric successor, wrapping
+        // when it was beyond the remaining set; do not restart at an array index.
+        .unwrap_or(0);
+    let mut ordered = Vec::with_capacity(MAX_LAYOUT_ATTEMPTS);
+    if let Some(preferred) = previous.preferred {
+        // A successful cached layout does not disturb the search cursor. If it
+        // fails, use the remaining budget to continue through other candidates.
+        ordered.push((preferred, None));
+    }
+    for offset in 0..available.len() {
+        let index = (start + offset) % available.len();
+        let modifier = available[index];
+        if Some(modifier) != previous.preferred && !previous.rejected.contains(&modifier) {
+            ordered.push((modifier, Some((index + 1) % available.len())));
+            if ordered.len() == MAX_LAYOUT_ATTEMPTS {
+                break;
+            }
         }
     }
     let mut result = Err(None);
-    for modifier in ordered.into_iter().take(MAX_LAYOUT_ATTEMPTS) {
+    for (modifier, next_index) in ordered {
+        if let Some(next_index) = next_index {
+            previous.next_modifier = Some(available[next_index]);
+        }
         match attempt(modifier) {
             Ok(value) => {
                 previous.preferred = Some(modifier);
@@ -4627,6 +4660,233 @@ mod tests {
             Ok(())
         );
         assert_eq!(attempts, [Modifier::Linear]);
+    }
+
+    #[test]
+    fn layout_probe_reaches_the_seventeenth_candidate_on_the_next_round() {
+        let key = layout_key();
+        let modifiers: Vec<_> = (0..32).map(Modifier::from).collect();
+        let mut attempts = Vec::new();
+        for expected in [Err(Some(())), Ok(())] {
+            attempts.clear();
+            assert_eq!(
+                try_layouts(key.clone(), &modifiers, |modifier| {
+                    attempts.push(modifier);
+                    if modifier == modifiers[16] {
+                        Ok(())
+                    } else {
+                        Err(((), false))
+                    }
+                }),
+                expected,
+            );
+            if expected.is_err() {
+                assert_eq!(attempts, modifiers[..16]);
+            } else {
+                assert_eq!(attempts, [modifiers[16]]);
+            }
+        }
+        // Once found, the late candidate has the same fast path as an early one.
+        attempts.clear();
+        assert_eq!(
+            try_layouts(key, &modifiers, |modifier| {
+                attempts.push(modifier);
+                Ok::<_, ((), bool)>(())
+            }),
+            Ok(())
+        );
+        assert_eq!(attempts, [modifiers[16]]);
+    }
+
+    #[test]
+    fn layout_probe_fairly_retries_every_transient_failure() {
+        let key = layout_key();
+        let modifiers: Vec<_> = (0..41).map(Modifier::from).collect();
+        let mut attempts = Vec::new();
+        for round in 0..6 {
+            // Reordering the same capability set must not erase progress either.
+            let mut advertised = modifiers.clone();
+            advertised.rotate_left((round * 7) % modifiers.len());
+            if round % 2 != 0 {
+                advertised.reverse();
+            }
+            let before = attempts.len();
+            assert_eq!(
+                try_layouts::<(), _>(key.clone(), &advertised, |modifier| {
+                    attempts.push(modifier);
+                    Err((std::io::ErrorKind::OutOfMemory, false))
+                }),
+                Err(Some(std::io::ErrorKind::OutOfMemory))
+            );
+            assert_eq!(attempts.len() - before, MAX_LAYOUT_ATTEMPTS);
+        }
+        // More than two complete passes: a failed prefix can neither starve the
+        // tail nor become permanently blacklisted by temporary resource pressure.
+        assert_eq!(&attempts[..modifiers.len() * 2], modifiers.repeat(2));
+        for (index, modifier) in attempts.iter().enumerate() {
+            assert_eq!(*modifier, modifiers[index % modifiers.len()]);
+        }
+    }
+
+    #[test]
+    fn failed_preferred_layout_preserves_progress_and_the_round_budget() {
+        let key = layout_key();
+        let modifiers: Vec<_> = (0..32).map(Modifier::from).collect();
+        let mut attempts = Vec::new();
+        for expected in [Err(Some(())), Ok(())] {
+            assert_eq!(
+                try_layouts(key.clone(), &modifiers, |modifier| {
+                    if modifier == modifiers[27] {
+                        Ok(())
+                    } else {
+                        Err(((), false))
+                    }
+                }),
+                expected
+            );
+        }
+        // A later cached-layout failure should resume at 28, not restart at 0
+        // or reset progress to the preferred layout's position every round.
+        for _ in 0..2 {
+            let before = attempts.len();
+            assert_eq!(
+                try_layouts::<(), _>(key.clone(), &modifiers, |modifier| {
+                    attempts.push(modifier);
+                    Err(((), false))
+                }),
+                Err(Some(()))
+            );
+            assert_eq!(attempts.len() - before, MAX_LAYOUT_ATTEMPTS);
+        }
+        assert_eq!(attempts[0], modifiers[27]);
+        let expected: Vec<_> = modifiers[27..].iter().chain(&modifiers[..27]).copied().collect();
+        assert_eq!(attempts, expected);
+        // Even the now-failed preferred candidate remains retryable next pass.
+        attempts.clear();
+        assert_eq!(
+            try_layouts(key, &modifiers, |modifier| {
+                attempts.push(modifier);
+                Ok::<_, ((), bool)>(())
+            }),
+            Ok(())
+        );
+        assert_eq!(attempts, [modifiers[27]]);
+    }
+
+    #[test]
+    fn layout_progress_survives_reordered_candidates_and_removed_preference() {
+        let key = layout_key();
+        let modifiers: Vec<_> = (0..32).map(Modifier::from).collect();
+        assert!(try_layouts::<(), _>(key.clone(), &modifiers, |_| Err(((), false))).is_err());
+        let mut reordered = modifiers.clone();
+        reordered.reverse();
+        let mut attempts = Vec::new();
+        assert_eq!(
+            try_layouts(key.clone(), &reordered, |modifier| {
+                attempts.push(modifier);
+                Ok::<_, ((), bool)>(())
+            }),
+            Ok(())
+        );
+        assert_eq!(attempts, [modifiers[16]], "the next identity survives reordering");
+        // Remove both a cached success and an unrelated earlier candidate.
+        reordered.retain(|modifier| *modifier != modifiers[16] && *modifier != modifiers[31]);
+        reordered.insert(0, Modifier::from(100));
+        attempts.clear();
+        assert_eq!(
+            try_layouts(key, &reordered, |modifier| {
+                attempts.push(modifier);
+                Ok::<_, ((), bool)>(())
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            attempts,
+            [modifiers[17]],
+            "a removed preference must not reset the cursor"
+        );
+    }
+
+    #[test]
+    fn layout_progress_handles_removed_cursor_new_candidates_and_context_reset() {
+        let key = layout_key();
+        let modifiers: Vec<_> = (0..32).map(Modifier::from).collect();
+        assert!(
+            try_layouts::<(), _>(key.clone(), &modifiers, |modifier| {
+                Err(((), modifiers[..4].contains(&modifier)))
+            })
+            .is_err()
+        );
+        // The next identity (16) disappears, along with an earlier candidate.
+        // Continue at its successor instead of retrying the old prefix.
+        let mut changed: Vec<_> = modifiers
+            .iter()
+            .copied()
+            .filter(|modifier| *modifier != modifiers[5] && *modifier != modifiers[16])
+            .collect();
+        let added = Modifier::from(100);
+        changed.insert(0, added);
+        changed.extend([added, Modifier::Invalid]);
+        let mut attempts = Vec::new();
+        for _ in 0..2 {
+            let before = attempts.len();
+            assert!(
+                try_layouts::<(), _>(key.clone(), &changed, |modifier| {
+                    attempts.push(modifier);
+                    Err(((), false))
+                })
+                .is_err()
+            );
+            let round = &attempts[before..];
+            assert_eq!(round.len(), MAX_LAYOUT_ATTEMPTS);
+            let unique: std::collections::HashSet<_> = round.iter().collect();
+            assert_eq!(
+                unique.len(),
+                round.len(),
+                "duplicate advertisements get only one attempt per round"
+            );
+        }
+        assert_eq!(attempts[0], modifiers[17]);
+        assert!(!attempts.iter().any(|modifier| modifiers[..4].contains(modifier)));
+        let visited: std::collections::HashSet<_> = attempts.iter().copied().collect();
+        let expected: std::collections::HashSet<_> = changed
+            .iter()
+            .copied()
+            .filter(|modifier| *modifier != Modifier::Invalid && !modifiers[..4].contains(modifier))
+            .collect();
+        assert_eq!(visited, expected);
+        assert_eq!(
+            try_layouts::<(), ()>(key.clone(), &[Modifier::Invalid], |_| {
+                panic!("an empty eligible set must not invoke the allocator");
+            }),
+            Err(None)
+        );
+
+        // A new source or target context inherits neither cursor nor rejections.
+        for new_key in [
+            LayoutKey {
+                source: ContextId::<MultiTexture>::new().erased(),
+                ..key.clone()
+            },
+            LayoutKey {
+                target: ContextId::<MultiTexture>::new().erased(),
+                ..key
+            },
+        ] {
+            attempts.clear();
+            assert_eq!(
+                try_layouts(new_key, &changed, |modifier| {
+                    attempts.push(modifier);
+                    if modifier == modifiers[0] {
+                        Ok(())
+                    } else {
+                        Err(((), false))
+                    }
+                }),
+                Ok(())
+            );
+            assert_eq!(attempts, [added, modifiers[0]]);
+        }
     }
 
     #[test]
