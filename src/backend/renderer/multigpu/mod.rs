@@ -42,9 +42,11 @@
 use aliasable::boxed::AliasableBox;
 use std::{
     any::Any,
+    cell::RefCell,
     collections::HashMap,
     fmt,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use super::{
@@ -66,7 +68,7 @@ use crate::{
         allocator::{
             Allocator, Buffer as BufferTrait, Format, Fourcc, Modifier,
             dmabuf::{AnyError, Dmabuf},
-            format::{FormatSet, get_bpp},
+            format::{FormatSet, get_bpp, get_depth, has_alpha},
         },
         drm::DrmNode,
         renderer::FrameContext,
@@ -88,7 +90,7 @@ pub mod vulkan;
 pub struct GpuManager<A: GraphicsApi> {
     api: A,
     devices: Vec<A::Device>,
-    dmabuf_cache: HashMap<(DrmNode, DrmNode), Option<(bool, Dmabuf)>>,
+    dmabuf_cache: HashMap<(DrmNode, DrmNode), Option<(bool, Dmabuf, Instant)>>,
     span: tracing::Span,
 }
 
@@ -958,7 +960,7 @@ where
 
 struct TargetData<'target, T: GraphicsApi> {
     device: &'target mut T::Device,
-    cached_buffer: &'target mut Option<(bool, Dmabuf)>,
+    cached_buffer: &'target mut Option<(bool, Dmabuf, Instant)>,
     format: Fourcc,
 }
 
@@ -1235,16 +1237,29 @@ where
         let target_state = if let Some(target) = self.target.as_mut() {
             let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
 
-            if let Some((_, dmabuf)) = &target.cached_buffer {
+            if let Some((_, dmabuf, _)) = &target.cached_buffer {
                 if dmabuf.size() != buffer_size || BufferTrait::format(dmabuf).code != target.format {
                     *target.cached_buffer = None;
                 }
             };
 
+            // A transient failure must not pin the CPU path forever. Preserve
+            // the existing fallback buffer if renegotiation still fails.
+            if target
+                .cached_buffer
+                .as_ref()
+                .is_some_and(|(direct, _, attempted)| !direct && attempted.elapsed() >= DMA_RETRY_INTERVAL)
+            {
+                match create_shared_dma_framebuffer::<R, T>(buffer_size, self.render, target) {
+                    Ok(dmabuf) => *target.cached_buffer = Some((true, dmabuf, Instant::now())),
+                    Err(_) => target.cached_buffer.as_mut().unwrap().2 = Instant::now(),
+                }
+            }
+
             if target.cached_buffer.is_none() {
                 match create_shared_dma_framebuffer::<R, T>(buffer_size, self.render, target) {
                     Ok(dmabuf) => {
-                        *target.cached_buffer = Some((true, dmabuf));
+                        *target.cached_buffer = Some((true, dmabuf, Instant::now()));
                     }
                     Err(err) => {
                         warn!(
@@ -1285,13 +1300,13 @@ where
                             // drop everything
                         }
 
-                        *target.cached_buffer = Some((false, dmabuf));
+                        *target.cached_buffer = Some((false, dmabuf, Instant::now()));
                     }
                 }
             };
 
             // try to import on target node
-            let (direct, dmabuf) = target.cached_buffer.as_mut().unwrap();
+            let (direct, dmabuf, _) = target.cached_buffer.as_mut().unwrap();
             // TODO: We could cache that texture all the way back to the GpuManager in a HashMap<WeakDmabuf, Texture>.
             let texture = (*direct)
                 .then(|| {
@@ -1401,6 +1416,7 @@ where
 
     #[profiling::function]
     fn invalidate_caches(&mut self) -> Result<(), Self::Error> {
+        LAYOUT_CACHE.with_borrow_mut(Vec::clear);
         let mut result = Ok(());
         for device in self.render_devices() {
             result = result.and(invalidate_device_caches(device).map_err(Error::Render));
@@ -1437,6 +1453,84 @@ fn cleanup_device_texture_cache<D: ApiDevice>(
         .renderer_mut()
         .cleanup_texture_cache()
         .inspect_err(|err| warn!("Error cleaning up texture cache of {}: {}", node, err))
+}
+
+// Bound negotiation work and metadata independently from retained GPU buffers.
+const MAX_LAYOUT_ATTEMPTS: usize = 16;
+const MAX_LAYOUT_CACHE: usize = 32;
+const DMA_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LayoutKey {
+    source: ErasedContextId,
+    target: ErasedContextId,
+    size: Size<i32, BufferCoords>,
+    format: Fourcc,
+}
+
+#[derive(Default)]
+struct LayoutResult {
+    preferred: Option<Modifier>,
+    rejected: Vec<Modifier>,
+}
+
+thread_local! {
+    // Context identity prevents a removed/recreated GPU from inheriting decisions.
+    static LAYOUT_CACHE: RefCell<Vec<(LayoutKey, LayoutResult)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn try_layouts<V, E>(
+    key: LayoutKey,
+    modifiers: &[Modifier],
+    mut attempt: impl FnMut(Modifier) -> Result<V, (E, bool)>,
+) -> Result<V, Option<E>> {
+    let mut previous = LAYOUT_CACHE.with_borrow_mut(|cache| {
+        cache
+            .iter()
+            .position(|(cached, _)| *cached == key)
+            .map(|index| cache.remove(index).1)
+            .unwrap_or_default()
+    });
+    let mut ordered = Vec::new();
+    if let Some(preferred) = previous.preferred.filter(|modifier| modifiers.contains(modifier)) {
+        ordered.push(preferred);
+    }
+    for modifier in modifiers {
+        if *modifier != Modifier::Invalid
+            && !ordered.contains(modifier)
+            && !previous.rejected.contains(modifier)
+        {
+            ordered.push(*modifier);
+        }
+    }
+    let mut result = Err(None);
+    for modifier in ordered.into_iter().take(MAX_LAYOUT_ATTEMPTS) {
+        match attempt(modifier) {
+            Ok(value) => {
+                previous.preferred = Some(modifier);
+                result = Ok(value);
+                break;
+            }
+            Err((error, deterministic)) => {
+                if previous.preferred == Some(modifier) {
+                    previous.preferred = None;
+                }
+                // Generic allocation/import errors may be OOM or a lost device:
+                // only demonstrable layout mismatches are negative-cached.
+                if deterministic && !previous.rejected.contains(&modifier) {
+                    previous.rejected.push(modifier);
+                }
+                result = Err(Some(error));
+            }
+        }
+    }
+    LAYOUT_CACHE.with_borrow_mut(|cache| {
+        if cache.len() >= MAX_LAYOUT_CACHE {
+            cache.remove(0);
+        }
+        cache.push((key, previous));
+    });
+    result
 }
 
 fn create_shared_dma_framebuffer<R, T: GraphicsApi>(
@@ -1481,27 +1575,46 @@ where
         target_modifiers,
     );
 
-    let mut dmabuf = src
-        .allocator()
-        .create_buffer(
-            buffer_size.w as u32,
-            buffer_size.h as u32,
-            target.format,
-            &target_modifiers,
-        )
-        .map_err(Error::AllocatorError)?;
-
-    // verify we can bind on src and import on target
-
-    src.renderer_mut().bind(&mut dmabuf).map_err(Error::Render)?;
-
-    target
-        .device
-        .renderer_mut()
-        .import_dmabuf(&dmabuf, Some(&[Rectangle::from_size(buffer_size)]))
-        .map_err(Error::Target)?;
-
-    Ok(dmabuf)
+    let key = LayoutKey {
+        source: src.renderer().context_id().map::<MultiTexture>().erased(),
+        target: target
+            .device
+            .renderer()
+            .context_id()
+            .map::<MultiTexture>()
+            .erased(),
+        size: buffer_size,
+        format: target.format,
+    };
+    try_layouts(key, &target_modifiers, |modifier| {
+        let mut dmabuf = src
+            .allocator()
+            .create_buffer(
+                buffer_size.w as u32,
+                buffer_size.h as u32,
+                target.format,
+                &[modifier],
+            )
+            .map_err(|err| (Error::AllocatorError(err), false))?;
+        if dmabuf.format()
+            != (Format {
+                code: target.format,
+                modifier,
+            })
+        {
+            return Err((Error::ImportFailed, true));
+        }
+        src.renderer_mut()
+            .bind(&mut dmabuf)
+            .map_err(|err| (Error::Render(err), false))?;
+        target
+            .device
+            .renderer_mut()
+            .import_dmabuf(&dmabuf, Some(&[Rectangle::from_size(buffer_size)]))
+            .map_err(|err| (Error::Target(err), false))?;
+        Ok(dmabuf)
+    })
+    .map_err(|err| err.unwrap_or(Error::ImportFailed))
 }
 
 impl<'frame, 'buffer, R: GraphicsApi, T: GraphicsApi> MultiFrame<'_, '_, 'frame, 'buffer, R, T>
@@ -1794,6 +1907,7 @@ enum GpuSingleTexture {
         external_shadow: Option<(Dmabuf, Box<dyn Any + 'static>)>,
         texture: Option<Box<dyn Any + 'static>>,
         mappings: Option<(DrmNode, DamageAnyTextureMappings)>,
+        dma_retry: Instant,
     },
 }
 
@@ -1983,7 +2097,7 @@ impl MultiTexture {
         let tex = &mut *tex_ref;
 
         let render_id = render_id.erased();
-        let (old_texture, old_mapping, external_shadow) = tex
+        let (old_texture, old_mapping, external_shadow, dma_retry) = tex
             .textures
             .remove(&render_id)
             .map(|single| match single {
@@ -1991,10 +2105,11 @@ impl MultiTexture {
                     texture,
                     mappings,
                     external_shadow,
-                } => (texture, mappings, external_shadow),
-                _ => (None, None, None),
+                    dma_retry,
+                } => (texture, mappings, external_shadow, dma_retry),
+                _ => (None, None, None, Instant::now()),
             })
-            .unwrap_or((None, None, None));
+            .unwrap_or((None, None, None, Instant::now()));
         let old_texture = old_texture.filter(|tex| {
             <dyn Any>::downcast_ref::<<<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>(tex)
                 .map(|tex| tex.size())
@@ -2034,6 +2149,7 @@ impl MultiTexture {
                 mappings: Some((source, mappings)),
                 texture: old_texture,
                 external_shadow,
+                dma_retry,
             },
         );
     }
@@ -2525,19 +2641,18 @@ where
                 if candidates.iter().any(|f| f.code == format) {
                     format
                 } else {
-                    let bpp = get_bpp(format).unwrap_or(8);
-                    if let Some(f) = candidates
+                    // Do not silently reduce HDR precision or discard alpha while
+                    // negotiating another channel order.
+                    candidates
                         .iter()
-                        .find(|f| get_bpp(f.code).is_some_and(|val| val == bpp))
-                    {
-                        f.code
-                    } else {
-                        candidates
-                            .iter()
-                            .find(|f| get_bpp(f.code).is_some_and(|val| val == 8))
-                            .map(|f| f.code)
-                            .ok_or(Error::ImportFailed)?
-                    }
+                        .find(|f| {
+                            get_bpp(format).is_some()
+                                && get_bpp(f.code) == get_bpp(format)
+                                && get_depth(f.code) == get_depth(format)
+                                && has_alpha(f.code) == has_alpha(format)
+                        })
+                        .map(|f| f.code)
+                        .ok_or(Error::ImportFailed)?
                 }
             }
         };
@@ -2552,44 +2667,55 @@ where
             return Err(Error::ImportFailed);
         }
 
-        let shadow_buffer = src
-            .allocator()
-            .create_buffer(
-                src_texture.width(),
-                src_texture.height(),
-                transfer_format,
-                &modifiers,
-            )
-            .map_err(Error::AllocatorError)?;
-
-        // Allocators may fall back to an implicit layout even when an explicit
-        // modifier was requested. Such a buffer is not covered by the shared
-        // capabilities above and must not be imported on the receiving GPU.
-        let allocated_format = shadow_buffer.format();
-        if allocated_format.code != transfer_format || !modifiers.contains(&allocated_format.modifier) {
-            debug!(
-                ?allocated_format,
-                ?transfer_format,
-                ?modifiers,
-                "Shadow allocation does not match the negotiated format"
-            );
-            return Err(Error::ImportFailed);
-        }
-
-        let target_texture = if let Some(target) = target.as_mut() {
-            Box::<<<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>::new(
-                target
-                    .renderer_mut()
-                    .import_dmabuf(&shadow_buffer, None)
-                    .map_err(Error::Target)?,
-            ) as Box<dyn Any + 'static>
-        } else {
-            Box::<<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>::new(
-                src.renderer_mut()
-                    .import_dmabuf(&shadow_buffer, None)
-                    .map_err(Error::Render)?,
-            ) as Box<dyn Any + 'static>
+        let key = LayoutKey {
+            source: src.renderer().context_id().erased(),
+            target: target
+                .as_ref()
+                .map(|target| target.renderer().context_id().erased())
+                .unwrap_or_else(|| src.renderer().context_id().erased()),
+            size: src_texture.size(),
+            format: transfer_format,
         };
+        let (shadow_buffer, target_texture) = try_layouts(key, &modifiers, |modifier| {
+            let mut shadow_buffer = src
+                .allocator()
+                .create_buffer(
+                    src_texture.width(),
+                    src_texture.height(),
+                    transfer_format,
+                    &[modifier],
+                )
+                .map_err(|err| (Error::AllocatorError(err), false))?;
+            // An implicit allocator fallback is not the layout we negotiated.
+            if shadow_buffer.format()
+                != (Format {
+                    code: transfer_format,
+                    modifier,
+                })
+            {
+                return Err((Error::ImportFailed, true));
+            }
+            // Validate both sides before caching this candidate as successful.
+            src.renderer_mut()
+                .bind(&mut shadow_buffer)
+                .map_err(|err| (Error::Render(err), false))?;
+            let target_texture = if let Some(target) = target.as_mut() {
+                Box::new(
+                    target
+                        .renderer_mut()
+                        .import_dmabuf(&shadow_buffer, None)
+                        .map_err(|err| (Error::Target(err), false))?,
+                ) as Box<dyn Any>
+            } else {
+                Box::new(
+                    src.renderer_mut()
+                        .import_dmabuf(&shadow_buffer, None)
+                        .map_err(|err| (Error::Render(err), false))?,
+                ) as Box<dyn Any>
+            };
+            Ok((shadow_buffer, target_texture))
+        })
+        .map_err(|err| err.unwrap_or(Error::ImportFailed))?;
         (slot.insert((shadow_buffer, target_texture, None)), true)
     };
 
@@ -2810,7 +2936,20 @@ where
             mut external_shadow,
             texture,
             mappings,
+            mut dma_retry,
         }) => {
+            if dma_retry.elapsed() >= DMA_RETRY_INTERVAL {
+                dma_retry = Instant::now();
+                let mut slot = None;
+                if dma_shadow_copy::<S, T>(src_texture, None, &mut slot, src, Some(target), None).is_ok() {
+                    *target_texture = slot.map(|(dmabuf, texture, sync)| GpuSingleTexture::Dma {
+                        texture,
+                        dmabuf,
+                        sync,
+                    });
+                    return Ok(());
+                }
+            }
             if let Some((dmabuf, texture)) = external_shadow.take() {
                 let mut slot = Some((dmabuf, texture, None));
                 dma_shadow_copy::<S, S>(src_texture, damage, &mut slot, src, None, None)
@@ -2844,6 +2983,7 @@ where
             let res = mem_copy::<S, T>(src_texture, damage, &mut slot, src, target);
             *target_texture = slot.map(|(mappings, texture)| GpuSingleTexture::Mem {
                 external_shadow,
+                dma_retry,
                 texture: texture.map(|texture| texture as Box<dyn Any + 'static>),
                 mappings: mappings.map(|mappings| {
                     (
@@ -2957,6 +3097,7 @@ where
                             )
                         }),
                         external_shadow,
+                        dma_retry: Instant::now(),
                     });
                     res
                 }
@@ -3998,6 +4139,94 @@ mod tests {
     use super::*;
     use crate::backend::allocator::dmabuf::DmabufFlags;
     use crate::backend::renderer::sync::{Fence, Interrupted};
+
+    fn layout_key() -> LayoutKey {
+        LayoutKey {
+            source: ContextId::<MultiTexture>::new().erased(),
+            target: ContextId::<MultiTexture>::new().erased(),
+            size: (3840, 2160).into(),
+            format: Fourcc::Xrgb2101010,
+        }
+    }
+
+    #[test]
+    fn layout_probe_recovers_from_failure_and_prefers_success() {
+        let key = layout_key();
+        let modifiers = [Modifier::Linear, Modifier::from(1_u64), Modifier::from(2_u64)];
+        let mut attempts = Vec::new();
+        assert_eq!(
+            try_layouts(key.clone(), &modifiers, |modifier| {
+                attempts.push(modifier);
+                if modifier == modifiers[1] {
+                    Ok(42)
+                } else {
+                    Err(((), false))
+                }
+            }),
+            Ok(42)
+        );
+        assert_eq!(attempts, modifiers[..2]);
+        attempts.clear();
+        assert_eq!(
+            try_layouts(key, &modifiers, |modifier| {
+                attempts.push(modifier);
+                Ok::<_, ((), bool)>(42)
+            }),
+            Ok(42)
+        );
+        assert_eq!(attempts, [modifiers[1]]);
+    }
+
+    #[test]
+    fn layout_probe_retries_transient_errors_but_not_layout_mismatches() {
+        let key = layout_key();
+        let modifiers = [Modifier::Linear, Modifier::from(1_u64)];
+        let mut attempts = Vec::new();
+        assert_eq!(
+            try_layouts::<(), _>(key.clone(), &modifiers, |modifier| {
+                Err(("failure", modifier == Modifier::Linear))
+            }),
+            Err(Some("failure"))
+        );
+        assert_eq!(
+            try_layouts(key.clone(), &modifiers, |modifier| {
+                attempts.push(modifier);
+                Ok::<_, ((), bool)>(())
+            }),
+            Ok(())
+        );
+        assert_eq!(attempts, [modifiers[1]]);
+        // A new context does not inherit the negative result.
+        let new_key = LayoutKey {
+            target: ContextId::<MultiTexture>::new().erased(),
+            ..key
+        };
+        attempts.clear();
+        assert_eq!(
+            try_layouts(new_key, &modifiers, |modifier| {
+                attempts.push(modifier);
+                Ok::<_, ((), bool)>(())
+            }),
+            Ok(())
+        );
+        assert_eq!(attempts, [Modifier::Linear]);
+    }
+
+    #[test]
+    fn layout_negotiation_and_metadata_are_bounded() {
+        LAYOUT_CACHE.with_borrow_mut(Vec::clear);
+        let modifiers: Vec<_> = (0..32).map(Modifier::from).collect();
+        let mut attempts = 0;
+        let _ = try_layouts::<(), _>(layout_key(), &modifiers, |_| {
+            attempts += 1;
+            Err(((), false))
+        });
+        assert_eq!(attempts, MAX_LAYOUT_ATTEMPTS);
+        for _ in 0..64 {
+            let _ = try_layouts(layout_key(), &modifiers, |_| Ok::<_, ((), bool)>(()));
+        }
+        LAYOUT_CACHE.with_borrow(|cache| assert_eq!(cache.len(), MAX_LAYOUT_CACHE));
+    }
 
     #[derive(Debug)]
     struct TestFence {
