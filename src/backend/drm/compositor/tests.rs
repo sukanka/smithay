@@ -386,3 +386,120 @@ fn retained_framebuffer_cache_is_bounded_and_keeps_in_flight_handles_alive() {
         MAX_RETAINED_FRAMEBUFFERS + 1
     );
 }
+
+fn placeholder_frame() -> (
+    wayland_server::Display<BufferTestState>,
+    std::os::unix::net::UnixStream,
+    FrameState<Dmabuf, TestFramebuffer>,
+) {
+    let (display, socket, client) = buffer_client();
+    let buffer = client
+        .create_resource::<WlBuffer, (), BufferTestState>(&display.handle(), 1, ())
+        .unwrap();
+    let buffer = crate::backend::renderer::utils::Buffer::with_implicit(buffer);
+    let claims = crate::backend::drm::device::PlaneClaimStorage::default();
+    let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut frame = FrameState {
+        planes: SmallVec::new(),
+        async_flip_failed: false,
+        presentation_state: None,
+    };
+    for index in 1..=3 {
+        let plane = drm::control::from_u32(index).unwrap();
+        frame.planes.push((
+            plane,
+            PlaneState {
+                skip: false,
+                needs_test: false,
+                element_state: Some(PlaneElementState {
+                    id: Id::new(),
+                    commit: CommitCounter::default(),
+                    z_index: index as usize,
+                    cursor_size: None,
+                    cursor_post_blend: false,
+                }),
+                config: Some(PlaneConfig {
+                    properties: PlaneProperties {
+                        src: Rectangle::from_size((800, 600).into()).to_f64(),
+                        dst: Rectangle::from_size((800, 600).into()),
+                        transform: Transform::Normal,
+                        alpha: 1.,
+                        format: DrmFormat {
+                            code: DrmFourcc::Xrgb8888,
+                            modifier: DrmModifier::Linear,
+                        },
+                    },
+                    buffer: DrmScanoutBuffer {
+                        buffer: ScanoutBuffer::Wayland(buffer.clone()),
+                        fb: cached_framebuffer(index, &drops),
+                    },
+                    damage_clips: None,
+                    plane_claim: claims.claim(plane, drm::control::from_u32(20).unwrap()).unwrap(),
+                    sync: None,
+                    color_pipeline: None,
+                }),
+            },
+        ));
+    }
+    frame
+        .planes
+        .push((drm::control::from_u32(4).unwrap(), PlaneState::default()));
+    (display, socket, frame)
+}
+
+#[test]
+fn replacing_placeholder_retests_the_complete_plane_combination() {
+    let (_display, _socket, mut next) = placeholder_frame();
+    let previous = FrameState {
+        planes: next.planes.clone(),
+        async_flip_failed: false,
+        presentation_state: None,
+    };
+    // All cursor/overlay tests succeeded against the old direct-scanout primary.
+    // The new composition target changes format and has no direct-scanout element.
+    let primary = &mut next.planes[0].1;
+    primary.config.as_mut().unwrap().properties.format.code = DrmFourcc::Xrgb2101010;
+    primary.element_state = None;
+    assert!(
+        !next.needs_complete_test(&previous, true),
+        "the pre-fix flags incorrectly skipped validation"
+    );
+    next.mark_configured_planes_for_test();
+    assert!(next.needs_complete_test(&previous, true));
+    assert!(next.planes[..3].iter().all(|(_, state)| state.needs_test));
+    assert!(
+        !next.planes[3].1.needs_test,
+        "unused planes need no new validation"
+    );
+    // Modesets/resets still force full validation independently of these flags.
+    assert!(next.needs_complete_test(&previous, false));
+}
+
+#[test]
+fn failed_placeholder_combination_falls_back_even_previously_accepted_elements() {
+    for composed_primary in [false, true] {
+        let (_display, _socket, mut next) = placeholder_frame();
+        if composed_primary {
+            next.planes[0].1.element_state = None;
+        }
+        // The individual assignment tests cleared all needs_test flags. A later
+        // full-frame test now fails with the placeholder or its replacement.
+        assert!(next.planes.iter().all(|(_, state)| !state.needs_test));
+        next.mark_element_planes_for_fallback();
+        let removed: Vec<_> = next
+            .planes
+            .iter()
+            .filter(|(_, state)| state.needs_test)
+            .map(|(plane, _)| u32::from(*plane))
+            .collect();
+        assert_eq!(
+            removed,
+            if composed_primary {
+                vec![2, 3]
+            } else {
+                vec![1, 2, 3]
+            }
+        );
+        assert!(!next.planes[3].1.needs_test);
+    }
+}

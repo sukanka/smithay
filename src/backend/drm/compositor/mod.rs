@@ -754,6 +754,28 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         })
     }
 
+    fn mark_configured_planes_for_test(&mut self) {
+        for (_, state) in &mut self.planes {
+            if state.config.is_some() {
+                state.needs_test = true;
+            }
+        }
+    }
+
+    fn mark_element_planes_for_fallback(&mut self) {
+        for (_, state) in &mut self.planes {
+            if state.element_state.is_some() {
+                state.needs_test = true;
+            }
+        }
+    }
+
+    fn needs_complete_test(&self, previous_frame: &Self, allow_partial_update: bool) -> bool {
+        !allow_partial_update
+            || (self.planes.iter().any(|(_, state)| state.needs_test)
+                && !self.is_fully_compatible(previous_frame))
+    }
+
     #[profiling::function]
     #[inline]
     fn set_state(&mut self, plane: plane::Handle, state: PlaneState<B, F>) {
@@ -809,10 +831,7 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         allow_partial_update: bool,
         presentation_mode: PresentationMode,
     ) -> Result<(), DrmError> {
-        let needs_test = self.planes.iter().any(|(_, state)| state.needs_test);
-        let is_fully_compatible = self.is_fully_compatible(previous_frame);
-
-        if allow_partial_update && (!needs_test || is_fully_compatible) {
+        if !self.needs_complete_test(previous_frame, allow_partial_update) {
             trace!("skipping fully compatible state test");
             self.planes
                 .iter_mut()
@@ -2237,6 +2256,7 @@ where
                         .is_some_and(|buffer| !matches!(buffer.buffer, ScanoutBuffer::Swapchain(_)))
             })
             .cloned();
+        let used_placeholder = placeholder.is_some();
         let mut primary_plane_state = None;
         let initial_primary = if let Some(mut placeholder) = placeholder {
             placeholder.skip = false;
@@ -2509,6 +2529,9 @@ where
             let state = self.acquire_primary_plane_state(current_size)?;
             next_frame_state.set_state(self.surface.plane(), state.clone());
             primary_plane_state = Some(state);
+            // Auxiliary planes were tested with the previous scanout buffer, not
+            // this composition target. Revalidate the complete combination.
+            next_frame_state.mark_configured_planes_for_test();
         }
 
         // Cleanup old state (e.g. old dmabuffers)
@@ -2540,6 +2563,14 @@ where
             presentation_mode,
         ) {
             debug!(?err, "atomic test failed for frame, resetting frame");
+
+            // With deferred acquisition, even individually accepted auxiliary
+            // planes may depend on the placeholder's format/color pipeline.
+            // Falling back to a new primary target must also composite those
+            // elements; no combination tested only against the placeholder survives.
+            if used_placeholder {
+                next_frame_state.mark_element_planes_for_fallback();
+            }
 
             let mut removed_overlay_elements: Vec<(usize, &E)> = Vec::with_capacity(
                 next_frame_state
