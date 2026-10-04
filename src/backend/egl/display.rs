@@ -1,13 +1,12 @@
 //! Type safe native types for safe egl initialisation
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     ffi::{CStr, c_int},
-    hash::{Hash, Hasher},
     mem::MaybeUninit,
     ops::Deref,
     os::unix::io::{AsRawFd, FromRawFd, OwnedFd},
-    sync::{Arc, LazyLock, Mutex, Weak},
+    sync::{Arc, Condvar, LazyLock, Mutex, Weak},
 };
 
 use indexmap::IndexSet;
@@ -41,8 +40,66 @@ use tracing::{debug, error, info, info_span, instrument, trace, warn};
 
 #[cfg(all(feature = "wayland_frontend", feature = "use_system_lib"))]
 pub(crate) static BUFFER_READER: Mutex<Option<WeakBufferReader>> = Mutex::new(None);
-static DISPLAYS: LazyLock<Mutex<HashSet<WeakEGLDisplayHandle>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+static DISPLAYS: LazyLock<DisplayCache> = LazyLock::new(DisplayCache::default);
+
+#[derive(Default)]
+struct DisplayCache {
+    handles: Mutex<HashMap<usize, Weak<EGLDisplayHandle>>>,
+    terminated: Condvar,
+    #[cfg(test)]
+    waiters: std::sync::atomic::AtomicUsize,
+}
+
+impl DisplayCache {
+    fn get_or_create(
+        &self,
+        raw: ffi::egl::types::EGLDisplay,
+        create: impl FnOnce() -> EGLDisplayHandle,
+    ) -> Arc<EGLDisplayHandle> {
+        let mut handles = self.handles.lock().unwrap();
+        loop {
+            match handles.get(&(raw as usize)) {
+                Some(handle) => {
+                    if let Some(handle) = handle.upgrade() {
+                        return handle;
+                    }
+                    // The last Arc is already being dropped, but its eglTerminate has not
+                    // completed. Do not initialize a replacement which that Drop could then
+                    // terminate. Waiting releases the cache lock so Drop can finish.
+                    #[cfg(test)]
+                    self.waiters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    handles = self.terminated.wait(handles).unwrap();
+                    #[cfg(test)]
+                    self.waiters.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                None => {
+                    let handle = Arc::new(create());
+                    handles.insert(raw as usize, Arc::downgrade(&handle));
+                    return handle;
+                }
+            }
+        }
+    }
+
+    fn terminate(
+        &self,
+        raw: ffi::egl::types::EGLDisplay,
+        identity: *const EGLDisplayHandle,
+        terminate: impl FnOnce(),
+    ) {
+        let mut handles = self.handles.lock().unwrap();
+        // A cached generation stays present, even with zero strong references, until its
+        // termination is complete. Only then can another thread create the next generation.
+        debug_assert!(
+            handles
+                .get(&(raw as usize))
+                .is_some_and(|handle| handle.as_ptr() == identity)
+        );
+        terminate();
+        handles.remove(&(raw as usize));
+        self.terminated.notify_all();
+    }
+}
 
 /// Wrapper around [`ffi::EGLDisplay`](ffi::egl::types::EGLDisplay) to ensure display is only destroyed
 /// once all resources bound to it have been dropped.
@@ -57,41 +114,6 @@ pub struct EGLDisplayHandle {
 unsafe impl Send for EGLDisplayHandle {}
 unsafe impl Sync for EGLDisplayHandle {}
 
-#[derive(Clone)]
-struct WeakEGLDisplayHandle {
-    handle: Weak<EGLDisplayHandle>,
-    ptr: ffi::egl::types::EGLDisplay,
-}
-
-unsafe impl Send for WeakEGLDisplayHandle {}
-unsafe impl Sync for WeakEGLDisplayHandle {}
-
-impl From<Arc<EGLDisplayHandle>> for WeakEGLDisplayHandle {
-    #[inline]
-    fn from(other: Arc<EGLDisplayHandle>) -> Self {
-        WeakEGLDisplayHandle {
-            handle: Arc::downgrade(&other),
-            ptr: other.handle,
-        }
-    }
-}
-
-impl Hash for WeakEGLDisplayHandle {
-    #[inline]
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.ptr.hash(state);
-    }
-}
-
-impl PartialEq for WeakEGLDisplayHandle {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.ptr == other.ptr
-    }
-}
-
-impl Eq for WeakEGLDisplayHandle {}
-
 impl Deref for EGLDisplayHandle {
     type Target = ffi::egl::types::EGLDisplay;
 
@@ -105,10 +127,10 @@ impl Drop for EGLDisplayHandle {
     #[inline]
     fn drop(&mut self) {
         if self.should_terminate {
-            unsafe {
+            DISPLAYS.terminate(self.handle, self, || unsafe {
                 // ignore errors on drop
                 ffi::egl::Terminate(self.handle);
-            }
+            });
         }
     }
 }
@@ -262,23 +284,11 @@ impl EGLDisplay {
         let (display, platform) = unsafe { select_platform_display(&native, &dp_extensions)? };
         span.record("platform", platform);
 
-        let display = {
-            let new_display = Arc::new(EGLDisplayHandle {
-                handle: display,
-                should_terminate: true,
-                _native: Box::new(native),
-            });
-            let weak_disp = WeakEGLDisplayHandle::from(new_display.clone());
-
-            let mut displays = DISPLAYS.lock().unwrap();
-            displays.retain(|handle| handle.handle.strong_count() != 0);
-            if displays.insert(weak_disp.clone()) {
-                new_display
-            } else {
-                Arc::try_unwrap(new_display).unwrap().should_terminate = false;
-                displays.get(&weak_disp).unwrap().handle.upgrade().unwrap()
-            }
-        };
+        let display = DISPLAYS.get_or_create(display, || EGLDisplayHandle {
+            handle: display,
+            should_terminate: true,
+            _native: Box::new(native),
+        });
 
         // We can then query the egl api version
         let egl_version = unsafe {
@@ -1278,3 +1288,7 @@ impl DamageSupport {
         self != &DamageSupport::No
     }
 }
+
+#[cfg(test)]
+#[path = "display_tests.rs"]
+mod tests;
