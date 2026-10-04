@@ -90,7 +90,7 @@ pub mod vulkan;
 pub struct GpuManager<A: GraphicsApi> {
     api: A,
     devices: Vec<A::Device>,
-    dmabuf_cache: HashMap<(DrmNode, DrmNode), Option<(bool, Dmabuf, Instant)>>,
+    dmabuf_cache: HashMap<(DrmNode, DrmNode), SharedBufferCache>,
     span: tracing::Span,
 }
 
@@ -960,7 +960,7 @@ where
 
 struct TargetData<'target, T: GraphicsApi> {
     device: &'target mut T::Device,
-    cached_buffer: &'target mut Option<(bool, Dmabuf, Instant)>,
+    cached_buffer: &'target mut SharedBufferCache,
     format: Fourcc,
 }
 
@@ -1237,29 +1237,36 @@ where
         let target_state = if let Some(target) = self.target.as_mut() {
             let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
 
-            if let Some((_, dmabuf, _)) = &target.cached_buffer {
-                if dmabuf.size() != buffer_size || BufferTrait::format(dmabuf).code != target.format {
-                    *target.cached_buffer = None;
-                }
-            };
+            target.cached_buffer.select(LayoutKey {
+                source: self.render.renderer().context_id().map::<MultiTexture>().erased(),
+                target: target
+                    .device
+                    .renderer()
+                    .context_id()
+                    .map::<MultiTexture>()
+                    .erased(),
+                size: buffer_size,
+                format: target.format,
+            });
 
             // A transient failure must not pin the CPU path forever. Preserve
             // the existing fallback buffer if renegotiation still fails.
             if target
                 .cached_buffer
+                .current()
                 .as_ref()
                 .is_some_and(|(direct, _, attempted)| !direct && attempted.elapsed() >= DMA_RETRY_INTERVAL)
             {
                 match create_shared_dma_framebuffer::<R, T>(buffer_size, self.render, target) {
-                    Ok(dmabuf) => *target.cached_buffer = Some((true, dmabuf, Instant::now())),
-                    Err(_) => target.cached_buffer.as_mut().unwrap().2 = Instant::now(),
+                    Ok(dmabuf) => *target.cached_buffer.current_mut() = Some((true, dmabuf, Instant::now())),
+                    Err(_) => target.cached_buffer.current_mut().as_mut().unwrap().2 = Instant::now(),
                 }
             }
 
-            if target.cached_buffer.is_none() {
+            if target.cached_buffer.current().is_none() {
                 match create_shared_dma_framebuffer::<R, T>(buffer_size, self.render, target) {
                     Ok(dmabuf) => {
-                        *target.cached_buffer = Some((true, dmabuf, Instant::now()));
+                        *target.cached_buffer.current_mut() = Some((true, dmabuf, Instant::now()));
                     }
                     Err(err) => {
                         warn!(
@@ -1300,13 +1307,13 @@ where
                             // drop everything
                         }
 
-                        *target.cached_buffer = Some((false, dmabuf, Instant::now()));
+                        *target.cached_buffer.current_mut() = Some((false, dmabuf, Instant::now()));
                     }
                 }
             };
 
             // try to import on target node
-            let (direct, dmabuf, _) = target.cached_buffer.as_mut().unwrap();
+            let (direct, dmabuf, _) = target.cached_buffer.current_mut().as_mut().unwrap();
             // TODO: We could cache that texture all the way back to the GpuManager in a HashMap<WeakDmabuf, Texture>.
             let texture = (*direct)
                 .then(|| {
@@ -1422,7 +1429,7 @@ where
             result = result.and(invalidate_device_caches(device).map_err(Error::Render));
         }
         if let Some(target) = self.target.as_mut() {
-            *target.cached_buffer = None;
+            target.cached_buffer.entries.clear();
             result = result.and(invalidate_device_caches(&mut *target.device).map_err(Error::Target));
         }
         result
@@ -1458,6 +1465,7 @@ fn cleanup_device_texture_cache<D: ApiDevice>(
 // Bound negotiation work and metadata independently from retained GPU buffers.
 const MAX_LAYOUT_ATTEMPTS: usize = 16;
 const MAX_LAYOUT_CACHE: usize = 32;
+const MAX_REJECTED_MODIFIERS: usize = 64;
 const DMA_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1466,6 +1474,64 @@ struct LayoutKey {
     target: ErasedContextId,
     size: Size<i32, BufferCoords>,
     format: Fourcc,
+}
+
+// Keep layouts for several outputs sharing the same GPU pair. Metadata keys
+// include context identity so hot-unplug/recreation cannot reuse old buffers.
+const MAX_SHARED_BUFFERS: usize = 4;
+const MAX_SHARED_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct SharedBufferCache {
+    entries: Vec<(LayoutKey, Option<(bool, Dmabuf, Instant)>)>,
+}
+
+impl SharedBufferCache {
+    fn select(&mut self, key: LayoutKey) {
+        self.entries
+            .retain(|(cached, _)| cached.source == key.source && cached.target == key.target);
+        if let Some(index) = self.entries.iter().position(|(cached, _)| *cached == key) {
+            let entry = self.entries.remove(index);
+            self.entries.push(entry);
+            return;
+        }
+        let bytes = |key: &LayoutKey| -> usize {
+            usize::try_from(key.size.w)
+                .ok()
+                .and_then(|width| {
+                    width
+                        .checked_mul(usize::try_from(key.size.h).ok()?)?
+                        .checked_mul(get_bpp(key.format).unwrap_or(64).div_ceil(8))
+                })
+                .unwrap_or(usize::MAX)
+        };
+        let needed = bytes(&key);
+        while !self.entries.is_empty()
+            && (self.entries.len() >= MAX_SHARED_BUFFERS
+                || self
+                    .entries
+                    .iter()
+                    .fold(needed, |sum, (key, _)| sum.saturating_add(bytes(key)))
+                    > MAX_SHARED_BUFFER_BYTES)
+        {
+            self.entries.remove(0);
+        }
+        // A single requested buffer may exceed the cache budget; retaining no
+        // other entries avoids multiplying its unavoidable allocation cost.
+        self.entries.push((key, None));
+    }
+
+    fn current(&self) -> &Option<(bool, Dmabuf, Instant)> {
+        &self.entries.last().expect("select must precede buffer access").1
+    }
+
+    fn current_mut(&mut self) -> &mut Option<(bool, Dmabuf, Instant)> {
+        &mut self
+            .entries
+            .last_mut()
+            .expect("select must precede buffer access")
+            .1
+    }
 }
 
 #[derive(Default)]
@@ -1518,6 +1584,9 @@ fn try_layouts<V, E>(
                 // Generic allocation/import errors may be OOM or a lost device:
                 // only demonstrable layout mismatches are negative-cached.
                 if deterministic && !previous.rejected.contains(&modifier) {
+                    if previous.rejected.len() == MAX_REJECTED_MODIFIERS {
+                        previous.rejected.remove(0);
+                    }
                     previous.rejected.push(modifier);
                 }
                 result = Err(Some(error));
@@ -4253,6 +4322,60 @@ mod tests {
             size: (3840, 2160).into(),
             format: Fourcc::Xrgb2101010,
         }
+    }
+
+    #[test]
+    fn intermediate_buffers_reuse_distinct_layouts_and_invalidate_contexts() {
+        let first = layout_key();
+        let second = LayoutKey {
+            size: (2560, 1600).into(),
+            ..first.clone()
+        };
+        let third = LayoutKey {
+            format: Fourcc::Xrgb8888,
+            ..first.clone()
+        };
+        let mut cache = SharedBufferCache::default();
+        cache.select(first.clone());
+        let GpuSingleTexture::Dma { dmabuf, .. } = shadow(SyncPoint::signaled()) else {
+            unreachable!()
+        };
+        let original = dmabuf.clone();
+        *cache.current_mut() = Some((true, dmabuf, Instant::now()));
+        cache.select(second);
+        cache.select(third);
+        assert_eq!(cache.entries.len(), 3);
+        cache.select(first.clone());
+        assert_eq!(cache.current().as_ref().unwrap().1, original);
+        cache.select(LayoutKey {
+            source: ContextId::<MultiTexture>::new().erased(),
+            ..first
+        });
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.current().is_none());
+    }
+
+    #[test]
+    fn intermediate_buffer_cache_evicts_lru_and_bounds_large_layouts() {
+        let first = layout_key();
+        let mut cache = SharedBufferCache::default();
+        for width in 1..=MAX_SHARED_BUFFERS + 1 {
+            cache.select(LayoutKey {
+                size: (width as i32, 10).into(),
+                ..first.clone()
+            });
+        }
+        assert_eq!(cache.entries.len(), MAX_SHARED_BUFFERS);
+        assert_eq!(cache.entries[0].0.size.w, 2);
+        for width in 7000..7004 {
+            cache.select(LayoutKey {
+                size: (width, 4320).into(),
+                format: Fourcc::Abgr16161616f,
+                ..first.clone()
+            });
+        }
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].0.size.w, 7003);
     }
 
     #[test]
