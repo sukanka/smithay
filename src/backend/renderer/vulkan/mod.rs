@@ -32,6 +32,7 @@ use std::{
 };
 
 use ash::{ext, khr, vk};
+use smallvec::{SmallVec, smallvec};
 use tracing::{info_span, instrument, trace, warn};
 
 use crate::{
@@ -348,7 +349,7 @@ impl PushConstants {
 #[derive(Debug)]
 struct InFlight {
     point: u64,
-    command_buffers: Vec<vk::CommandBuffer>,
+    command_buffers: SmallVec<[vk::CommandBuffer; 2]>,
 }
 
 const DESCRIPTOR_POOL_SIZE: u32 = 256;
@@ -1001,7 +1002,7 @@ impl VulkanRenderer {
 
         let export_semaphore = with_export.then(|| self.create_export_semaphore()).flatten();
 
-        let mut wait_infos: Vec<vk::SemaphoreSubmitInfo<'_>> = Vec::new();
+        let mut wait_infos: SmallVec<[vk::SemaphoreSubmitInfo<'_>; 8]> = SmallVec::new();
         for sem in &binary_waits {
             wait_infos.push(
                 vk::SemaphoreSubmitInfo::default()
@@ -1018,7 +1019,7 @@ impl VulkanRenderer {
             );
         }
 
-        let mut signal_infos = vec![
+        let mut signal_infos: SmallVec<[vk::SemaphoreSubmitInfo<'_>; 2]> = smallvec![
             vk::SemaphoreSubmitInfo::default()
                 .semaphore(self.device.timeline)
                 .value(point)
@@ -1032,7 +1033,7 @@ impl VulkanRenderer {
             );
         }
 
-        let cb_infos: Vec<_> = command_buffers
+        let cb_infos: SmallVec<[vk::CommandBufferSubmitInfo<'_>; 2]> = command_buffers
             .iter()
             .map(|cb| vk::CommandBufferSubmitInfo::default().command_buffer(*cb))
             .collect();
@@ -1061,7 +1062,7 @@ impl VulkanRenderer {
         self.timeline_point = point;
         self.in_flight.push(InFlight {
             point,
-            command_buffers: command_buffers.to_vec(),
+            command_buffers: SmallVec::from_slice(command_buffers),
         });
         // Imported wait semaphores can be destroyed once the submission completed.
         self.device.defer_destroy(
