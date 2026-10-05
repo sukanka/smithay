@@ -2330,6 +2330,61 @@ impl GlesFrame<'_, '_> {
         Ok(func(&self.renderer.gl))
     }
 
+    /// Runs custom framebuffer capture code with a reusable empty draw framebuffer.
+    ///
+    /// The current frame remains bound for reading, with its color buffer selected, and
+    /// scissoring is disabled. The callback may attach textures to `COLOR_ATTACHMENT0` of
+    /// `DRAW_FRAMEBUFFER`; it must not delete the framebuffer, change its other attachments,
+    /// or change the read framebuffer binding. Other GL state follows the requirements of
+    /// [`with_context`](Self::with_context).
+    ///
+    /// On return, including a callback error, the color attachment is detached and the
+    /// previous draw framebuffer, read buffer selection, and scissor enable state are restored.
+    /// No flush or synchronization fence is issued: these commands remain part of this frame.
+    /// Requires OpenGL ES 3.0.
+    pub fn with_scratch_draw_framebuffer<F, R>(&mut self, func: F) -> Result<R, GlesError>
+    where
+        F: FnOnce(&ffi::Gles2) -> R,
+    {
+        if self.renderer.gl_version < version::GLES_3_0 {
+            return Err(GlesError::GLVersionNotSupported(version::GLES_3_0));
+        }
+        let gl = &self.renderer.gl;
+        let framebuffer = self.renderer.texture_framebuffers.scratch(gl);
+        unsafe {
+            let mut draw_framebuffer = 0;
+            let mut read_buffer = 0;
+            gl.GetIntegerv(ffi::DRAW_FRAMEBUFFER_BINDING, &mut draw_framebuffer);
+            gl.GetIntegerv(ffi::READ_BUFFER, &mut read_buffer);
+            let scissor = gl.IsEnabled(ffi::SCISSOR_TEST);
+            gl.Disable(ffi::SCISSOR_TEST);
+            // Readback can leave a persistent source framebuffer's read buffer at NONE.
+            gl.ReadBuffer(if matches!(self.target.0, GlesTargetInternal::Surface { .. }) {
+                ffi::BACK
+            } else {
+                ffi::COLOR_ATTACHMENT0
+            });
+            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, framebuffer.fbo);
+            let result = func(gl);
+            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, framebuffer.fbo);
+            gl.FramebufferTexture2D(
+                ffi::DRAW_FRAMEBUFFER,
+                ffi::COLOR_ATTACHMENT0,
+                ffi::TEXTURE_2D,
+                0,
+                0,
+            );
+            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, draw_framebuffer as u32);
+            gl.ReadBuffer(read_buffer as u32);
+            if scissor == ffi::TRUE {
+                gl.Enable(ffi::SCISSOR_TEST);
+            } else {
+                gl.Disable(ffi::SCISSOR_TEST);
+            }
+            Ok(result)
+        }
+    }
+
     /// Run custom code in the GL context with GPU profiling.
     ///
     /// Calls [`with_context()`](Self::with_context) inside

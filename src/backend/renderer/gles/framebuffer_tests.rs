@@ -6,6 +6,11 @@ fn renderers(shared: bool) -> Option<Vec<GlesRenderer>> {
         let mut devices = EGLDevice::enumerate()
             .map_err(|err| err.to_string())?
             .collect::<Vec<_>>();
+        // Allow hardware-specific checks without changing the software-first default.
+        if let Some(path) = std::env::var_os("SMITHAY_TEST_GLES_RENDER_NODE") {
+            let path = std::path::PathBuf::from(path);
+            devices.retain(|device| device.render_device_path().ok().as_ref() == Some(&path));
+        }
         devices.sort_by_key(|device| !device.is_software());
         for device in devices {
             let Ok(display) = (unsafe { EGLDisplay::new(device) }) else {
@@ -333,6 +338,195 @@ fn scratch_framebuffer_reuses_one_object_and_detaches_textures_even_on_error() {
     drop(texture);
     renderer.cleanup().unwrap();
     assert_eq!(unsafe { renderer.gl.IsTexture(texture_id) }, ffi::FALSE);
+}
+
+#[test]
+fn frame_capture_reuses_scratch_and_restores_read_draw_and_scissor_state() {
+    let Some(mut renderers) = renderers(false) else {
+        return;
+    };
+    let renderer = &mut renderers[0];
+    let mut source: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, (4, 4).into()).unwrap();
+    let destination: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, (2, 2).into()).unwrap();
+    let mut scratch_id = None;
+    let state = |gl: &ffi::Gles2| unsafe {
+        let mut read = 0;
+        let mut draw = 0;
+        let mut buffer = 0;
+        gl.GetIntegerv(ffi::READ_FRAMEBUFFER_BINDING, &mut read);
+        gl.GetIntegerv(ffi::DRAW_FRAMEBUFFER_BINDING, &mut draw);
+        gl.GetIntegerv(ffi::READ_BUFFER, &mut buffer);
+        (read, draw, buffer, gl.IsEnabled(ffi::SCISSOR_TEST))
+    };
+
+    for index in 0..32 {
+        let red = (index % 2) as f32;
+        {
+            let mut target = renderer.bind(&mut source).unwrap();
+            let mut frame = renderer
+                .render(&mut target, (4, 4).into(), Transform::Normal)
+                .unwrap();
+            let previous = frame
+                .with_context(|gl| unsafe {
+                    gl.Enable(ffi::SCISSOR_TEST);
+                    gl.Scissor(0, 0, 4, 4);
+                    gl.ClearColor(red, 0., 0., 1.);
+                    gl.Clear(ffi::COLOR_BUFFER_BIT);
+                    gl.Scissor(2, 0, 2, 4);
+                    gl.ClearColor(0., 0., 1., 1.);
+                    gl.Clear(ffi::COLOR_BUFFER_BIT);
+                    // A cached framebuffer can retain NONE after a readback. Neither this
+                    // nor the empty scissor must prevent capture of the red/blue boundary.
+                    gl.ReadBuffer(ffi::NONE);
+                    gl.Scissor(0, 0, 0, 0);
+                    if index % 2 == 0 {
+                        gl.Disable(ffi::SCISSOR_TEST);
+                    }
+                    state(gl)
+                })
+                .unwrap();
+            let result = frame
+                .with_scratch_draw_framebuffer(|gl| unsafe {
+                    let (read, draw, buffer, scissor) = state(gl);
+                    assert_eq!(read, previous.0);
+                    assert_ne!(draw, previous.1);
+                    assert_eq!(buffer, ffi::COLOR_ATTACHMENT0 as i32);
+                    assert_eq!(scissor, ffi::FALSE);
+                    assert_eq!(*scratch_id.get_or_insert(draw), draw);
+                    assert_eq!(
+                        gl.CheckFramebufferStatus(ffi::DRAW_FRAMEBUFFER),
+                        ffi::FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT
+                    );
+                    gl.FramebufferTexture2D(
+                        ffi::DRAW_FRAMEBUFFER,
+                        ffi::COLOR_ATTACHMENT0,
+                        ffi::TEXTURE_2D,
+                        destination.tex_id(),
+                        0,
+                    );
+                    gl.BlitFramebuffer(1, 1, 3, 3, 0, 0, 2, 2, ffi::COLOR_BUFFER_BIT, ffi::NEAREST);
+                    assert_eq!(gl.GetError(), ffi::NO_ERROR);
+                    // The helper owns this state and restores it even if custom code changes it.
+                    if previous.3 == ffi::FALSE {
+                        gl.Enable(ffi::SCISSOR_TEST);
+                    }
+                    Err::<(), _>("capture callback error")
+                })
+                .unwrap();
+            assert!(result.is_err());
+            assert_eq!(frame.with_context(state).unwrap(), previous);
+            frame.finish().unwrap().wait().unwrap();
+        }
+        let mapping = renderer
+            .copy_texture(
+                &destination,
+                Rectangle::from_size((2, 2).into()),
+                Fourcc::Abgr8888,
+            )
+            .unwrap();
+        let pixels = renderer.map_texture(&mapping).unwrap();
+        let row = [(red * 255.) as u8, 0, 0, 255, 0, 0, 255, 255];
+        assert_eq!(pixels, [row, row].concat());
+    }
+    // Source and readback targets each have one cached FBO; all 32 captures share one more.
+    assert_eq!(renderer.texture_framebuffers.created, 3);
+    renderer
+        .with_context(|gl| unsafe {
+            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, scratch_id.unwrap() as u32);
+            assert_eq!(
+                gl.CheckFramebufferStatus(ffi::DRAW_FRAMEBUFFER),
+                ffi::FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT
+            );
+            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
+        })
+        .unwrap();
+}
+
+#[test]
+#[ignore = "manual comparison of per-capture allocation against scratch framebuffer reuse"]
+fn benchmark_frame_capture_scratch_reuse() {
+    let Some(mut renderers) = renderers(false) else {
+        return;
+    };
+    let renderer = &mut renderers[0];
+    renderer
+        .with_context(|gl| unsafe {
+            eprintln!(
+                "capture benchmark renderer: {:?}",
+                CStr::from_ptr(gl.GetString(ffi::RENDERER).cast())
+            );
+        })
+        .unwrap();
+    let mut source: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, (32, 32).into()).unwrap();
+    let destination: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, (32, 32).into()).unwrap();
+    let mut target = renderer.bind(&mut source).unwrap();
+    let mut frame = renderer
+        .render(&mut target, (32, 32).into(), Transform::Normal)
+        .unwrap();
+    frame
+        .clear(
+            Color32F::new(0.25, 0.5, 0.75, 1.),
+            &[Rectangle::from_size((32, 32).into())],
+        )
+        .unwrap();
+    let blit = |gl: &ffi::Gles2| unsafe {
+        gl.FramebufferTexture2D(
+            ffi::DRAW_FRAMEBUFFER,
+            ffi::COLOR_ATTACHMENT0,
+            ffi::TEXTURE_2D,
+            destination.tex_id(),
+            0,
+        );
+        gl.BlitFramebuffer(0, 0, 32, 32, 0, 0, 32, 32, ffi::COLOR_BUFFER_BIT, ffi::LINEAR);
+    };
+    let mut samples: [Vec<u128>; 2] = Default::default();
+    const CAPTURES: u32 = 32768;
+    for round in 0..10 {
+        // Alternate the order to avoid attributing driver warmup to one variant.
+        for mode in [round % 2, 1 - round % 2] {
+            frame.with_context(|gl| unsafe { gl.Finish() }).unwrap();
+            let start = std::time::Instant::now();
+            for _ in 0..CAPTURES {
+                if mode == 1 {
+                    frame
+                        .with_scratch_draw_framebuffer(|gl| unsafe {
+                            while gl.GetError() != ffi::NO_ERROR {}
+                            blit(gl);
+                            assert_eq!(gl.GetError(), ffi::NO_ERROR);
+                        })
+                        .unwrap();
+                } else {
+                    // Previous niri framebuffer-effect capture path.
+                    frame
+                        .with_context(|gl| unsafe {
+                            while gl.GetError() != ffi::NO_ERROR {}
+                            let mut previous = 0;
+                            gl.GetIntegerv(ffi::DRAW_FRAMEBUFFER_BINDING, &mut previous);
+                            gl.Disable(ffi::SCISSOR_TEST);
+                            let mut fbo = 0;
+                            gl.GenFramebuffers(1, &mut fbo);
+                            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbo);
+                            blit(gl);
+                            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, previous as u32);
+                            gl.Enable(ffi::SCISSOR_TEST);
+                            gl.DeleteFramebuffers(1, &fbo);
+                            assert_eq!(gl.GetError(), ffi::NO_ERROR);
+                        })
+                        .unwrap();
+                }
+            }
+            frame.with_context(|gl| unsafe { gl.Finish() }).unwrap();
+            samples[mode].push(start.elapsed().as_nanos() / u128::from(CAPTURES));
+        }
+    }
+    for (name, samples) in ["allocate", "scratch"].into_iter().zip(&mut samples) {
+        samples.sort_unstable();
+        eprintln!(
+            "frame capture {name}: median={} ns/capture samples={samples:?}",
+            samples[samples.len() / 2]
+        );
+    }
+    frame.finish().unwrap().wait().unwrap();
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
