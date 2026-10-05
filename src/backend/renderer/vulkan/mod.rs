@@ -2363,6 +2363,7 @@ impl crate::backend::renderer::ImportEgl for VulkanRenderer {
     }
 }
 
+#[cfg(feature = "wayland_frontend")]
 impl ImportDmaWl for VulkanRenderer {}
 
 impl Bind<Dmabuf> for VulkanRenderer {
