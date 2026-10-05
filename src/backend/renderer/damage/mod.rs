@@ -735,11 +735,19 @@ impl OutputDamageTracker {
         }
 
         // That is all completely new damage, which we need to store for subsequent renders
-        let mut new_damage = self.damage.clone();
-        new_damage.shrink_to_fit();
+        let use_history = age > 0 && self.last_state.old_damage.len() >= age;
+        let history_limit = if use_history { age } else { MAX_AGE };
+        // Reuse a snapshot outside the history retained for this frame.
+        let mut new_damage = if self.last_state.old_damage.len() > history_limit {
+            self.last_state.old_damage.pop_back().unwrap()
+        } else {
+            Vec::new()
+        };
+        new_damage.clear();
+        new_damage.extend_from_slice(&self.damage);
 
         // We now add old damage states, if we have an age value
-        if age > 0 && self.last_state.old_damage.len() >= age {
+        if use_history {
             trace!("age of {} recent enough, using old damage", age);
             // We do not need even older states anymore
             self.last_state.old_damage.truncate(age);
@@ -835,7 +843,6 @@ impl OutputDamageTracker {
         self.last_state
             .opaque_regions
             .extend(self.opaque_regions.iter().copied());
-        self.last_state.opaque_regions.shrink_to_fit();
         self.last_state.clear_color = clear_color;
 
         element_render_states
