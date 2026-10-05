@@ -405,6 +405,8 @@ pub struct VulkanRenderer {
     downscale_filter: TextureFilter,
     upscale_filter: TextureFilter,
     debug_flags: DebugFlags,
+    opaque_damage: Vec<Rectangle<i32, Physical>>,
+    non_opaque_damage: Vec<Rectangle<i32, Physical>>,
 
     /// Default color blend parameters applied to texture draws without a per-draw override.
     pub(super) default_color_params: Option<ColorBlendParams>,
@@ -683,6 +685,8 @@ impl VulkanRenderer {
             downscale_filter: TextureFilter::Linear,
             upscale_filter: TextureFilter::Linear,
             debug_flags: DebugFlags::empty(),
+            opaque_damage: Vec::new(),
+            non_opaque_damage: Vec::new(),
             default_color_params: None,
             solid_color_transform: None,
             user_data: UserDataMap::default(),

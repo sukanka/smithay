@@ -615,14 +615,16 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
 
         // Split the damage into opaque and non-opaque regions to disable blending where
         // possible, mirroring the GLES renderer.
-        let mut opaque_damage: Vec<Rectangle<i32, Physical>> = Vec::new();
-        let mut non_opaque_damage: Vec<Rectangle<i32, Physical>> = Vec::new();
+        let mut opaque_damage = std::mem::take(&mut self.renderer.opaque_damage);
+        let mut non_opaque_damage = std::mem::take(&mut self.renderer.non_opaque_damage);
+        opaque_damage.clear();
+        non_opaque_damage.clear();
 
         let is_implicit_opaque = !texture.0.has_alpha && alpha == 1f32;
-        if is_implicit_opaque {
-            opaque_damage.extend_from_slice(damage);
+        let (opaque_rects, non_opaque_rects) = if is_implicit_opaque {
+            (damage, &[][..])
         } else if alpha != 1f32 || opaque_regions.is_empty() {
-            non_opaque_damage.extend_from_slice(damage);
+            (&[][..], damage)
         } else {
             non_opaque_damage.extend_from_slice(damage);
             opaque_damage.extend_from_slice(damage);
@@ -630,31 +632,37 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 Rectangle::subtract_rects_many_in_place(non_opaque_damage, opaque_regions.iter().copied());
             opaque_damage =
                 Rectangle::subtract_rects_many_in_place(opaque_damage, non_opaque_damage.iter().copied());
-        }
+            (opaque_damage.as_slice(), non_opaque_damage.as_slice())
+        };
 
-        let format = self.target.vk_format();
-        let raw = self.renderer.device().raw.clone();
-        for (blend, damage) in [(true, &non_opaque_damage), (false, &opaque_damage)] {
-            if damage.is_empty() {
-                continue;
+        let result = (|| {
+            let format = self.target.vk_format();
+            let raw = self.renderer.device().raw.clone();
+            for (blend, damage) in [(true, non_opaque_rects), (false, opaque_rects)] {
+                if damage.is_empty() {
+                    continue;
+                }
+                let pipeline = self.renderer.get_pipeline(format, false, blend)?;
+                self.bind_pipeline(pipeline);
+                unsafe {
+                    raw.cmd_bind_descriptor_sets(
+                        self.cb,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.renderer.pipeline_layout,
+                        0,
+                        &[ds],
+                        &[],
+                    );
+                }
+                // Texture vertices are in dest-local coordinates.
+                self.draw_rects(&pc, dest, Point::default(), damage);
             }
-            let pipeline = self.renderer.get_pipeline(format, false, blend)?;
-            self.bind_pipeline(pipeline);
-            unsafe {
-                raw.cmd_bind_descriptor_sets(
-                    self.cb,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.renderer.pipeline_layout,
-                    0,
-                    &[ds],
-                    &[],
-                );
-            }
-            // Texture vertices are in dest-local coordinates.
-            self.draw_rects(&pc, dest, Point::default(), damage);
-        }
 
-        Ok(())
+            Ok(())
+        })();
+        self.renderer.opaque_damage = opaque_damage;
+        self.renderer.non_opaque_damage = non_opaque_damage;
+        result
     }
 
     fn finish_internal(&mut self) -> Result<SyncPoint, VulkanError> {
