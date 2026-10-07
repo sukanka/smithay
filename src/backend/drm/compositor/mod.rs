@@ -2296,9 +2296,9 @@ where
         let placeholder = previous_primary
             .filter(|state| {
                 allow_partial_update
-                    && frame_flags.intersects(
-                        FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY,
-                    )
+                    // Restricted scanout compares the candidate with the actual slot,
+                    // including its modifier, so acquire it before assigning planes.
+                    && frame_flags.contains(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY)
                     && state
                         .buffer()
                         .is_some_and(|buffer| !matches!(buffer.buffer, ScanoutBuffer::Swapchain(_)))
@@ -4987,10 +4987,9 @@ where
             other_geometry.overlaps(element_config.geometry)
         });
 
-        let primary_plane_has_alpha = frame_state
-            .plane_buffer(self.surface.plane())
-            .map(|state| has_alpha(state.format().code))
-            .unwrap_or(false);
+        // An underlay forces primary-plane composition. Its hole must therefore be
+        // visible through the swapchain framebuffer, regardless of a scanout placeholder.
+        let primary_plane_has_alpha = !self.primary_is_opaque && has_alpha(self.swapchain.format());
 
         let previous_frame_state = self
             .pending_frame
