@@ -239,10 +239,10 @@ impl<A: GraphicsApi> GpuManager<A> {
     }
 
     fn enumerate_devices(&mut self) -> Result<(), A::Error> {
-        let result = self.api.enumerate(&mut self.devices);
+        self.api.enumerate(&mut self.devices)?;
         let nodes: Vec<_> = self.devices.iter().map(|device| *device.node()).collect();
         retain_live_buffer_pairs(&mut self.dmabuf_cache, &nodes);
-        result
+        Ok(())
     }
 
     /// Get all devices enumerated by the API.
@@ -420,12 +420,11 @@ impl<A: GraphicsApi> GpuManager<A> {
             // This cache lives on the target manager, so also retire pairs whose
             // source was removed from the separate render manager.
             let previous_nodes: Vec<_> = render_api.devices.iter().map(|device| *device.node()).collect();
-            let result = render_api.enumerate_devices();
+            render_api.enumerate_devices().map_err(Error::RenderApiError)?;
             target_api.dmabuf_cache.retain(|(source, _), _| {
                 !previous_nodes.contains(source)
                     || render_api.devices.iter().any(|device| device.node() == source)
             });
-            result.map_err(Error::RenderApiError)?;
         }
 
         if !target_api
