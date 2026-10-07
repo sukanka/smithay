@@ -64,7 +64,13 @@ pub(crate) fn wait(fd: BorrowedFd<'_>) {
             }
             // EINTR does not establish completion. An owned, valid sync_file cannot become
             // invalid while it is held here, so never replace a failed wait with release.
-            _ => continue,
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(err) => {
+                super::failed_wait(err);
+            }
+            Ok(_) => {
+                super::failed_wait(fds[0].revents());
+            }
         }
     }
 }

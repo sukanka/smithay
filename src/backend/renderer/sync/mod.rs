@@ -3,6 +3,27 @@ use std::{error::Error, fmt, os::unix::io::OwnedFd, sync::Arc};
 
 use downcast_rs::{Downcast, impl_downcast};
 
+#[cfg(any(feature = "backend_egl", feature = "backend_drm", feature = "renderer_vulkan"))]
+pub(crate) const FAILED_WAIT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+
+#[cfg(any(feature = "backend_egl", feature = "backend_drm", feature = "renderer_vulkan"))]
+pub(crate) fn failed_wait(err: impl fmt::Debug) -> Interrupted {
+    use std::{sync::Mutex, time::Instant};
+
+    static LAST_WARNING: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut last_warning = LAST_WARNING.lock().unwrap();
+    let now = Instant::now();
+    if last_warning.is_none_or(|last| now.duration_since(last) >= std::time::Duration::from_secs(1)) {
+        tracing::warn!(?err, "Waiting for GPU completion failed; retrying");
+        *last_warning = Some(now);
+    }
+    drop(last_warning);
+    // Fence errors do not establish completion. Bound retries without releasing
+    // buffers which the GPU may still be accessing, even after device loss.
+    std::thread::sleep(FAILED_WAIT_RETRY_DELAY);
+    Interrupted
+}
+
 #[cfg(feature = "backend_egl")]
 mod egl;
 

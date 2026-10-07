@@ -2,15 +2,12 @@ use std::{os::unix::io::OwnedFd, time::Duration};
 
 use crate::backend::{
     egl::fence::EGLFence,
-    renderer::sync::{Fence, Interrupted},
+    renderer::sync::{Fence, Interrupted, failed_wait},
 };
 
 impl Fence for EGLFence {
     fn wait(&self) -> Result<(), Interrupted> {
-        self.client_wait(None, false).map(|_| ()).map_err(|err| {
-            tracing::warn!(?err, "Waiting for fence was interrupted");
-            Interrupted
-        })
+        self.client_wait(None, false).map(|_| ()).map_err(failed_wait)
     }
 
     fn is_exportable(&self) -> bool {

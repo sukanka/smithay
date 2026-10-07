@@ -11,6 +11,7 @@ use std::{
 };
 
 use super::*;
+use crate::backend::renderer::sync::FAILED_WAIT_RETRY_DELAY;
 use crate::backend::renderer::{
     sync::SyncPoint,
     vulkan::{VulkanRenderer, descriptor_pool_tests::renderer},
