@@ -86,6 +86,18 @@ impl<T> CachedState<T> {
         &mut self.current
     }
 
+    /// Access the current state and all queued committed updates for `T`.
+    ///
+    /// Updates are visited in commit order, after the current state. This excludes the
+    /// pending state, which has not yet been committed by the client. Mutating queued
+    /// updates does not apply them or release any transaction blockers.
+    ///
+    /// This can be used to retire committed presentation feedback when a surface is
+    /// unmapped, including feedback queued behind a buffer readiness blocker.
+    pub fn committed_iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        std::iter::once(&mut self.current).chain(self.cache.iter_mut().map(|(_, state)| state))
+    }
+
     /// Access the pending state for `T`
     pub fn pending(&mut self) -> &mut T {
         &mut self.pending
@@ -220,5 +232,29 @@ impl MultiCache {
         for cache in &self.caches {
             cache.apply_state(commit_id, dh);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn committed_iteration_preserves_pending_state_and_commit_order() {
+        let mut state = CachedState {
+            pending: vec![4],
+            current: vec![1],
+            cache: VecDeque::from([(1.into(), vec![2]), (2.into(), vec![3])]),
+        };
+
+        let mut retired = Vec::new();
+        for committed in state.committed_iter_mut() {
+            retired.append(committed);
+        }
+
+        assert_eq!(retired, [1, 2, 3]);
+        assert_eq!(state.pending, [4]);
+        assert!(state.current.is_empty());
+        assert_eq!(state.cache, [(1.into(), vec![]), (2.into(), vec![])]);
     }
 }
