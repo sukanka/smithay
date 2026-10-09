@@ -3123,6 +3123,34 @@ where
         Ok(())
     }
 
+    /// Takes all synchronization points from the frame prepared by the last
+    /// [`render_frame`](DrmCompositor::render_frame) call.
+    ///
+    /// After calling this function, the next [`queue_frame`](DrmCompositor::queue_frame)
+    /// will submit the prepared frame without any input fences. The caller must wait for every
+    /// returned synchronization point before queueing the frame. This is useful for drivers where
+    /// KMS input fences are unreliable, while still allowing the waits to be integrated into an
+    /// asynchronous event loop.
+    #[must_use = "all returned synchronization points must be awaited before queueing the frame"]
+    pub fn take_pending_frame_sync_points(&mut self) -> Vec<SyncPoint> {
+        let Some(frame) = self.next_frame.as_mut() else {
+            return Vec::new();
+        };
+
+        frame
+            .frame
+            .planes
+            .iter_mut()
+            .filter_map(|(_, state)| {
+                state
+                    .config
+                    .as_mut()
+                    .and_then(|config| config.sync.take())
+                    .map(|(sync, _)| sync)
+            })
+            .collect()
+    }
+
     /// Commits the current frame for scan-out.
     ///
     /// If `render_frame` has not been called prior to this function or returned no damage
