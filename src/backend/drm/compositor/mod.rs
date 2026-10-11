@@ -3873,9 +3873,42 @@ where
     /// commit, so the connector color properties are applied in a *single* atomic commit
     /// together with the mode, CRTC and plane state.
     ///
-    /// See [`DrmSurface::use_color_state`] for more details.
+    /// Tests the state with an unused swapchain framebuffer in this compositor's actual
+    /// format and modifier, resetting other owned planes for the test. The buffer is neither
+    /// rendered into nor submitted, and buffers still in flight are never acquired.
+    ///
+    /// See [`DrmSurface::use_color_state_with_planes`] for more details.
     pub fn use_color_state(&mut self, state: ConnectorColorState) -> FrameResult<(), A, F> {
-        self.surface.use_color_state(state).map_err(FrameError::DrmError)
+        if !self.surface.is_active() {
+            return Err(FrameError::DrmError(DrmError::DeviceInactive));
+        }
+        if self.surface.is_legacy() {
+            return self.surface.use_color_state(state).map_err(FrameError::DrmError);
+        }
+        if self.surface.pending_color_state() == state {
+            return Ok(());
+        }
+        let mode = self.surface.pending_mode();
+        let size = Size::from((i32::from(mode.size().0), i32::from(mode.size().1)));
+        let primary = self.acquire_primary_plane_state(size)?;
+        let format = primary.config.as_ref().unwrap().properties.format;
+        let mut test_frame = FrameState::from_planes(self.surface.plane(), &self.planes);
+        test_frame.set_state(self.surface.plane(), primary);
+        let planes = test_frame
+            .build_planes(&self.surface, self.supports_fencing, false)
+            .into_iter()
+            .collect::<Vec<_>>();
+        self.surface
+            .use_color_state_with_planes(state, &planes)
+            .map_err(|err| {
+                warn!(
+                    ?state,
+                    ?format,
+                    ?err,
+                    "Connector color test failed with composition framebuffer"
+                );
+                FrameError::DrmError(err)
+            })
     }
 
     /// Set the [`DebugFlags`] to use

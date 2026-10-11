@@ -88,22 +88,42 @@ pub enum Error {
     TestFailed(crtc::Handle),
 }
 
+fn temporary_access_error(source: &io::Error) -> bool {
+    matches!(
+        source.kind(),
+        ErrorKind::PermissionDenied
+            | ErrorKind::WouldBlock
+            | ErrorKind::Interrupted
+            | ErrorKind::ResourceBusy
+    )
+}
+
+/// Preserve transient failures of TEST_ONLY requests so callers can retry after a VT/master
+/// change or a busy commit, instead of treating the requested configuration as unsupported.
+/// Other failures retain the historical `TestFailed` result.
+pub(super) fn atomic_test_error(
+    crtc: crtc::Handle,
+    dev: Option<PathBuf>,
+    errmsg: &'static str,
+    source: io::Error,
+) -> Error {
+    if temporary_access_error(&source) {
+        Error::Access(AccessError { errmsg, dev, source })
+    } else {
+        Error::TestFailed(crtc)
+    }
+}
+
 impl From<Error> for SwapBuffersError {
     #[inline]
     fn from(err: Error) -> SwapBuffersError {
-        // FIXME: replace the special handling for EBUSY with ErrorKind::ResourceBusy once
-        // we reach MSRV >= 1.83
         match err {
             x @ Error::DeviceInactive | x @ Error::DrmMasterFailed => {
                 SwapBuffersError::TemporaryFailure(Box::new(x))
             }
             Error::Access(AccessError {
                 errmsg, dev, source, ..
-            }) if matches!(
-                source.kind(),
-                ErrorKind::PermissionDenied | ErrorKind::WouldBlock | ErrorKind::Interrupted
-            ) || rustix::io::Errno::from_io_error(&source) == Some(rustix::io::Errno::BUSY) =>
-            {
+            }) if temporary_access_error(&source) => {
                 SwapBuffersError::TemporaryFailure(Box::new(Error::Access(AccessError {
                     errmsg,
                     dev,
@@ -111,6 +131,62 @@ impl From<Error> for SwapBuffersError {
                 })))
             }
             x => SwapBuffersError::ContextLost(Box::new(x)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use super::*;
+
+    #[test]
+    fn atomic_test_retains_temporary_errno_and_access_context() {
+        let crtc = crtc::Handle::from(NonZeroU32::new(42).unwrap());
+        let dev = Some(PathBuf::from("/dev/dri/card-test"));
+        for errno in [libc::EACCES, libc::EPERM, libc::EAGAIN, libc::EINTR, libc::EBUSY] {
+            let error = atomic_test_error(
+                crtc,
+                dev.clone(),
+                "Error testing connector color state",
+                io::Error::from_raw_os_error(errno),
+            );
+            let Error::Access(access) = &error else {
+                panic!("temporary errno {errno} became {error:?}");
+            };
+            assert_eq!(access.dev, dev);
+            assert_eq!(access.errmsg, "Error testing connector color state");
+            assert_eq!(access.source.raw_os_error(), Some(errno));
+            assert!(matches!(
+                SwapBuffersError::from(error),
+                SwapBuffersError::TemporaryFailure(_)
+            ));
+        }
+
+        // ErrorKind also works when a caller supplies an error without a raw OS errno.
+        let error = atomic_test_error(crtc, None, "Error testing state", ErrorKind::ResourceBusy.into());
+        assert!(matches!(
+            SwapBuffersError::from(error),
+            SwapBuffersError::TemporaryFailure(_)
+        ));
+    }
+
+    #[test]
+    fn atomic_test_permanent_failures_keep_test_failed_semantics() {
+        let crtc = crtc::Handle::from(NonZeroU32::new(42).unwrap());
+        for errno in [libc::EINVAL, libc::EIO, libc::ENODEV, libc::ENOMEM] {
+            let error = atomic_test_error(
+                crtc,
+                None,
+                "Error testing connector color state",
+                io::Error::from_raw_os_error(errno),
+            );
+            assert!(matches!(error, Error::TestFailed(handle) if handle == crtc));
+            assert!(matches!(
+                SwapBuffersError::from(error),
+                SwapBuffersError::ContextLost(_)
+            ));
         }
     }
 }

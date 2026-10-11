@@ -18,7 +18,7 @@ use std::sync::{
 };
 
 use crate::backend::drm::color::{self, Colorspace, ConnectorColorState, HdmiVsifMetadata};
-use crate::backend::drm::error::AccessError;
+use crate::backend::drm::error::{AccessError, atomic_test_error};
 use crate::utils::{Coordinate, Rectangle, Transform};
 use crate::{
     backend::{
@@ -683,7 +683,14 @@ impl AtomicDrmSurface {
                     AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
                     req.build()?,
                 )
-                .map_err(|_| Error::TestFailed(self.crtc))?;
+                .map_err(|source| {
+                    atomic_test_error(
+                        self.crtc,
+                        self.fd.dev_path(),
+                        "Error testing added connector",
+                        source,
+                    )
+                })?;
 
             // seems to be, lets add the connector
             pending.connectors.insert(conn);
@@ -745,7 +752,14 @@ impl AtomicDrmSurface {
                 AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
                 req.build()?,
             )
-            .map_err(|_| Error::TestFailed(self.crtc))?;
+            .map_err(|source| {
+                atomic_test_error(
+                    self.crtc,
+                    self.fd.dev_path(),
+                    "Error testing removed connector",
+                    source,
+                )
+            })?;
 
         // seems to be, lets remove the connector
         pending.connectors.remove(&conn);
@@ -816,7 +830,14 @@ impl AtomicDrmSurface {
                 AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
                 req.build()?,
             )
-            .map_err(|_| Error::TestFailed(self.crtc))?;
+            .map_err(|source| {
+                atomic_test_error(
+                    self.crtc,
+                    self.fd.dev_path(),
+                    "Error testing connector set",
+                    source,
+                )
+            })?;
 
         pending.connectors = conns;
         pending.resolved_color = resolved_color;
@@ -873,7 +894,7 @@ impl AtomicDrmSurface {
                 AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
                 req.build()?,
             )
-            .map_err(|_| Error::TestFailed(self.crtc))
+            .map_err(|source| atomic_test_error(self.crtc, self.fd.dev_path(), "Error testing mode", source))
         {
             let _ = self.fd.destroy_property_blob(new_blob.into());
             return Err(err);
@@ -1012,7 +1033,9 @@ impl AtomicDrmSurface {
                 AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
                 req.build()?,
             )
-            .map_err(|_| Error::TestFailed(self.crtc))?;
+            .map_err(|source| {
+                atomic_test_error(self.crtc, self.fd.dev_path(), "Error testing VRR state", source)
+            })?;
 
         pending.vrr = value;
         Ok(())
@@ -1137,6 +1160,22 @@ impl AtomicDrmSurface {
     /// The kernel latches connector property values, so page flips after the commit keep
     /// the signalled state without re-emitting it.
     pub fn use_color_state(&self, color_state: ConnectorColorState) -> Result<(), Error> {
+        self.use_color_state_impl(color_state, None)
+    }
+
+    pub fn use_color_state_with_planes(
+        &self,
+        color_state: ConnectorColorState,
+        planes: &[PlaneState<'_>],
+    ) -> Result<(), Error> {
+        self.use_color_state_impl(color_state, Some(planes))
+    }
+
+    fn use_color_state_impl(
+        &self,
+        color_state: ConnectorColorState,
+        supplied_planes: Option<&[PlaneState<'_>]>,
+    ) -> Result<(), Error> {
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
         }
@@ -1193,32 +1232,40 @@ impl AtomicDrmSurface {
         };
 
         let res = (|| {
-            let test_buffer = self.create_test_buffer(pending.mode.size(), self.plane)?;
-            let plane_config = PlaneState {
-                handle: self.plane,
-                config: Some(PlaneConfig {
-                    src: Rectangle::from_size(pending.mode.size().into()).to_f64(),
-                    dst: Rectangle::from_size(
-                        (pending.mode.size().0 as i32, pending.mode.size().1 as i32).into(),
-                    ),
-                    transform: Transform::Normal,
-                    alpha: 1.0,
-                    damage_clips: None,
-                    fb: test_buffer.fb,
-                    fence: None,
-                    color_pipeline: None,
-                }),
+            // Only the compatibility API needs a temporary 8-bit dumb buffer. Compositors
+            // supply their actual format/modifier and all owned plane resets instead.
+            let test_buffer;
+            let test_plane;
+            let planes = if let Some(planes) = supplied_planes {
+                planes
+            } else {
+                test_buffer = self.create_test_buffer(pending.mode.size(), self.plane)?;
+                test_plane = PlaneState {
+                    handle: self.plane,
+                    config: Some(PlaneConfig {
+                        src: Rectangle::from_size(pending.mode.size().into()).to_f64(),
+                        dst: Rectangle::from_size(
+                            (pending.mode.size().0 as i32, pending.mode.size().1 as i32).into(),
+                        ),
+                        transform: Transform::Normal,
+                        alpha: 1.0,
+                        damage_clips: None,
+                        fb: test_buffer.fb,
+                        fence: None,
+                        color_pipeline: None,
+                    }),
+                };
+                std::slice::from_ref(&test_plane)
             };
 
-            let req = AtomicRequest::build_request(
+            let req = color_state_test_request(
                 &prop_mapping,
                 self.crtc,
-                Some(pending.blob),
-                pending.vrr,
-                Some(&resolved),
-                &pending.connectors,
-                &[],
-                [&plane_config],
+                self.plane,
+                &current,
+                &pending,
+                &resolved,
+                planes,
             )?;
 
             self.fd
@@ -1226,7 +1273,22 @@ impl AtomicDrmSurface {
                     AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
                     req.build()?,
                 )
-                .map_err(|_| Error::TestFailed(self.crtc))
+                .map_err(|source| {
+                    if supplied_planes.is_some() {
+                        Error::Access(AccessError {
+                            errmsg: "Error testing connector color state with supplied planes",
+                            dev: self.fd.dev_path(),
+                            source,
+                        })
+                    } else {
+                        atomic_test_error(
+                            self.crtc,
+                            self.fd.dev_path(),
+                            "Error testing connector color state",
+                            source,
+                        )
+                    }
+                })
         })();
 
         if let Err(err) = res {
@@ -1390,7 +1452,12 @@ impl AtomicDrmSurface {
             ) {
                 warn!("New screen configuration invalid!:\n\t{:?}\n\t{}\n", req, err);
 
-                return Err(Error::TestFailed(self.crtc));
+                return Err(atomic_test_error(
+                    self.crtc,
+                    self.fd.dev_path(),
+                    "Error testing screen configuration before commit",
+                    err,
+                ));
             } else {
                 if current.mode != pending.mode {
                     if let Err(err) = self.fd.destroy_property_blob(current.blob.into()) {
@@ -1740,6 +1807,144 @@ mod test {
     };
 
     use super::{AtomicDrmSurface, read_crtc_flags};
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn color_test_uses_supplied_framebuffer_plane_resets_and_gamma_reset() {
+        use std::num::NonZeroU32;
+
+        use crate::backend::drm::colorop::ResolvedColorPipeline;
+
+        use super::*;
+
+        let conn = connector::Handle::from(NonZeroU32::new(10).unwrap());
+        let detached = connector::Handle::from(NonZeroU32::new(11).unwrap());
+        let crtc = crtc::Handle::from(NonZeroU32::new(20).unwrap());
+        let primary = plane::Handle::from(NonZeroU32::new(30).unwrap());
+        let overlay = plane::Handle::from(NonZeroU32::new(31).unwrap());
+        let framebuffer = framebuffer::Handle::from(NonZeroU32::new(100).unwrap());
+        let gamma_prop = property::Handle::from(NonZeroU32::new(101).unwrap());
+        let mut mapping = PropMapping::default();
+        let properties = |names: &[&str]| {
+            names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    (
+                        (*name).to_owned(),
+                        property::Handle::from(NonZeroU32::new(index as u32 + 200).unwrap()),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        };
+        mapping.connectors.insert(
+            conn,
+            properties(&[
+                "CRTC_ID",
+                "Colorspace",
+                "HDR_OUTPUT_METADATA",
+                "NV_HDMI_VSIF_METADATA",
+            ]),
+        );
+        mapping
+            .connectors
+            .insert(detached, mapping.connectors[&conn].clone());
+        mapping.crtcs.insert(crtc, properties(&["MODE_ID", "ACTIVE"]));
+        for plane in [primary, overlay] {
+            mapping.planes.insert(
+                plane,
+                properties(&[
+                    "CRTC_ID",
+                    "FB_ID",
+                    "SRC_X",
+                    "SRC_Y",
+                    "SRC_W",
+                    "SRC_H",
+                    "CRTC_X",
+                    "CRTC_Y",
+                    "CRTC_W",
+                    "CRTC_H",
+                    "COLOR_PIPELINE",
+                ]),
+            );
+        }
+        let pending = State {
+            active: true,
+            mode: Mode::from(drm_ffi::drm_mode_modeinfo::default()),
+            blob: property::Value::Blob(400),
+            vrr: false,
+            connectors: HashSet::from([conn]),
+            color_state: ConnectorColorState::default(),
+            resolved_color: ResolvedColorState::default(),
+        };
+        let candidate = ResolvedColorState {
+            colorspace_values: HashMap::from([(conn, 9)]),
+            hdr_blob: property::Value::Blob(401),
+            ..Default::default()
+        };
+        let mut current = pending.clone();
+        current.connectors.insert(detached);
+        let gamma_reset = ResolvedColorPipeline::with_gamma_lut(None, crtc.into(), gamma_prop, None);
+        let planes = [
+            PlaneState {
+                handle: primary,
+                config: Some(PlaneConfig {
+                    src: Rectangle::from_size((3840, 2160).into()).to_f64(),
+                    dst: Rectangle::from_size((3840, 2160).into()),
+                    transform: Transform::Normal,
+                    alpha: 1.0,
+                    damage_clips: None,
+                    fb: framebuffer,
+                    fence: None,
+                    color_pipeline: Some(&gamma_reset),
+                }),
+            },
+            PlaneState {
+                handle: overlay,
+                config: None,
+            },
+        ];
+        let req = color_state_test_request(&mapping, crtc, primary, &current, &pending, &candidate, &planes)
+            .unwrap();
+        assert_eq!(
+            req.plane_props[&primary]["FB_ID"],
+            property::Value::Framebuffer(Some(framebuffer))
+        );
+        assert_eq!(
+            req.plane_props[&overlay]["FB_ID"],
+            property::Value::Framebuffer(None)
+        );
+        assert_eq!(req.plane_props[&overlay]["CRTC_ID"], property::Value::CRTC(None));
+        assert_eq!(
+            req.connector_props[&conn]["HDR_OUTPUT_METADATA"],
+            candidate.hdr_blob
+        );
+        assert_eq!(
+            req.connector_props[&conn]["NV_HDMI_VSIF_METADATA"],
+            property::Value::Blob(0)
+        );
+        assert_eq!(req.crtc_props[&crtc]["MODE_ID"], pending.blob);
+        assert_eq!(
+            req.connector_props[&detached]["CRTC_ID"],
+            property::Value::CRTC(None)
+        );
+        assert_eq!(
+            req.connector_props[&detached]["NV_HDMI_VSIF_METADATA"],
+            property::Value::Blob(0)
+        );
+        assert!(req.colorop_props.contains(&(crtc.into(), gamma_prop, 0)));
+        assert!(req.build().is_ok());
+        assert_eq!(pending.color_state, ConnectorColorState::default());
+
+        // A caller cannot silently turn this into a connector-only test, or supply only
+        // an overlay framebuffer while leaving the primary plane out of the request.
+        for missing_primary in [&planes[0..0], &planes[1..]] {
+            assert!(matches!(
+                color_state_test_request(&mapping, crtc, primary, &current, &pending, &candidate, missing_primary),
+                Err(Error::NoFramebuffer(handle)) if handle == primary
+            ));
+        }
+    }
 
     #[test]
     fn vsif_requires_property_on_every_connector() {
@@ -2532,6 +2737,8 @@ impl<'a> AtomicRequest<'a> {
 }
 
 impl<'a> AtomicRequest<'a> {
+    // Keep the candidate connector state and supplied framebuffer in the same atomic
+    // request; testing connector properties alone cannot validate the display pipeline.
     #[allow(clippy::too_many_arguments)]
     fn build_request(
         mapping: &'a PropMapping,
@@ -2571,4 +2778,31 @@ impl<'a> AtomicRequest<'a> {
 
         Ok(req)
     }
+}
+
+fn color_state_test_request<'a>(
+    mapping: &'a PropMapping,
+    crtc: crtc::Handle,
+    primary: plane::Handle,
+    current: &'a State,
+    pending: &'a State,
+    color: &'a ResolvedColorState,
+    planes: &'a [PlaneState<'a>],
+) -> Result<AtomicRequest<'a>, Error> {
+    if !planes
+        .iter()
+        .any(|plane| plane.handle == primary && plane.config.is_some())
+    {
+        return Err(Error::NoFramebuffer(primary));
+    }
+    AtomicRequest::build_request(
+        mapping,
+        crtc,
+        Some(pending.blob),
+        pending.vrr,
+        Some(color),
+        &pending.connectors,
+        current.connectors.difference(&pending.connectors),
+        planes,
+    )
 }

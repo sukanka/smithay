@@ -486,6 +486,10 @@ impl DrmSurface {
     /// changes as requiring a full modeset and misbehave when they are committed with
     /// incomplete pipeline state.
     ///
+    /// This convenience method tests with a temporary 8-bit dumb framebuffer. A rejection
+    /// may be specific to that buffer's format or modifier; applications with a framebuffer
+    /// available should use [`use_color_state_with_planes`](Self::use_color_state_with_planes).
+    ///
     /// Use [`supported_colorspaces`](DrmSurface::supported_colorspaces),
     /// [`hdr_metadata_supported`](DrmSurface::hdr_metadata_supported),
     /// [`hdmi_vsif_supported`](DrmSurface::hdmi_vsif_supported) and
@@ -507,6 +511,27 @@ impl DrmSurface {
                     })
                 }
             }
+        }
+    }
+
+    /// Tests and stages connector color state using the supplied framebuffer and plane state.
+    ///
+    /// The primary plane must contain a framebuffer. Include all other planes used on this
+    /// CRTC, using `config: None` to disable a plane for the test. The framebuffers and any
+    /// referenced color-pipeline blobs must remain alive until this method returns.
+    ///
+    /// This issues only `TEST_ONLY | ALLOW_MODESET`; it does not display or write the buffers.
+    /// Pending color state is replaced only after a successful test. The next full commit
+    /// still validates the actual submitted frame. Test failures preserve their DRM errno.
+    /// On the legacy DRM api, only the default color state is accepted.
+    pub fn use_color_state_with_planes(
+        &self,
+        state: ConnectorColorState,
+        planes: &[PlaneState<'_>],
+    ) -> Result<(), Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.use_color_state_with_planes(state, planes),
+            DrmSurfaceInternal::Legacy(_) => self.use_color_state(state),
         }
     }
 
