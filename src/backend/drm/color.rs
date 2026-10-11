@@ -304,7 +304,20 @@ pub(super) mod ffi {
     pub struct HdrOutputMetadata {
         pub metadata_type: u32,
         pub hdmi_metadata_type1: HdrMetadataInfoframe,
+        // The C ABI ends with two padding bytes. Make them actual initialized fields so
+        // create_property_blob never reads Rust padding, and equal metadata has equal bytes.
+        _reserved: [u8; 2],
     }
+
+    // All 32 bytes are copied to the kernel. These sizes and offsets prove that the
+    // integer fields plus explicit reserved bytes cover the layout without hidden padding.
+    const _: () = {
+        assert!(std::mem::size_of::<HdrColorPoint>() == 4);
+        assert!(std::mem::size_of::<HdrMetadataInfoframe>() == 26);
+        assert!(std::mem::offset_of!(HdrOutputMetadata, hdmi_metadata_type1) == 4);
+        assert!(std::mem::offset_of!(HdrOutputMetadata, _reserved) == 30);
+        assert!(std::mem::size_of::<HdrOutputMetadata>() == 32);
+    };
 
     impl From<super::HdrOutputMetadata> for HdrOutputMetadata {
         fn from(meta: super::HdrOutputMetadata) -> Self {
@@ -325,6 +338,7 @@ pub(super) mod ffi {
                     max_cll: meta.max_cll,
                     max_fall: meta.max_fall,
                 },
+                _reserved: [0; 2],
             }
         }
     }
@@ -408,6 +422,32 @@ mod tests {
         // The blob is passed to the kernel verbatim, so the layout must match
         // `struct hdr_output_metadata` exactly: 4-byte type + 26-byte infoframe, padded to 32.
         assert_eq!(std::mem::size_of::<ffi::HdrOutputMetadata>(), 32);
+        assert_eq!(std::mem::offset_of!(ffi::HdrOutputMetadata, metadata_type), 0);
+        assert_eq!(
+            std::mem::offset_of!(ffi::HdrOutputMetadata, hdmi_metadata_type1),
+            4
+        );
+        assert_eq!(std::mem::size_of::<ffi::HdrColorPoint>(), 4);
+        assert_eq!(std::mem::offset_of!(ffi::HdrColorPoint, x), 0);
+        assert_eq!(std::mem::offset_of!(ffi::HdrColorPoint, y), 2);
+        assert_eq!(std::mem::size_of::<ffi::HdrMetadataInfoframe>(), 26);
+        assert_eq!(std::mem::offset_of!(ffi::HdrMetadataInfoframe, eotf), 0);
+        assert_eq!(std::mem::offset_of!(ffi::HdrMetadataInfoframe, metadata_type), 1);
+        assert_eq!(
+            std::mem::offset_of!(ffi::HdrMetadataInfoframe, display_primaries),
+            2
+        );
+        assert_eq!(std::mem::offset_of!(ffi::HdrMetadataInfoframe, white_point), 14);
+        assert_eq!(
+            std::mem::offset_of!(ffi::HdrMetadataInfoframe, max_display_mastering_luminance),
+            18
+        );
+        assert_eq!(
+            std::mem::offset_of!(ffi::HdrMetadataInfoframe, min_display_mastering_luminance),
+            20
+        );
+        assert_eq!(std::mem::offset_of!(ffi::HdrMetadataInfoframe, max_cll), 22);
+        assert_eq!(std::mem::offset_of!(ffi::HdrMetadataInfoframe, max_fall), 24);
 
         let meta: ffi::HdrOutputMetadata = HdrOutputMetadata::pq_bt2020(500, 50, 400, 300).into();
         let bytes = unsafe {
@@ -416,6 +456,16 @@ mod tests {
                 std::mem::size_of::<ffi::HdrOutputMetadata>(),
             )
         };
+
+        // Includes the ABI's two trailing reserved bytes. No compiler padding is read.
+        assert_eq!(
+            bytes,
+            &[
+                0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x48, 0x8a, 0x08, 0x39, 0x34, 0x21, 0xaa, 0x9b, 0x96,
+                0x19, 0xfc, 0x08, 0x13, 0x3d, 0x42, 0x40, 0xf4, 0x01, 0x32, 0x00, 0x90, 0x01, 0x2c, 0x01,
+                0x00, 0x00,
+            ]
+        );
 
         // metadata_type: u32 = HDMI_STATIC_METADATA_TYPE1 (0)
         assert_eq!(&bytes[0..4], &0u32.to_le_bytes());
@@ -453,6 +503,11 @@ mod tests {
             )
         };
         assert_eq!(ffi::HdrOutputMetadata::parse(bytes), Some(meta));
+        assert_eq!(ffi::HdrOutputMetadata::parse(&bytes[..30]), Some(meta));
+        assert_eq!(ffi::HdrOutputMetadata::parse(&bytes[..29]), None);
+        let mut with_foreign_padding = bytes.to_vec();
+        with_foreign_padding[30..].copy_from_slice(&[0xaa, 0xbb]);
+        assert_eq!(ffi::HdrOutputMetadata::parse(&with_foreign_padding), Some(meta));
     }
 
     #[test]
