@@ -17,8 +17,26 @@
 use drm::control::{Device as ControlDevice, connector};
 use libdisplay_info::info::Info;
 
+mod dolby_vision;
+pub use dolby_vision::DolbyVisionCapabilities;
+
 /// Try to read the [`Info`] from the connector EDID property
 pub fn for_connector(device: &impl ControlDevice, connector: connector::Handle) -> Option<Info> {
+    Info::parse_edid(&edid_for_connector(device, connector)?).ok()
+}
+
+/// Read the connector's Dolby Vision version 2 capabilities.
+///
+/// Returns `None` if the EDID is malformed or does not contain a supported Dolby
+/// Vision block. This describes the sink, not the driver or active wire format.
+pub fn get_dolby_vision_info(
+    device: &impl ControlDevice,
+    connector: connector::Handle,
+) -> Option<DolbyVisionCapabilities> {
+    DolbyVisionCapabilities::from_edid(&edid_for_connector(device, connector)?)
+}
+
+fn edid_for_connector(device: &impl ControlDevice, connector: connector::Handle) -> Option<Vec<u8>> {
     let props = device.get_properties(connector).ok()?;
 
     let (info, value) = props
@@ -31,7 +49,5 @@ pub fn for_connector(device: &impl ControlDevice, connector: connector::Handle) 
         .find(|(info, _)| info.name().to_str() == Ok("EDID"))?;
 
     let blob = info.value_type().convert_value(value).as_blob()?;
-    let data = device.get_property_blob(blob).ok()?;
-
-    Info::parse_edid(&data).ok()
+    device.get_property_blob(blob).ok()
 }
