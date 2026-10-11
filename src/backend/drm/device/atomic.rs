@@ -224,10 +224,9 @@ impl AtomicDrmDevice {
         // Disable all connectors (otherwise we might run into conflicting commits when restarting the rendering loop)
         let mut req = AtomicModeReq::new();
         for conn in res_handles.connectors() {
-            let prop = prop_mapping
-                .conn_prop_handle(*conn, "CRTC_ID")
-                .expect("Unknown property CRTC_ID");
-            req.add_property(*conn, prop, property::Value::CRTC(None));
+            for (prop, value) in connector_reset_properties(&prop_mapping, *conn)? {
+                req.add_property(*conn, prop, value);
+            }
         }
         // Disable all planes
         for plane in plane_handles {
@@ -265,6 +264,24 @@ impl AtomicDrmDevice {
 
         Ok(())
     }
+}
+
+fn connector_reset_properties(
+    mapping: &PropMapping,
+    conn: connector::Handle,
+) -> Result<impl Iterator<Item = (property::Handle, property::Value<'static>)>, Error> {
+    let crtc = (
+        mapping.conn_prop_handle(conn, "CRTC_ID")?,
+        property::Value::CRTC(None),
+    );
+    // A surface can be dropped while the device is inactive, when its own clear_state
+    // cannot submit a commit. The connector still retains its VSIF property then, even
+    // after detaching it from the CRTC. Clear it during this device-wide reset as well.
+    let vsif = mapping
+        .conn_prop_handle(conn, "NV_HDMI_VSIF_METADATA")
+        .ok()
+        .map(|prop| (prop, property::Value::Blob(0)));
+    Ok(std::iter::once(crtc).chain(vsif))
 }
 
 impl Drop for AtomicDrmDevice {
@@ -305,6 +322,54 @@ impl Drop for AtomicDrmDevice {
                 error!("Failed to restore previous state. Error: {}", err);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use super::*;
+
+    #[test]
+    fn device_reset_clears_latched_vsif_after_inactive_surface_drop() {
+        let conn = connector::Handle::from(NonZeroU32::new(10).unwrap());
+        let crtc_prop = property::Handle::from(NonZeroU32::new(20).unwrap());
+        let vsif_prop = property::Handle::from(NonZeroU32::new(21).unwrap());
+        let mut mapping = PropMapping::default();
+        mapping.connectors.insert(
+            conn,
+            HashMap::from([
+                ("CRTC_ID".into(), crtc_prop),
+                ("NV_HDMI_VSIF_METADATA".into(), vsif_prop),
+            ]),
+        );
+
+        let properties = connector_reset_properties(&mapping, conn)
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            properties,
+            [
+                (crtc_prop, property::Value::CRTC(None)),
+                (vsif_prop, property::Value::Blob(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn device_reset_does_not_require_vsif_support() {
+        let conn = connector::Handle::from(NonZeroU32::new(10).unwrap());
+        let crtc_prop = property::Handle::from(NonZeroU32::new(20).unwrap());
+        let mut mapping = PropMapping::default();
+        mapping
+            .connectors
+            .insert(conn, HashMap::from([("CRTC_ID".into(), crtc_prop)]));
+
+        let properties = connector_reset_properties(&mapping, conn)
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert_eq!(properties, [(crtc_prop, property::Value::CRTC(None))]);
     }
 }
 

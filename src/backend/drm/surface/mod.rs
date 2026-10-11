@@ -440,6 +440,17 @@ impl DrmSurface {
         }
     }
 
+    /// Returns whether the connector exposes NVIDIA's `NV_HDMI_VSIF_METADATA` property.
+    ///
+    /// This tests driver support only; consult the display's EDID before requesting a
+    /// vendor-specific format. Always returns `false` on the legacy DRM api.
+    pub fn hdmi_vsif_supported(&self, conn: connector::Handle) -> Result<bool, Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.hdmi_vsif_supported(conn),
+            DrmSurfaceInternal::Legacy(_) => Ok(false),
+        }
+    }
+
     /// Returns the valid range of the given connector's `max bpc` property, or `None` if the
     /// connector has no such property or the underlying implementation is using the legacy
     /// DRM api.
@@ -466,7 +477,7 @@ impl DrmSurface {
         }
     }
 
-    /// Stages a new [`ConnectorColorState`] (colorspace, HDR metadata, max bpc) to be applied
+    /// Stages a new [`ConnectorColorState`] (colorspace, HDR metadata, HDMI VSIF, max bpc) to be applied
     /// on the next commit.
     ///
     /// A change to the color state causes [`DrmSurface::commit_pending`] to return `true`; the
@@ -476,7 +487,8 @@ impl DrmSurface {
     /// incomplete pipeline state.
     ///
     /// Use [`supported_colorspaces`](DrmSurface::supported_colorspaces),
-    /// [`hdr_metadata_supported`](DrmSurface::hdr_metadata_supported) and
+    /// [`hdr_metadata_supported`](DrmSurface::hdr_metadata_supported),
+    /// [`hdmi_vsif_supported`](DrmSurface::hdmi_vsif_supported) and
     /// [`max_bpc_range`](DrmSurface::max_bpc_range) to probe for driver support, and the
     /// sink's EDID (e.g. via `smithay-drm-extras`) for what the connected display can accept.
     ///

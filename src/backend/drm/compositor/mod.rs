@@ -3515,6 +3515,15 @@ where
             .map_err(FrameError::DrmError)
     }
 
+    /// Returns whether the connector exposes NVIDIA's `NV_HDMI_VSIF_METADATA` property.
+    ///
+    /// See [`DrmSurface::hdmi_vsif_supported`] for more details.
+    pub fn hdmi_vsif_supported(&self, conn: connector::Handle) -> FrameResult<bool, A, F> {
+        self.surface
+            .hdmi_vsif_supported(conn)
+            .map_err(FrameError::DrmError)
+    }
+
     /// Returns the color pipelines advertised on the given plane.
     ///
     /// See [`DrmSurface::plane_color_pipelines`] for more details.
@@ -3857,7 +3866,7 @@ where
         self.surface.current_color_state()
     }
 
-    /// Stages a new [`ConnectorColorState`] (colorspace, HDR metadata, max bpc) to be applied
+    /// Stages a new [`ConnectorColorState`] (colorspace, HDR metadata, HDMI VSIF, max bpc) to be applied
     /// with the next queued frame.
     ///
     /// A changed color state upgrades the next frame submission to a full atomic modeset

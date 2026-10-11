@@ -11,13 +11,13 @@ use std::collections::{HashMap, HashSet};
 #[cfg(debug_assertions)]
 use std::fmt;
 use std::ops::RangeInclusive;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsFd, AsRawFd};
 use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicBool, Ordering},
 };
 
-use crate::backend::drm::color::{self, Colorspace, ConnectorColorState};
+use crate::backend::drm::color::{self, Colorspace, ConnectorColorState, HdmiVsifMetadata};
 use crate::backend::drm::error::AccessError;
 use crate::utils::{Coordinate, Rectangle, Transform};
 use crate::{
@@ -38,6 +38,39 @@ use tracing::{debug, info, info_span, instrument, trace, warn};
 
 use super::{PlaneConfig, PlaneState, VrrSupport};
 
+/// A VSIF blob shared by pending and committed states. It remains valid until the last
+/// state releases it, including across failed tests/commits, VT switches and surface drop.
+#[derive(Debug)]
+struct HdmiVsifBlob {
+    fd: DrmDeviceFd,
+    id: u64,
+}
+
+impl HdmiVsifBlob {
+    fn new(fd: &DrmDeviceFd, metadata: HdmiVsifMetadata) -> Result<Arc<Self>, Error> {
+        let mut bytes = metadata.as_bytes().to_vec();
+        let blob = drm_ffi::mode::create_property_blob(fd.as_fd(), &mut bytes).map_err(|source| {
+            Error::Access(AccessError {
+                errmsg: "Failed to create HDMI VSIF property blob",
+                dev: fd.dev_path(),
+                source,
+            })
+        })?;
+        Ok(Arc::new(Self {
+            fd: fd.clone(),
+            id: u64::from(blob.blob_id),
+        }))
+    }
+}
+
+impl Drop for HdmiVsifBlob {
+    fn drop(&mut self) {
+        if let Err(err) = self.fd.destroy_property_blob(self.id) {
+            warn!("Failed to destroy HDMI VSIF property blob: {}", err);
+        }
+    }
+}
+
 /// Connector color state resolved against the actual properties of the surface's connectors,
 /// ready to be put into an atomic request.
 ///
@@ -51,6 +84,8 @@ pub struct ResolvedColorState {
     colorspace_values: HashMap<connector::Handle, u64>,
     /// The `HDR_OUTPUT_METADATA` blob; `Blob(0)` when no metadata is signalled.
     hdr_blob: property::Value<'static>,
+    /// Owned `NV_HDMI_VSIF_METADATA` blob; absent means clear the property.
+    hdmi_vsif_blob: Option<Arc<HdmiVsifBlob>>,
     /// The raw `max bpc` value, if one should be set.
     max_bpc: Option<u64>,
 }
@@ -60,8 +95,15 @@ impl Default for ResolvedColorState {
         ResolvedColorState {
             colorspace_values: HashMap::new(),
             hdr_blob: property::Value::Blob(0),
+            hdmi_vsif_blob: None,
             max_bpc: None,
         }
+    }
+}
+
+impl ResolvedColorState {
+    fn hdmi_vsif_value(&self) -> property::Value<'static> {
+        property::Value::Blob(self.hdmi_vsif_blob.as_ref().map_or(0, |blob| blob.id))
     }
 }
 
@@ -242,6 +284,25 @@ impl State {
                             }
                         }
                     }
+                    Ok("NV_HDMI_VSIF_METADATA") => {
+                        if raw == 0 || color_state.hdmi_vsif.is_some() {
+                            continue;
+                        }
+                        match fd.get_property_blob(raw) {
+                            Ok(data) => {
+                                color_state.hdmi_vsif = HdmiVsifMetadata::new(&data);
+                                if color_state.hdmi_vsif.is_none() {
+                                    warn!(?conn, "Failed to parse current NV_HDMI_VSIF_METADATA blob");
+                                }
+                            }
+                            Err(err) => {
+                                warn!(
+                                    ?conn,
+                                    "Failed to read current NV_HDMI_VSIF_METADATA blob: {}", err
+                                );
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -277,7 +338,7 @@ impl State {
 /// Resolves the given color state against the actual properties of `connectors`.
 ///
 /// Fails with [`Error::UnknownProperty`] if the state requests something a connector has no
-/// property for (a non-default colorspace, HDR metadata or a `max bpc` value). Connectors
+/// property for (a non-default colorspace, HDR metadata, HDMI VSIF or a `max bpc` value). Connectors
 /// missing a property that isn't actively used are simply skipped, so plain SDR state
 /// resolves successfully on any connector.
 fn resolve_color_state<A: DevPath + ControlDevice>(
@@ -285,11 +346,13 @@ fn resolve_color_state<A: DevPath + ControlDevice>(
     prop_mapping: &PropMapping,
     color_state: &ConnectorColorState,
     hdr_blob: property::Value<'static>,
+    hdmi_vsif_blob: Option<Arc<HdmiVsifBlob>>,
     connectors: impl IntoIterator<Item = connector::Handle>,
 ) -> Result<ResolvedColorState, Error> {
     let mut resolved = ResolvedColorState {
         colorspace_values: HashMap::new(),
         hdr_blob,
+        hdmi_vsif_blob,
         max_bpc: color_state.max_bpc.map(u64::from),
     };
 
@@ -361,6 +424,17 @@ fn resolve_color_state<A: DevPath + ControlDevice>(
                 name: "max bpc",
             });
         }
+
+        if color_state.hdmi_vsif.is_some()
+            && prop_mapping
+                .conn_prop_handle(conn, "NV_HDMI_VSIF_METADATA")
+                .is_err()
+        {
+            return Err(Error::UnknownProperty {
+                handle: conn.into(),
+                name: "NV_HDMI_VSIF_METADATA",
+            });
+        }
     }
 
     Ok(resolved)
@@ -415,6 +489,7 @@ impl AtomicDrmSurface {
             &prop_mapping.read().unwrap(),
             &color_state,
             property::Value::Blob(0),
+            None,
             connectors.iter().copied(),
         )?;
         let pending = State {
@@ -587,6 +662,7 @@ impl AtomicDrmSurface {
                     &prop_mapping,
                     &pending.color_state,
                     resolved_color.hdr_blob,
+                    resolved_color.hdmi_vsif_blob.clone(),
                     [conn],
                 )?
                 .colorspace_values,
@@ -720,6 +796,7 @@ impl AtomicDrmSurface {
             &prop_mapping,
             &pending.color_state,
             pending.resolved_color.hdr_blob,
+            pending.resolved_color.hdmi_vsif_blob.clone(),
             conns.iter().copied(),
         )?;
 
@@ -996,6 +1073,19 @@ impl AtomicDrmSurface {
             .is_ok())
     }
 
+    /// Returns whether the connector exposes NVIDIA's `NV_HDMI_VSIF_METADATA` property.
+    pub fn hdmi_vsif_supported(&self, conn: connector::Handle) -> Result<bool, Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+        Ok(self
+            .prop_mapping
+            .read()
+            .unwrap()
+            .conn_prop_handle(conn, "NV_HDMI_VSIF_METADATA")
+            .is_ok())
+    }
+
     /// Returns the valid range of the given connector's `max bpc` property, or `None` if the
     /// connector has no such property.
     pub fn max_bpc_range(&self, conn: connector::Handle) -> Result<Option<RangeInclusive<u32>>, Error> {
@@ -1067,6 +1157,11 @@ impl AtomicDrmSurface {
             }
         };
 
+        // Create VSIF first so its RAII owner also handles a subsequent HDR creation error.
+        let hdmi_vsif_blob = color_state
+            .hdmi_vsif
+            .map(|meta| HdmiVsifBlob::new(self.fd.device_fd(), meta))
+            .transpose()?;
         let hdr_blob = match color_state.hdr_metadata {
             Some(meta) => self
                 .fd
@@ -1087,6 +1182,7 @@ impl AtomicDrmSurface {
             &prop_mapping,
             &color_state,
             hdr_blob,
+            hdmi_vsif_blob,
             pending.connectors.iter().copied(),
         ) {
             Ok(resolved) => resolved,
@@ -1547,6 +1643,14 @@ impl AtomicDrmSurface {
             }
         }
 
+        // Recreate the vendor blob as well. Replacing the shared owner releases the old
+        // blob only after all committed/pending references have gone away.
+        pending.resolved_color.hdmi_vsif_blob = pending
+            .color_state
+            .hdmi_vsif
+            .map(|meta| HdmiVsifBlob::new(self.fd.device_fd(), meta))
+            .transpose()?;
+
         Ok(())
     }
 
@@ -1636,6 +1740,104 @@ mod test {
     };
 
     use super::{AtomicDrmSurface, read_crtc_flags};
+
+    #[test]
+    fn vsif_requires_property_on_every_connector() {
+        use std::{
+            fs::File,
+            num::NonZeroU32,
+            os::fd::{AsFd, BorrowedFd},
+        };
+
+        use super::*;
+
+        // No DRM ioctls should be needed to reject a missing property, or to leave an
+        // unsupported optional property disabled.
+        struct NoDrmDevice(File);
+        impl AsFd for NoDrmDevice {
+            fn as_fd(&self) -> BorrowedFd<'_> {
+                self.0.as_fd()
+            }
+        }
+        impl drm::Device for NoDrmDevice {}
+        impl ControlDevice for NoDrmDevice {}
+
+        let fd = NoDrmDevice(File::open("/dev/null").unwrap());
+        let conn = connector::Handle::from(NonZeroU32::new(10).unwrap());
+        let other = connector::Handle::from(NonZeroU32::new(11).unwrap());
+        let prop = property::Handle::from(NonZeroU32::new(20).unwrap());
+        let mut mapping = PropMapping::default();
+        mapping
+            .connectors
+            .insert(conn, HashMap::from([("NV_HDMI_VSIF_METADATA".into(), prop)]));
+        mapping.connectors.insert(other, HashMap::new());
+        let color = ConnectorColorState {
+            hdmi_vsif: Some(HdmiVsifMetadata::low_latency_dolby_vision()),
+            ..Default::default()
+        };
+        assert!(resolve_color_state(&fd, &mapping, &color, property::Value::Blob(0), None, [conn]).is_ok());
+        assert!(matches!(
+            resolve_color_state(
+                &fd,
+                &mapping,
+                &color,
+                property::Value::Blob(0),
+                None,
+                [conn, other]
+            ),
+            Err(Error::UnknownProperty {
+                name: "NV_HDMI_VSIF_METADATA",
+                ..
+            })
+        ));
+        assert!(
+            resolve_color_state(
+                &fd,
+                &mapping,
+                &ConnectorColorState::default(),
+                property::Value::Blob(0),
+                None,
+                [conn, other]
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn vsif_is_cleared_on_sdr_and_detach_but_omitted_on_page_flip() {
+        use std::num::NonZeroU32;
+
+        use super::*;
+
+        let conn = connector::Handle::from(NonZeroU32::new(10).unwrap());
+        let crtc = crtc::Handle::from(NonZeroU32::new(11).unwrap());
+        let prop = property::Handle::from(NonZeroU32::new(20).unwrap());
+        let mut mapping = PropMapping::default();
+        mapping
+            .connectors
+            .insert(conn, HashMap::from([("NV_HDMI_VSIF_METADATA".into(), prop)]));
+
+        let mut sdr_request = AtomicRequest::new(&mapping);
+        sdr_request
+            .set_connector(conn, crtc, Some(&ResolvedColorState::default()))
+            .unwrap();
+        assert_eq!(
+            sdr_request.connector_props[&conn]["NV_HDMI_VSIF_METADATA"],
+            property::Value::Blob(0)
+        );
+
+        let mut flip_request = AtomicRequest::new(&mapping);
+        flip_request.set_connector(conn, crtc, None).unwrap();
+        assert!(!flip_request.connector_props[&conn].contains_key("NV_HDMI_VSIF_METADATA"));
+
+        let mut detach_request = AtomicRequest::new(&mapping);
+        detach_request.reset_connector(conn).unwrap();
+        assert_eq!(
+            detach_request.connector_props[&conn]["NV_HDMI_VSIF_METADATA"],
+            property::Value::Blob(0)
+        );
+    }
 
     #[test]
     fn crtc_snapshot_reads_active_and_vrr_in_either_property_order() {
@@ -1759,6 +1961,13 @@ impl<'a> AtomicRequest<'a> {
             if self.mapping.conn_prop_handle(conn, "HDR_OUTPUT_METADATA").is_ok() {
                 connector_props.insert("HDR_OUTPUT_METADATA", color.hdr_blob);
             }
+            if self
+                .mapping
+                .conn_prop_handle(conn, "NV_HDMI_VSIF_METADATA")
+                .is_ok()
+            {
+                connector_props.insert("NV_HDMI_VSIF_METADATA", color.hdmi_vsif_value());
+            }
             if let Some(max_bpc) = color.max_bpc {
                 if self.mapping.conn_prop_handle(conn, "max bpc").is_ok() {
                     connector_props.insert("max bpc", property::Value::UnsignedRange(max_bpc));
@@ -1779,6 +1988,13 @@ impl<'a> AtomicRequest<'a> {
         }
         if self.mapping.conn_prop_handle(conn, "HDR_OUTPUT_METADATA").is_ok() {
             connector_props.insert("HDR_OUTPUT_METADATA", property::Value::Blob(0));
+        }
+        if self
+            .mapping
+            .conn_prop_handle(conn, "NV_HDMI_VSIF_METADATA")
+            .is_ok()
+        {
+            connector_props.insert("NV_HDMI_VSIF_METADATA", property::Value::Blob(0));
         }
         Ok(())
     }
@@ -2008,6 +2224,9 @@ impl<'a> AtomicRequest<'a> {
             if let Ok(prop) = self.mapping.conn_prop_handle(conn, "HDR_OUTPUT_METADATA") {
                 self.request.add_property(conn, prop, color.hdr_blob);
             }
+            if let Ok(prop) = self.mapping.conn_prop_handle(conn, "NV_HDMI_VSIF_METADATA") {
+                self.request.add_property(conn, prop, color.hdmi_vsif_value());
+            }
             if let Some(max_bpc) = color.max_bpc {
                 if let Ok(prop) = self.mapping.conn_prop_handle(conn, "max bpc") {
                     self.request
@@ -2031,6 +2250,9 @@ impl<'a> AtomicRequest<'a> {
             self.request.add_property(conn, prop, property::Value::Unknown(0));
         }
         if let Ok(prop) = self.mapping.conn_prop_handle(conn, "HDR_OUTPUT_METADATA") {
+            self.request.add_property(conn, prop, property::Value::Blob(0));
+        }
+        if let Ok(prop) = self.mapping.conn_prop_handle(conn, "NV_HDMI_VSIF_METADATA") {
             self.request.add_property(conn, prop, property::Value::Blob(0));
         }
         Ok(())

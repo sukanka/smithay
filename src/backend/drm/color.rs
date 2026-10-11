@@ -1,7 +1,8 @@
 //! Types for configuring the color pipeline of a connector.
 //!
 //! These types describe the wide-gamut / HDR signalling state of a DRM connector, i.e. the
-//! values of the optional `Colorspace`, `HDR_OUTPUT_METADATA` and `max bpc` connector
+//! values of the optional `Colorspace`, `HDR_OUTPUT_METADATA`, `NV_HDMI_VSIF_METADATA`
+//! and `max bpc` connector
 //! properties. They are used with [`DrmSurface::use_color_state`](super::DrmSurface::use_color_state)
 //! (and the corresponding
 //! [`DrmCompositor::use_color_state`](super::compositor::DrmCompositor::use_color_state)),
@@ -12,7 +13,8 @@
 //!
 //! Whether a connector supports these properties can be queried with
 //! [`DrmSurface::supported_colorspaces`](super::DrmSurface::supported_colorspaces),
-//! [`DrmSurface::hdr_metadata_supported`](super::DrmSurface::hdr_metadata_supported) and
+//! [`DrmSurface::hdr_metadata_supported`](super::DrmSurface::hdr_metadata_supported),
+//! [`DrmSurface::hdmi_vsif_supported`](super::DrmSurface::hdmi_vsif_supported) and
 //! [`DrmSurface::max_bpc_range`](super::DrmSurface::max_bpc_range).
 //!
 //! Capabilities of the connected sink (whether it accepts a PQ EOTF, its desired luminance
@@ -180,10 +182,74 @@ impl HdrOutputMetadata {
     }
 }
 
+/// HDMI vendor-specific InfoFrame payload, including its three-byte IEEE OUI.
+///
+/// This is sent through NVIDIA's `NV_HDMI_VSIF_METADATA` connector property. The driver
+/// supplies the InfoFrame header and checksum; they must not be included here. Payloads
+/// contain 3 to 27 bytes, as required by that property's uAPI.
+///
+/// Setting an InfoFrame only changes signalling. The caller must separately produce pixels
+/// in the corresponding format and verify the connected display's capabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HdmiVsifMetadata {
+    payload: [u8; 27],
+    len: u8,
+}
+
+impl HdmiVsifMetadata {
+    /// Copies a payload, returning `None` if its length is outside 3..=27 bytes.
+    pub fn new(bytes: &[u8]) -> Option<Self> {
+        if !(3..=27).contains(&bytes.len()) {
+            return None;
+        }
+        let mut payload = [0; 27];
+        payload[..bytes.len()].copy_from_slice(bytes);
+        Some(Self {
+            payload,
+            len: bytes.len() as u8,
+        })
+    }
+
+    /// Returns exactly the bytes sent to the driver, excluding unused storage.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.payload[..usize::from(self.len)]
+    }
+
+    /// Builds an HDMI Licensing VSIF announcing no additional video format.
+    ///
+    /// This is the standard four-byte payload produced by Linux's
+    /// `hdmi_vendor_infoframe_pack()` with no HDMI VIC or 3D structure. It can be used
+    /// temporarily on an SDR output to synchronize a driver's cached VSIF state.
+    ///
+    /// This sends a nonempty InfoFrame; it is not equivalent to clearing the connector
+    /// property. Do not pair it with HDR10 static metadata: some hardware shares one slot
+    /// between these InfoFrames. Finish synchronization by setting
+    /// [`ConnectorColorState::hdmi_vsif`] to `None` before or together with enabling HDR10.
+    pub const fn hdmi_no_additional_video_format() -> Self {
+        let mut payload = [0; 27];
+        payload[0] = 0x03;
+        payload[1] = 0x0c;
+        Self { payload, len: 4 }
+    }
+
+    /// Builds a minimal low-latency Dolby Vision signalling payload.
+    ///
+    /// The Dolby OUI is encoded least-significant byte first (`46 d0 00`); the next byte
+    /// sets the low-latency and Dolby Vision signal flags. The remaining bytes are zero.
+    /// This does not encode Dolby Vision RPU data, perform display mapping or convert pixels.
+    pub const fn low_latency_dolby_vision() -> Self {
+        let mut payload = [0; 27];
+        payload[0] = 0x46;
+        payload[1] = 0xd0;
+        payload[3] = 0x03;
+        Self { payload, len: 27 }
+    }
+}
+
 /// Desired color pipeline configuration of a connector.
 ///
-/// The default value describes plain SDR signalling: default colorspace, no HDR metadata and
-/// the `max bpc` property left untouched.
+/// The default value describes plain SDR signalling: default colorspace, no HDR metadata or
+/// vendor-specific InfoFrame, and the `max bpc` property left untouched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ConnectorColorState {
     /// The colorimetry to signal via the `Colorspace` property.
@@ -192,6 +258,11 @@ pub struct ConnectorColorState {
     ///
     /// `None` disables the HDR infoframe (the property is set to no blob).
     pub hdr_metadata: Option<HdrOutputMetadata>,
+    /// The HDMI vendor-specific InfoFrame sent via `NV_HDMI_VSIF_METADATA`.
+    ///
+    /// `None` clears this property on connectors exposing it. This does not affect vendor
+    /// InfoFrames managed internally by the driver, such as the HDMI Forum VSIF.
+    pub hdmi_vsif: Option<HdmiVsifMetadata>,
     /// The maximum bits per component to allow on the link via the `max bpc` property.
     ///
     /// `None` leaves the property at its current value.
@@ -297,6 +368,40 @@ pub(super) mod ffi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hdmi_vsif_payload_boundaries() {
+        for length in 0..=28 {
+            let bytes = vec![0x46; length];
+            let parsed = HdmiVsifMetadata::new(&bytes);
+            assert_eq!(parsed.is_some(), (3..=27).contains(&length));
+            if let Some(parsed) = parsed {
+                assert_eq!(parsed.as_bytes(), bytes);
+                assert_eq!(HdmiVsifMetadata::new(parsed.as_bytes()), Some(parsed));
+            }
+        }
+    }
+
+    #[test]
+    fn low_latency_dolby_vision_payload() {
+        // The payload used by the NVIDIA HDMI signalling probe: no header/checksum bytes.
+        let metadata = HdmiVsifMetadata::low_latency_dolby_vision();
+        assert_eq!(metadata.as_bytes().len(), 27);
+        assert_eq!(&metadata.as_bytes()[..4], &[0x46, 0xd0, 0x00, 0x03]);
+        assert_eq!(&metadata.as_bytes()[4..], &[0; 23]);
+        assert_eq!(HdmiVsifMetadata::new(metadata.as_bytes()), Some(metadata));
+        assert_eq!(ConnectorColorState::default().hdmi_vsif, None);
+    }
+
+    #[test]
+    fn hdmi_no_additional_video_format_payload() {
+        let metadata = HdmiVsifMetadata::hdmi_no_additional_video_format();
+        // HDMI Licensing OUI, LSB first, followed by HDMI_Video_Format = 0.
+        // No InfoFrame header, checksum, HDMI VIC or 3D fields belong in this blob.
+        assert_eq!(metadata.as_bytes(), &[0x03, 0x0c, 0x00, 0x00]);
+        assert_eq!(HdmiVsifMetadata::new(metadata.as_bytes()), Some(metadata));
+        assert_ne!(metadata, HdmiVsifMetadata::low_latency_dolby_vision());
+    }
 
     #[test]
     fn hdr_output_metadata_layout() {

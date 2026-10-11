@@ -89,7 +89,7 @@ mod surface;
 use std::sync::Once;
 
 use crate::utils::{DevPath, Physical, Size};
-pub use color::{Colorspace, ConnectorColorState, CtaCoordinate, Eotf, HdrOutputMetadata};
+pub use color::{Colorspace, ConnectorColorState, CtaCoordinate, Eotf, HdmiVsifMetadata, HdrOutputMetadata};
 pub use colorop::{
     ColorOp, ColorOpKind, ColorPipeline, Curve1DType, Lut1DInterpolation, Lut3DInterpolation,
     PostBlendEncode, ResolvedColorPipeline, ScanoutColorTransform,
